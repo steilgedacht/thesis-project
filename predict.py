@@ -5,6 +5,8 @@ import glob
 import nibabel as nib
 import shutil
 
+PATH_TO_DATASET = "data/entire_yale_dataset/predictions/"
+
 def main():
     nnUNet_preprocessed=".archive/train_nnUNet/train_dataset/data/nnUNet_preprocessed"
     nnUNet_results="data/thomas_data/BratsMets/nnUNetTrainer__nnUNetResEncUNetLPlans__3d_fullres/Dataset001_UCSFBrainMet/nnUNetTrainer__nnUNetPlans__3d_fullres"
@@ -30,7 +32,7 @@ def main():
 
     predictor.initialize_from_trained_model_folder(
         join(nnUNet_results),
-        use_folds=(0,),
+        use_folds=(0,1,2,3,4),
         checkpoint_name='checkpoint_final.pth',
     )
 
@@ -41,14 +43,14 @@ def main():
     print(f"{len(globs)=}")
     globs = sorted(globs)
 
-    n_processed = len(glob.glob('data/Yale-Brain-Mets-Longitudinal/predictions/**/**'))
+    n_processed = len(glob.glob(f'{PATH_TO_DATASET}**/**'))
 
 
 
     for i, input_path in enumerate(globs):
         if i < n_processed: continue
         os.makedirs(f"/tmp/files_for_prediction/{i}", exist_ok=True)
-        save_path = f"data/Yale-Brain-Mets-Longitudinal/predictions/{os.path.join(*os.path.dirname(input_path).split('/')[-2:])}/"
+        save_path = f"{PATH_TO_DATASET}{os.path.join(*os.path.dirname(input_path).split('/')[-2:])}/"
         os.makedirs(save_path, exist_ok=True)
         
         output_file_1 = f"/tmp/files_for_prediction/{i}/" + "T1.nii.gz"
@@ -61,7 +63,7 @@ def main():
         predictor.predict_from_files(
             [[output_file_1, output_file_2]],
             [save_path + "0"],
-            save_probabilities=True, 
+            save_probabilities=False, 
             overwrite=True,
             num_processes_preprocessing=1,
             num_processes_segmentation_export=1,
