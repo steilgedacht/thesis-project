@@ -38,27 +38,24 @@ def main():
 
     predictor.allowed_mirroring_axes = (0,)
 
-
     globs = glob.glob('**/*POST.nii.gz', recursive=True)
     print(f"{len(globs)=}")
     globs = sorted(globs)
 
-    n_processed = len(glob.glob(f'{PATH_TO_DATASET}**/**'))
-
-
-
     for i, input_path in enumerate(globs):
-        if i < n_processed: continue
-        os.makedirs(f"/tmp/files_for_prediction/{i}", exist_ok=True)
+
         save_path = f"{PATH_TO_DATASET}{os.path.join(*os.path.dirname(input_path).split('/')[-2:])}/"
-        os.makedirs(save_path, exist_ok=True)
+        if os.path.exists(save_path):  # in case the file was already predicted
+            continue
+
+        os.makedirs(save_path)
+        os.makedirs(f"/tmp/files_for_prediction/{i}", exist_ok=True)
         
         output_file_1 = f"/tmp/files_for_prediction/{i}/" + "T1.nii.gz"
         output_file_2 = f"/tmp/files_for_prediction/{i}/" + "T1_gad.nii.gz"
         
         shutil.copyfile(input_path, output_file_1)
-        shutil.copyfile(input_path, output_file_2)            
-
+        shutil.copyfile(input_path, output_file_2)
 
         predictor.predict_from_files(
             [[output_file_1, output_file_2]],
