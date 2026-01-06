@@ -17,6 +17,11 @@ from scipy.ndimage import shift
 from skimage.measure import find_contours
 from scipy.ndimage import affine_transform
 from scipy.spatial.transform import Rotation as R
+from plotly.colors import qualitative
+import plotly.graph_objects as go
+import itertools
+from sklearn.cluster import AffinityPropagation
+from scipy.ndimage import center_of_mass
 
 class DataSample:
     def __init__(self, pre_post_path, load_meta_data=False):
@@ -300,15 +305,44 @@ class Patient:
             affine,
             offset=offset,
             output_shape=output_shape,
-            order=0,
+            order=1,
             mode="constant",
             cval=0
         )
 
         return transformed
 
+    # def _register_image(self, reference, moving_mask):
+    #     initital_params = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
+        
+    #     def objective(params):
+    #         transformed = self.rigid_transform(
+    #             moving_mask,
+    #             params,
+    #             reference.shape
+    #         )
+
+    #         return - self._iou_score(reference, transformed)
+        
+    #     # Optimize translation
+    #     result = minimize(
+    #         objective,
+    #         initital_params,
+    #         method="Powell",
+    #         options=dict(maxiter=15, disp=True)
+    #     )
+        
+    #     return result.x
+
     def _register_image(self, reference, moving_mask):
-        initital_params = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
+        ref_com = center_of_mass(reference)
+        mov_com = center_of_mass(moving_mask)
+
+        tz_init = ref_com[0] - mov_com[0]
+        ty_init = ref_com[1] - mov_com[1]
+        tx_init = ref_com[2] - mov_com[2]
+        
+        initial_params = np.array([tx_init, ty_init, tz_init, 0, 0, 0, 1.0, 1.0, 1.0])
         
         def objective(params):
             transformed = self.rigid_transform(
@@ -316,18 +350,26 @@ class Patient:
                 params,
                 reference.shape
             )
+            reg = 0.01 * np.sum((params[6:9] - 1.0)**2)
+            return -self._iou_score(reference, transformed) + reg
 
-            return - self._iou_score(reference, transformed)
         
-        # Optimize translation
+        print(f"Starting Powell with CoM Offset: {initial_params[:3].round(2)}")
+        
         result = minimize(
             objective,
-            initital_params,
+            initial_params,
             method="Powell",
-            options=dict(maxiter=15, disp=True)
+            options=dict(
+                maxiter=30,  
+                xtol=1e-3, 
+                ftol=1e-3,
+                disp=True
+            )
         )
         
         return result.x
+
 
     def register_all_to_first(self):
         """Register all images to the first image using linear translation only."""
@@ -373,7 +415,6 @@ class Patient:
 
         D_point = np.stack(D_point)
 
-        # TODO find a better clustering approach
         kmeans = KMeans(n_clusters=maximum_n, random_state=0, n_init=200).fit(D_point)
         labels = kmeans.labels_
 
@@ -393,53 +434,168 @@ class Patient:
         
         fig.show()
 
-    def plot_3d_lesion_position(self, corr, log_size=True):
+
+    def plot_image_registration(self, registereed_parameters):
+        colors = (qualitative.Dark24)
+        color_cycle = itertools.cycle(colors)
+
+        fig = go.Figure()
+
+        for i, sample in enumerate(self.samples):   
+            col = next(color_cycle)
+
+            points_transformed = self.rigid_transform(
+                sample.load_mri(),
+                registereed_parameters[i],
+                self.samples[0].load_mri().shape
+            )
+
+            points_transformed = points_transformed > 0.0
+
+
+            contours_3d = []
+
+            for z in range(points_transformed.shape[-1]):
+                slice_2d = points_transformed[:,:,z]
+
+                contours = find_contours(slice_2d, level=0.5)
+
+                for contour in contours:
+                    y = contour[:, 0]
+                    x = contour[:, 1]
+                    z_coords = np.full_like(x, z)
+
+                    contours_3d.append((x,y,z_coords))
+
+            for x, y, z in contours_3d:
+                fig.add_trace(go.Scatter3d(
+                    x=x,
+                    y=y,
+                    z=z,
+                    mode="lines",
+                    line=dict(width=2, color=col),
+                    opacity=0.6
+                ))
+            
+        fig.update_layout(
+            height=800, 
+            width=900
+        )
+
+        fig.show()
+
+    def transform_point_to_fixed(self, params, moving_volume_shape, point):
+        tx, ty, tz, rx, ry, rz, sx, sy, sz = params
+        
+        # 1. Build the matrix in the SAME way the optimizer uses it
+        # Use 'xyz' only if your array is stored as (X, Y, Z)
+        # If your brain is 'sideways', you might need to try 'zyx' or swap tx/ty
+        rot_mat = R.from_euler("xyz", [rx, ry, rz]).as_matrix()
+        scale_mat = np.diag([sx, sy, sz])
+        
+        # This is the forward matrix A
+        A = (rot_mat @ scale_mat).T 
+        
+        # Center of rotation (must be identical to the registration function)
+        center = np.array(moving_volume_shape) / 2.0
+        translation = np.array([tx, ty, tz])
+        
+        # 2. Apply the INVERSE logic
+        # In Scipy: p_moving = A @ (p_fixed - center) + center - translation
+        # To get p_fixed:
+        A_inv = np.linalg.inv(A)
+        p_moving = np.asarray(point)
+        
+        fixed_point = A_inv @ (p_moving - center + translation) + center
+        return fixed_point
+
+
+
+    def plot_registered_3d_lesion_position(self, registered_parameters, log_size=True):
+        """
+        registered_parameters: List of parameter vectors (length 9) for each sample.
+                registered_parameters[0] should be the identity: [0,0,0,0,0,0,1,1,1]
+        """
         D_point, D_sizes, D_time, D_time_absolute = [], [], [], []
-        data = {}
+        
+        # We use Sample 0 as the reference shape
+        ref_shape = self.samples[0].load_mri().shape
 
         for i, mri in enumerate(self.samples):
+            # Ensure lesions are processed and loaded
             mri.load_mri_segmentation()
-            
-            data[mri.date] = {
-                "num_features": mri.num_lesions,
-                "sizes": mri.sizes,
-                "lesion_rel_coords": mri.lesion_rel_coords,
-            }
+            if not hasattr(mri, 'lesion_abs_coords'):
+                mri.process_sample()
+                
+            params = registered_parameters[i]
+            vol_shape = mri.load_mri().shape
 
-            for n in range(mri.lesion_rel_coords.shape[0]):
-                D_point.append(mri.lesion_rel_coords[n] + corr)
-                D_sizes.append(np.log(mri.sizes[n]))
+            for n in range(len(mri.lesion_abs_coords)):
+                moving_point = np.array(mri.lesion_abs_coords[n])
+                
+                # Transform moving point to the fixed (Sample 0) coordinate system
+                if i == 0:
+                    fixed_point = moving_point
+                else:
+                    fixed_point = self.transform_point_to_fixed(params, vol_shape, moving_point)
+                
+                D_point.append(fixed_point)
+                D_sizes.append(mri.sizes[n])
                 D_time.append(i)
                 D_time_absolute.append(mri.date)
 
-        maximum_n = max([len(data[d]["sizes"]) for d in data.keys()])
+        if not D_point:
+            print("No lesions found.")
+            return
 
         D_point = np.stack(D_point)
-
-        # TODO find a better clustering approach
-        kmeans = KMeans(n_clusters=maximum_n, random_state=0, n_init=200).fit(D_point)
-        labels = kmeans.labels_
+        
+        # Clustering to identify the same lesion across different timepoints
+        # We use the maximum number of lesions found in any single scan as n_clusters
+        affprop = AffinityPropagation(random_state=0).fit(D_point)
 
         df = pd.DataFrame({
-            "x": D_point[:,0], 
-            "y": D_point[:,1], 
-            "z": D_point[:,2], 
-            "log_size":D_sizes, 
-            "size":np.exp(D_sizes), 
-            "time":D_time,
-            "time_absolute":D_time_absolute, 
-            "labels": labels,
-            "patient": self.patient_id
+            "x": D_point[:, 1], 
+            "y": ref_shape[0] -D_point[:, 0], 
+            "z": D_point[:, 2], 
+            "size": D_sizes,
+            "log_size": np.log(D_sizes),
+            "time": D_time,
+            "date": D_time_absolute, 
+            "lesion_id": affprop.labels_.astype(str) # String for discrete color map
         })
-        scale = 'log_size' if log_size else 'size'
-        fig = px.scatter_3d(df, x='x', y='y', z='z', size=scale, color='time', height=800, width=900, symbol=labels)
+
+        scale_col = 'log_size' if log_size else 'size'
         
+        fig = px.scatter_3d(
+            df, x='x', y='y', z='z', 
+            size=scale_col,
+            size_max=30, 
+            color='time',
+            symbol='lesion_id',
+            hover_data=['date', 'size'],
+            title=f"Longitudinal Lesion Tracking: Patient {self.patient_id}",
+            height=800, width=1000
+        )
+
+        # Optional: Add brain contours from the reference image (Sample 0)
+        for x, y, z in self.samples[0].calculate_contours():
+            fig.add_trace(go.Scatter3d(
+                x=x, y=y, z=z,
+                mode="lines",
+                line=dict(width=1, color="rgba(50,50,50,1)"),
+                showlegend=False
+            ))
+
+        fig.update_layout(
+            scene=dict(
+                aspectmode='manual',
+                aspectratio=dict(x=300/ref_shape[0], y=300/ref_shape[1], z=1) # Adjust z based on your slice thickness
+            )
+        )
+
         fig.show()
 
-
-    def plot_image_registration(self, correlation):
-        mri_image = self.load_mri()
-        target_image = DataSample(self.all_patient_dates[0]) 
 
 
 if __name__ == "__main__":
