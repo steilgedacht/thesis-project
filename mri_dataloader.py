@@ -14,7 +14,9 @@ import plotly.express as px
 from sklearn.cluster import KMeans
 from scipy.optimize import minimize
 from scipy.ndimage import shift
-
+from skimage.measure import find_contours
+from scipy.ndimage import affine_transform
+from scipy.spatial.transform import Rotation as R
 
 class DataSample:
     def __init__(self, pre_post_path, load_meta_data=False):
@@ -153,9 +155,11 @@ class DataSample:
             for pos in lesion_positions
         ])
 
+
         self.num_lesions = num_features
         self.lesion_sizes = sizes
         self.lesion_rel_coords = lesion_rel_coords
+        self.lesion_abs_coords = lesion_positions
 
         return labeled_array
 
@@ -221,6 +225,23 @@ class DataSample:
     def __repr__(self):
         return f"MRI({self.patient_id}, {self.date}, {self.n_scans} scans)"
     
+    def calculate_contours(self):
+        contours_3d = []
+
+        for z in range(self.load_mri().shape[-1]):
+            slice_2d = self.load_mri()[:,:,z]
+
+            contours = find_contours(slice_2d, level=0.5)
+
+            for contour in contours:
+                y = contour[:, 0]
+                x = contour[:, 1]
+                z_coords = np.full_like(x, z)
+
+                contours_3d.append((x,y,z_coords))
+        
+        return contours_3d
+    
 
 class MRI_Dataloader:
     def __init__(self, data_path='data/entire_yale_dataset/PRE_POST_YBML'):
@@ -254,63 +275,80 @@ class Patient:
         self.dataloader = dataloader
         self.samples = self.dataloader.find_by_patient_id(patient_id)
 
+    def _iou_score(self, fixed, moving):
+        intersection = np.logical_and(fixed, moving).sum()
+        union = np.logical_or(fixed, moving).sum()
+        return intersection / union if union > 0 else 0.0
+    
+    def make_mask(self, vol):
+        return (vol > 0).astype(np.uint8)
+
+    def rigid_transform(self, mask, params, output_shape):
+        tx, ty, tz, rx, ry, rz, sx, sy, sz = params
+
+        rot = R.from_euler("xyz", [rx, ry, rz]).as_matrix()
+
+        scale_matrix = np.diag([sx, sy, sz])
+        affine = (rot @ scale_matrix).T
+
+        center = np.array(mask.shape) / 2
+
+        offset = center - affine @ center - np.array([tx, ty, tz])
+
+        transformed = affine_transform(
+            mask,
+            affine,
+            offset=offset,
+            output_shape=output_shape,
+            order=0,
+            mode="constant",
+            cval=0
+        )
+
+        return transformed
+
+    def _register_image(self, reference, moving_mask):
+        initital_params = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
+        
+        def objective(params):
+            transformed = self.rigid_transform(
+                moving_mask,
+                params,
+                reference.shape
+            )
+
+            return - self._iou_score(reference, transformed)
+        
+        # Optimize translation
+        result = minimize(
+            objective,
+            initital_params,
+            method="Powell",
+            options=dict(maxiter=15, disp=True)
+        )
+        
+        return result.x
+
     def register_all_to_first(self):
         """Register all images to the first image using linear translation only."""
         reference_image = self.samples[0].load_mri()
         
         # Set correction vector for reference image
-        self.samples[0].correction_vector = np.array([0.0, 0.0, 0.0])
+        self.samples[0].correction_vector = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
+
+        correction_vectors = []
         
         for i, sample in enumerate(self.samples[1:], start=1):
             moving_image = sample.load_mri()
             
-            # Find optimal translation
-            translation = self._register_image(reference_image, moving_image)
-            sample.correction_vector = translation
+            transformation = self._register_image(self.make_mask(reference_image), self.make_mask(moving_image))
+            sample.correction_vector = transformation
             
-            print(f"Sample {i}: correction_vector = {translation}")
+            print(f"Sample {i}: correction_vector = {transformation}")
 
-    def _register_image(self, reference, moving, initial_guess=None):
-        """Register moving image to reference using translation only."""
-        if initial_guess is None:
-            initial_guess = np.array([0.0, 0.0, 0.0])
+            correction_vectors.append(transformation)
         
-        def neg_cross_correlation(translation):
-            """Negative cross-correlation (for minimization)."""
-            shifted = shift(moving, translation, order=1, mode='constant', cval=0)
-            
-            # Ensure both images have the same shape
-            ref_shape = np.array(reference.shape)
-            shift_shape = np.array(shifted.shape)
-            min_shape = np.minimum(ref_shape, shift_shape)
-            
-            # Crop to overlapping region (take from center)
-            ref_slices = tuple([slice(int((ref_shape[i] - min_shape[i]) / 2), int((ref_shape[i] - min_shape[i]) / 2) + int(min_shape[i]))  for i in range(len(ref_shape))])
-            shift_slices = tuple([slice(int((shift_shape[i] - min_shape[i]) / 2), int((shift_shape[i] - min_shape[i]) / 2) + int(min_shape[i])) for i in range(len(shift_shape))])
-            
-            ref_cropped = reference[ref_slices].flatten()
-            shifted_cropped = shifted[shift_slices].flatten()
-            
-            # Remove zero values to avoid bias
-            mask = (ref_cropped > 0) & (shifted_cropped > 0)
-            if mask.sum() < 10:
-                return 1e6
-            
-            corr = np.corrcoef(ref_cropped[mask], shifted_cropped[mask])[0, 1]
-            if np.isnan(corr):
-                return 1e6
-            return -corr  # Negative because we minimize
-        
-        
-        # Optimize translation
-        result = minimize(
-            neg_cross_correlation, 
-            initial_guess,
-            method='Powell',
-            options={'maxiter': 500}
-        )
-        
-        return result.x
+        return correction_vectors
 
     def plot_3d_lesion_position(self, log_size=True):
         D_point, D_sizes, D_time, D_time_absolute = [], [], [], []
@@ -355,11 +393,54 @@ class Patient:
         
         fig.show()
 
-    def plot_image_registration(self):
+    def plot_3d_lesion_position(self, corr, log_size=True):
+        D_point, D_sizes, D_time, D_time_absolute = [], [], [], []
+        data = {}
+
+        for i, mri in enumerate(self.samples):
+            mri.load_mri_segmentation()
+            
+            data[mri.date] = {
+                "num_features": mri.num_lesions,
+                "sizes": mri.sizes,
+                "lesion_rel_coords": mri.lesion_rel_coords,
+            }
+
+            for n in range(mri.lesion_rel_coords.shape[0]):
+                D_point.append(mri.lesion_rel_coords[n] + corr)
+                D_sizes.append(np.log(mri.sizes[n]))
+                D_time.append(i)
+                D_time_absolute.append(mri.date)
+
+        maximum_n = max([len(data[d]["sizes"]) for d in data.keys()])
+
+        D_point = np.stack(D_point)
+
+        # TODO find a better clustering approach
+        kmeans = KMeans(n_clusters=maximum_n, random_state=0, n_init=200).fit(D_point)
+        labels = kmeans.labels_
+
+        df = pd.DataFrame({
+            "x": D_point[:,0], 
+            "y": D_point[:,1], 
+            "z": D_point[:,2], 
+            "log_size":D_sizes, 
+            "size":np.exp(D_sizes), 
+            "time":D_time,
+            "time_absolute":D_time_absolute, 
+            "labels": labels,
+            "patient": self.patient_id
+        })
+        scale = 'log_size' if log_size else 'size'
+        fig = px.scatter_3d(df, x='x', y='y', z='z', size=scale, color='time', height=800, width=900, symbol=labels)
+        
+        fig.show()
+
+
+    def plot_image_registration(self, correlation):
         mri_image = self.load_mri()
         target_image = DataSample(self.all_patient_dates[0]) 
 
-        
 
 if __name__ == "__main__":
     dataloader = MRI_Dataloader()
