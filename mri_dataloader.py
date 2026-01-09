@@ -22,6 +22,7 @@ import plotly.graph_objects as go
 import itertools
 from sklearn.cluster import AffinityPropagation
 from scipy.ndimage import center_of_mass
+import json
 
 class DataSample:
     def __init__(self, pre_post_path, load_meta_data=False):
@@ -294,6 +295,7 @@ class Patient:
         self.patient_id = patient_id
         self.dataloader = dataloader
         self.samples = self.dataloader.find_by_patient_id(patient_id)
+        self.path = os.path.join(self.dataloader.data_path, patient_id)
 
     def _iou_score(self, fixed, moving):
         intersection = np.logical_and(fixed, moving).sum()
@@ -614,6 +616,32 @@ class Patient:
 
     def __repr__(self):
         return f"Patient {self.patient_id}, {len(self.samples)} scans"
+
+
+class Lesion_Trajectory():
+
+    def __init__(self, patient_id, label_id, dates):
+        self.path = os.path.join(MRI_Dataloader().data_path, patient_id, f"lesion_trajectories_{label_id}.json")
+        self.patient_id = patient_id
+        self.label_id = label_id
+        self.dates = dates
+        self.scans = len(dates)
+        self.sizes = []
+        self.registered_coordinates = []
+
+    def save_lesion_trajectory(self):
+        export = {
+            "patient_id": self.patient_id,
+            "label_id": self.label_id,
+            "dates": self.dates,
+            "scans": self.scans,
+            "sizes": self.sizes,
+            "registered_coordinates": self.registered_coordinates
+        }
+
+        with open(self.path, "w") as f:
+            json.dump(export, f)
+
 
 if __name__ == "__main__":
     dataloader = MRI_Dataloader()
