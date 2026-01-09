@@ -30,6 +30,12 @@ class DataSample:
         self.pre_post_path = pre_post_path
         self.original_sample_path = pre_post_path.replace("PRE_POST_YBML", "YBML")
 
+        self.registered_transform_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["registered_transform.npy"])
+        if os.path.exists(self.registered_transform_path):
+            self.registered_transform = np.load(self.registered_transform_path)
+        else:
+            self.registered_transform = None
+
         self.lesion_prediction_nnUnet_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["0.nii.gz"])
         self.lesion_segmentation_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["label.npz"])
 
@@ -246,7 +252,10 @@ class DataSample:
                 contours_3d.append((x,y,z_coords))
         
         return contours_3d
-    
+
+    def save_registered_images(self):
+        if self.registered_transform is not None:
+            np.save(self.registered_transform_path, self.registered_transform)
 
 class MRI_Dataloader:
     def __init__(self, data_path='data/entire_yale_dataset/PRE_POST_YBML'):
@@ -254,6 +263,8 @@ class MRI_Dataloader:
         globs = glob.glob(data_path + "/**/**/*POST.nii.gz", recursive=True)
         self.pre_post_samples = list(set(sorted(globs))) 
         self.data_path = data_path
+
+        self.patient_ids = sorted(list(set([path.split(os.path.sep)[-3] for path in self.pre_post_samples])))
 
     def __iter__(self):
         for i in range(self.__len__()):
@@ -273,6 +284,10 @@ class MRI_Dataloader:
     def find_by_patient_id_and_date(self, patient_id, date):
         filtered_samples = [sample for sample in self.pre_post_samples if f"{os.path.sep}{patient_id}{os.path.sep}" in sample and f"{os.path.sep}{date}{os.path.sep}" in sample]
         return DataSample(filtered_samples[0])
+
+    def iterate_patients(self):
+        for patient_id in self.patient_ids:
+            yield Patient(patient_id, dataloader=self)
 
 class Patient:
     def __init__(self, patient_id, dataloader=MRI_Dataloader()):
@@ -375,22 +390,23 @@ class Patient:
         """Register all images to the first image using linear translation only."""
         reference_image = self.samples[0].load_mri()
         
-        # Set correction vector for reference image
-        self.samples[0].correction_vector = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
+        self.samples[0].registered_transform = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
+        self.samples[0].save_registered_images()
 
-        correction_vectors = []
+        registered_transforms = []
         
         for i, sample in enumerate(self.samples[1:], start=1):
             moving_image = sample.load_mri()
             
             transformation = self._register_image(self.make_mask(reference_image), self.make_mask(moving_image))
-            sample.correction_vector = transformation
-            
-            print(f"Sample {i}: correction_vector = {transformation}")
+            sample.registered_transform = transformation
+            sample.save_registered_images()
 
-            correction_vectors.append(transformation)
+            print(f"Sample {i}: registered_transform = {transformation}")
+
+            registered_transforms.append(transformation)
         
-        return correction_vectors
+        return registered_transforms
 
     def plot_3d_lesion_position(self, log_size=True):
         D_point, D_sizes, D_time, D_time_absolute = [], [], [], []
@@ -596,7 +612,8 @@ class Patient:
 
         fig.show()
 
-
+    def __repr__(self):
+        return f"Patient {self.patient_id}, {len(self.samples)} scans"
 
 if __name__ == "__main__":
     dataloader = MRI_Dataloader()
