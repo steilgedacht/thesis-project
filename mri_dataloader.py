@@ -23,6 +23,72 @@ import itertools
 from sklearn.cluster import AffinityPropagation
 from scipy.ndimage import center_of_mass
 import json
+import torch
+
+class Registrator:
+    def __init__(self, device=None):
+        self.device = device if device else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+    def get_3d_bbox(self, mask):
+        z_idx = torch.nonzero(mask.sum(dim=(1,2)))
+        y_idx = torch.nonzero(mask.sum(dim=(0,2)))
+        x_idx = torch.nonzero(mask.sum(dim=(0,1)))
+
+        bbox = {
+            "z_min": z_idx[0].item(), "z_max": z_idx[-1].item(),
+            "y_min": y_idx[0].item(), "y_max": y_idx[-1].item(),
+            "x_min": x_idx[0].item(), "x_max": x_idx[-1].item(),
+        }
+
+        center = torch.tensor([
+            (bbox["x_min"] + bbox["x_max"]) / 2.0,
+            (bbox["y_min"] + bbox["y_max"]) / 2.0,
+            (bbox["z_min"] + bbox["z_max"]) / 2.0,
+        ], device=self.device)
+
+        return bbox, center
+
+
+    def rigid_transform(self, mask, params, output_shape):
+        tx, ty, tz, rx, ry, rz, sx, sy, sz = params
+                
+        transformed = affine_transform(
+            mask,
+            [sx, sy, sz],
+            offset=[tx, ty, tz],
+            output_shape=output_shape,
+            order=1,
+            mode="constant",
+            cval=0
+        )
+        return transformed
+
+
+    def register(self, reference_mask, moving_mask):
+        ref_t = torch.from_numpy(reference_mask).float().permute(2, 1, 0).to(self.device)
+        mov_t = torch.from_numpy(moving_mask).float().permute(2, 1, 0).to(self.device)
+
+        bbox_ref, center_ref = self.get_3d_bbox(ref_t)
+        bbox_mov, center_mov = self.get_3d_bbox(mov_t)
+
+
+        sx = (bbox_mov["x_max"] - bbox_mov["x_min"]) / (bbox_ref["x_max"] - bbox_ref["x_min"]) 
+        sy = (bbox_mov["y_max"] - bbox_mov["y_min"]) / (bbox_ref["y_max"] - bbox_ref["y_min"]) 
+        sz = (bbox_mov["z_max"] - bbox_mov["z_min"]) / (bbox_ref["z_max"] - bbox_ref["z_min"]) 
+
+        tx = center_mov[0] -  center_ref[0] * sx
+        ty = center_mov[1] -  center_ref[1] * sy
+        tz = center_mov[2] -  center_ref[2] * sz
+
+        init_params = torch.tensor([
+            tx, ty, tz,
+            0.0, 0.0, 0.0,
+            sx, sy, sz
+        ])
+
+        return init_params.cpu().detach().numpy()
 
 class DataSample:
     def __init__(self, pre_post_path, load_meta_data=False):
@@ -123,7 +189,8 @@ class DataSample:
             segmentation = np.load(self.lesion_segmentation_path)
             self.num_lesions = segmentation["num_features"].item()
             self.sizes = segmentation["sizes"]
-            self.lesion_rel_coords = segmentation["lesion_rel_coords"]
+            self.lesion_coords = segmentation["lesion_abs_coords"]
+            self.global_center_of_mass = segmentation["global_center_of_mass"]
             return segmentation["labeled_array"]
         else:
             raise FileNotFoundError(f"Lesion segmentation file not found at {self.lesion_segmentation_path}")
@@ -155,23 +222,13 @@ class DataSample:
         # we save the position of the lesions in euclidean roation coordinates
         lesion_positions = ndimage.center_of_mass(nnUNet_prediction, labeled_array, range(1, num_features + 1))
 
-        # calculate global center of mass of the MRI to have a reference point that is similar also to the next scan of the same patient
-        mri_mask = (mri_image > 0).astype(np.float32)
-        global_center_of_mass = ndimage.center_of_mass(mri_mask)
-
-        # calculate the rotation coordinates of each lesion with respect to the global center of mass
-        lesion_rel_coords = np.array([
-            [pos[0] - global_center_of_mass[0],
-            pos[1] - global_center_of_mass[1],
-            pos[2] - global_center_of_mass[2]]
-            for pos in lesion_positions
-        ])
-
+        # because different mri scans which might not be registered have different scalings, we need to account for the size
+        total_area = np.sum((mri_image > 0).astype(np.float32))
 
         self.num_lesions = num_features
         self.lesion_sizes = sizes
-        self.lesion_rel_coords = lesion_rel_coords
-        self.lesion_abs_coords = lesion_positions
+        self.relative_lesion_sizes = sizes / total_area
+        self.lesion_coords = lesion_positions
 
         return labeled_array
 
@@ -297,98 +354,7 @@ class Patient:
         self.samples = self.dataloader.find_by_patient_id(patient_id)
         self.path = os.path.join(self.dataloader.data_path, patient_id)
 
-    def _iou_score(self, fixed, moving):
-        intersection = np.logical_and(fixed, moving).sum()
-        union = np.logical_or(fixed, moving).sum()
-        return intersection / union if union > 0 else 0.0
-    
-    def make_mask(self, vol):
-        return (vol > 0).astype(np.uint8)
-
-    def rigid_transform(self, mask, params, output_shape):
-        tx, ty, tz, rx, ry, rz, sx, sy, sz = params
-
-        rot = R.from_euler("xyz", [rx, ry, rz]).as_matrix()
-
-        scale_matrix = np.diag([sx, sy, sz])
-        affine = (rot @ scale_matrix).T
-
-        center = np.array(mask.shape) / 2
-
-        offset = center - affine @ center - np.array([tx, ty, tz])
-
-        transformed = affine_transform(
-            mask,
-            affine,
-            offset=offset,
-            output_shape=output_shape,
-            order=1,
-            mode="constant",
-            cval=0
-        )
-
-        return transformed
-
-    # def _register_image(self, reference, moving_mask):
-    #     initital_params = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
-        
-    #     def objective(params):
-    #         transformed = self.rigid_transform(
-    #             moving_mask,
-    #             params,
-    #             reference.shape
-    #         )
-
-    #         return - self._iou_score(reference, transformed)
-        
-    #     # Optimize translation
-    #     result = minimize(
-    #         objective,
-    #         initital_params,
-    #         method="Powell",
-    #         options=dict(maxiter=15, disp=True)
-    #     )
-        
-    #     return result.x
-
-    def _register_image(self, reference, moving_mask):
-        ref_com = center_of_mass(reference)
-        mov_com = center_of_mass(moving_mask)
-
-        tz_init = ref_com[0] - mov_com[0]
-        ty_init = ref_com[1] - mov_com[1]
-        tx_init = ref_com[2] - mov_com[2]
-        
-        initial_params = np.array([tx_init, ty_init, tz_init, 0, 0, 0, 1.0, 1.0, 1.0])
-        
-        def objective(params):
-            transformed = self.rigid_transform(
-                moving_mask,
-                params,
-                reference.shape
-            )
-            reg = 0.01 * np.sum((params[6:9] - 1.0)**2)
-            return -self._iou_score(reference, transformed) + reg
-
-        
-        print(f"Starting Powell with CoM Offset: {initial_params[:3].round(2)}")
-        
-        result = minimize(
-            objective,
-            initial_params,
-            method="Powell",
-            options=dict(
-                maxiter=30,  
-                xtol=1e-3, 
-                ftol=1e-3,
-                disp=True
-            )
-        )
-        
-        return result.x
-
-
-    def register_all_to_first(self):
+    def register_all_to_first(self, registrator: Registrator = Registrator()):
         """Register all images to the first image using linear translation only."""
         reference_image = self.samples[0].load_mri()
         
@@ -397,17 +363,16 @@ class Patient:
 
         registered_transforms = []
         
-        for i, sample in enumerate(self.samples[1:], start=1):
+        for sample in self.samples[1:]:
             moving_image = sample.load_mri()
             
-            transformation = self._register_image(self.make_mask(reference_image), self.make_mask(moving_image))
+            transformation = registrator.register(reference_image, moving_image)
             sample.registered_transform = transformation
             sample.save_registered_images()
 
-            print(f"Sample {i}: registered_transform = {transformation}")
-
             registered_transforms.append(transformation)
-        
+            print(f"Registered {sample.date} to {self.samples[0].date} with transformation:\n{transformation}")
+
         return registered_transforms
 
     def plot_3d_lesion_position(self, log_size=True):
@@ -452,8 +417,28 @@ class Patient:
         
         fig.show()
 
+    def contur_plot(self, fig, data, col):
+        data = data > 0.0
 
-    def plot_image_registration(self, registereed_parameters):
+        contours_3d = []
+
+        for z in range(data.shape[-1]):
+            slice_2d = data[:,:,z]
+
+            contours = find_contours(slice_2d, level=0.5)
+
+            for contour in contours:
+                x = contour[:, 0]
+                y = contour[:, 1]
+                z_coords = np.full_like(x, z)
+
+                contours_3d.append((x,y,z_coords))
+
+        for x, y, z in contours_3d:
+            fig.add_trace(go.Scatter3d(x=x,y=y,z=z,mode="lines",line=dict(width=2, color=col), opacity=0.6))
+
+
+    def plot_image_registration(self, registered_parameters = [], registrator: Registrator = Registrator()):
         colors = (qualitative.Dark24)
         color_cycle = itertools.cycle(colors)
 
@@ -462,38 +447,22 @@ class Patient:
         for i, sample in enumerate(self.samples):   
             col = next(color_cycle)
 
-            points_transformed = self.rigid_transform(
+            if hasattr(sample, "registered_transform") and sample.registered_transform is not None:
+                rp = sample.registered_transform
+            elif registered_parameters:
+                rp = registered_parameters[i]
+            else:
+                rp = np.array([0, 0, 0, 0, 0, 0, 1.0, 1.0, 1.0])
+                print(f"Sample {i} has no registered transform. Using no transformation.")
+
+            points_transformed = registrator.rigid_transform(
                 sample.load_mri(),
-                registereed_parameters[i],
+                rp,
                 self.samples[0].load_mri().shape
             )
+            
+            self.contur_plot(fig, points_transformed, col)
 
-            points_transformed = points_transformed > 0.0
-
-
-            contours_3d = []
-
-            for z in range(points_transformed.shape[-1]):
-                slice_2d = points_transformed[:,:,z]
-
-                contours = find_contours(slice_2d, level=0.5)
-
-                for contour in contours:
-                    y = contour[:, 0]
-                    x = contour[:, 1]
-                    z_coords = np.full_like(x, z)
-
-                    contours_3d.append((x,y,z_coords))
-
-            for x, y, z in contours_3d:
-                fig.add_trace(go.Scatter3d(
-                    x=x,
-                    y=y,
-                    z=z,
-                    mode="lines",
-                    line=dict(width=2, color=col),
-                    opacity=0.6
-                ))
             
         fig.update_layout(
             height=800, 
@@ -528,30 +497,37 @@ class Patient:
         return fixed_point
 
 
-
-    def plot_registered_3d_lesion_position(self, registered_parameters, log_size=True):
+    def plot_registered_3d_lesion_position(self, registered_parameters=[], log_size=True):
         """
         registered_parameters: List of parameter vectors (length 9) for each sample.
                 registered_parameters[0] should be the identity: [0,0,0,0,0,0,1,1,1]
         """
         D_point, D_sizes, D_time, D_time_absolute = [], [], [], []
         
-        # We use Sample 0 as the reference shape
         ref_shape = self.samples[0].load_mri().shape
-
         for i, mri in enumerate(self.samples):
+            
             # Ensure lesions are processed and loaded
             mri.load_mri_segmentation()
-            if not hasattr(mri, 'lesion_abs_coords'):
+            if not hasattr(mri, 'lesion_coords'):
                 mri.process_sample()
-                
-            params = registered_parameters[i]
+            
+            if hasattr(mri, "registered_transform") and mri.registered_transform is not None:
+                params = mri.registered_transform
+            elif registered_parameters:
+                params = registered_parameters[i]
+            else:
+                params = np.array([0, 0, 0, 0, 0, 0, 1.0, 1.0, 1.0])
+                print(f"Sample {i} has no registered transform. Using no transformation.")
+
             vol_shape = mri.load_mri().shape
 
-            for n in range(len(mri.lesion_abs_coords)):
-                moving_point = np.array(mri.lesion_abs_coords[n])
+            for n in range(len(mri.lesion_coords)):
+                moving_point = np.array(mri.lesion_coords[n])
                 
                 # Transform moving point to the fixed (Sample 0) coordinate system
+                fixed_point = moving_point
+
                 if i == 0:
                     fixed_point = moving_point
                 else:
@@ -596,14 +572,14 @@ class Patient:
             height=800, width=1000
         )
 
-        # Optional: Add brain contours from the reference image (Sample 0)
-        for x, y, z in self.samples[0].calculate_contours():
-            fig.add_trace(go.Scatter3d(
-                x=x, y=y, z=z,
-                mode="lines",
-                line=dict(width=1, color="rgba(50,50,50,1)"),
-                showlegend=False
-            ))
+        # brain contours
+        # for x, y, z in self.samples[0].calculate_contours():
+        #     fig.add_trace(go.Scatter3d(
+        #         x=x, y=y, z=z,
+        #         mode="lines",
+        #         line=dict(width=1, color="rgba(50,50,50,1)"),
+        #         showlegend=False
+        #     ))
 
         fig.update_layout(
             scene=dict(
@@ -616,6 +592,46 @@ class Patient:
 
     def __repr__(self):
         return f"Patient {self.patient_id}, {len(self.samples)} scans"
+    
+    def plot_average_slice_trajectory(self):
+
+        means = []
+        for i, sample in enumerate(self.samples):
+            means.append(sample.load_mri().mean(axis=(0, 1)))
+        
+        means_interp = []
+        for mean in means:
+            m = mean.copy()
+            
+            sliced_mean = m[m != 0]
+
+            x_old = np.linspace(0, 1, len(sliced_mean))
+            x_new = np.linspace(0, 1, 100)
+            mean_interp = np.interp(x_new, x_old, sliced_mean)
+            mean_interp = mean_interp / np.sort(mean_interp)[-5] 
+            means_interp.append(mean_interp)
+
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 10))
+
+        cmap = plt.get_cmap("cool")
+        colors = cmap(np.linspace(0, 1, len(means)))
+        for i, mean in enumerate(means):
+            axes[0].plot(mean, label=f"Sample {i}", color=colors[i])
+        axes[0].set_title("Mean MRI Intensity per Slice")
+        axes[0].set_xlabel("Slice Index")
+        axes[0].set_ylabel("Mean Intensity")
+        axes[0].legend()
+
+        for i, mean_interp in enumerate(means_interp):
+            axes[1].plot(mean_interp, label=f"Sample {i} (Interpolated)", color=colors[i])
+        axes[1].set_title("Interpolated Mean Intensity (100 pts)")
+        axes[1].set_xlabel("Interpolated Index")
+        axes[1].set_ylabel("Normalized Intensity")
+        axes[1].legend()
+
+        plt.tight_layout()
+        plt.show()
 
 
 class Lesion_Trajectory():
@@ -641,6 +657,9 @@ class Lesion_Trajectory():
 
         with open(self.path, "w") as f:
             json.dump(export, f)
+
+
+
 
 
 if __name__ == "__main__":
