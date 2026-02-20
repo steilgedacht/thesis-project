@@ -51,11 +51,11 @@ class Registrator:
         return bbox, center
 
 
-    def rigid_transform(self, mask, params, output_shape):
+    def rigid_transform(self, moving_image, params, output_shape):
         tx, ty, tz, rx, ry, rz, sx, sy, sz = params
                 
         transformed = affine_transform(
-            mask,
+            moving_image,
             [sx, sy, sz],
             offset=[tx, ty, tz],
             output_shape=output_shape,
@@ -188,12 +188,13 @@ class DataSample:
         if os.path.exists(self.lesion_segmentation_path):
             segmentation = np.load(self.lesion_segmentation_path)
             self.num_lesions = segmentation["num_features"].item()
-            self.sizes = segmentation["sizes"]
-            self.lesion_coords = segmentation["lesion_abs_coords"]
-            self.global_center_of_mass = segmentation["global_center_of_mass"]
+            self.lesion_sizes = segmentation["lesion_sizes"]
+            self.lesion_coords = segmentation["lesion_positions"]
+            self.relative_lesion_sizes = segmentation["relative_lesion_sizes"]
             return segmentation["labeled_array"]
         else:
-            raise FileNotFoundError(f"Lesion segmentation file not found at {self.lesion_segmentation_path}")
+            print(f"Lesion segmentation file not found at {self.lesion_segmentation_path}, processing sample to create it.")
+            return self.process_sample()
 
     def get_other_timepoint(self, date):
         glob_path = os.path.join(self.base_path, self.patient_id, date, f"**_POST.nii.gz")
@@ -229,6 +230,8 @@ class DataSample:
         self.lesion_sizes = sizes
         self.relative_lesion_sizes = sizes / total_area
         self.lesion_coords = lesion_positions
+
+        np.savez(self.lesion_segmentation_path, num_features=num_features, lesion_sizes=sizes, relative_lesion_sizes=sizes / total_area, lesion_positions=lesion_positions, labeled_array=labeled_array)
 
         return labeled_array
 
@@ -348,11 +351,12 @@ class MRI_Dataloader:
             yield Patient(patient_id, dataloader=self)
 
 class Patient:
-    def __init__(self, patient_id, dataloader=MRI_Dataloader()):
+    def __init__(self, patient_id, dataloader=MRI_Dataloader(), registrator=Registrator()):
         self.patient_id = patient_id
         self.dataloader = dataloader
         self.samples = self.dataloader.find_by_patient_id(patient_id)
         self.path = os.path.join(self.dataloader.data_path, patient_id)
+        self.registrator = registrator
 
     def register_all_to_first(self, registrator: Registrator = Registrator()):
         """Register all images to the first image using linear translation only."""
@@ -384,17 +388,17 @@ class Patient:
             
             data[mri.date] = {
                 "num_features": mri.num_lesions,
-                "sizes": mri.sizes,
-                "lesion_rel_coords": mri.lesion_rel_coords,
+                "lesion_sizes": mri.lesion_sizes,
+                "lesion_coords": mri.lesion_coords,
             }
 
-            for n in range(mri.lesion_rel_coords.shape[0]):
-                D_point.append(mri.lesion_rel_coords[n])
-                D_sizes.append(np.log(mri.sizes[n]))
+            for n in range(mri.lesion_coords.shape[0]):
+                D_point.append(mri.lesion_coords[n])
+                D_sizes.append(np.log(mri.lesion_sizes[n]))
                 D_time.append(i)
                 D_time_absolute.append(mri.date)
 
-        maximum_n = max([len(data[d]["sizes"]) for d in data.keys()])
+        maximum_n = max([len(data[d]["lesion_sizes"]) for d in data.keys()])
 
         D_point = np.stack(D_point)
 
@@ -471,32 +475,6 @@ class Patient:
 
         fig.show()
 
-    def transform_point_to_fixed(self, params, moving_volume_shape, point):
-        tx, ty, tz, rx, ry, rz, sx, sy, sz = params
-        
-        # 1. Build the matrix in the SAME way the optimizer uses it
-        # Use 'xyz' only if your array is stored as (X, Y, Z)
-        # If your brain is 'sideways', you might need to try 'zyx' or swap tx/ty
-        rot_mat = R.from_euler("xyz", [rx, ry, rz]).as_matrix()
-        scale_mat = np.diag([sx, sy, sz])
-        
-        # This is the forward matrix A
-        A = (rot_mat @ scale_mat).T 
-        
-        # Center of rotation (must be identical to the registration function)
-        center = np.array(moving_volume_shape) / 2.0
-        translation = np.array([tx, ty, tz])
-        
-        # 2. Apply the INVERSE logic
-        # In Scipy: p_moving = A @ (p_fixed - center) + center - translation
-        # To get p_fixed:
-        A_inv = np.linalg.inv(A)
-        p_moving = np.asarray(point)
-        
-        fixed_point = A_inv @ (p_moving - center + translation) + center
-        return fixed_point
-
-
     def plot_registered_3d_lesion_position(self, registered_parameters=[], log_size=True):
         """
         registered_parameters: List of parameter vectors (length 9) for each sample.
@@ -520,21 +498,18 @@ class Patient:
                 params = np.array([0, 0, 0, 0, 0, 0, 1.0, 1.0, 1.0])
                 print(f"Sample {i} has no registered transform. Using no transformation.")
 
-            vol_shape = mri.load_mri().shape
-
             for n in range(len(mri.lesion_coords)):
                 moving_point = np.array(mri.lesion_coords[n])
                 
                 # Transform moving point to the fixed (Sample 0) coordinate system
                 fixed_point = moving_point
 
-                if i == 0:
-                    fixed_point = moving_point
-                else:
-                    fixed_point = self.transform_point_to_fixed(params, vol_shape, moving_point)
+                if i > 0:
+                    tx, ty, tz, _, _, _, sx, sy, sz = params
+                    fixed_point = (moving_point - np.array([tx, ty, tz])) / np.array([sx, sy, sz]) 
                 
                 D_point.append(fixed_point)
-                D_sizes.append(mri.sizes[n])
+                D_sizes.append(mri.lesion_sizes[n])
                 D_time.append(i)
                 D_time_absolute.append(mri.date)
 
@@ -573,13 +548,14 @@ class Patient:
         )
 
         # brain contours
-        # for x, y, z in self.samples[0].calculate_contours():
-        #     fig.add_trace(go.Scatter3d(
-        #         x=x, y=y, z=z,
-        #         mode="lines",
-        #         line=dict(width=1, color="rgba(50,50,50,1)"),
-        #         showlegend=False
-        #     ))
+        for x, y, z in self.samples[0].calculate_contours():
+            fig.add_trace(go.Scatter3d(
+                x=x, y=y, z=z,
+                mode="lines",
+                line=dict(width=1, color="rgba(50,50,50,1)"),
+                showlegend=False
+            )
+        )
 
         fig.update_layout(
             scene=dict(
@@ -633,6 +609,10 @@ class Patient:
         plt.tight_layout()
         plt.show()
 
+    def process_samples(self):
+        for sample in self.samples:
+            sample.process_sample()
+
 
 class Lesion_Trajectory():
 
@@ -662,9 +642,9 @@ class Lesion_Trajectory():
 
 
 
-if __name__ == "__main__":
-    dataloader = MRI_Dataloader()
-    for i in dataloader:
-        print(i)
-        break
+# if __name__ == "__main__":
+#     dataloader = MRI_Dataloader()
+#     for i in dataloader:
+#         print(i)
+#         break
 
