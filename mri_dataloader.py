@@ -105,6 +105,7 @@ class DataSample:
 
         self.lesion_prediction_nnUnet_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["0.nii.gz"])
         self.lesion_segmentation_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["label.npz"])
+        self.lesion_trajectory_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["trajectory.npz"])
 
         # get the meta information
         self.patient_id = pre_post_path.split(os.path.sep)[-3]
@@ -317,15 +318,26 @@ class DataSample:
     def save_registered_images(self):
         if self.registered_transform is not None:
             np.save(self.registered_transform_path, self.registered_transform)
+    
+    def load_registered_transform(self):
+        if os.path.exists(self.registered_transform_path):
+            self.registered_transform = np.load(self.registered_transform_path)
+        else:
+            print(f"Registered transform file not found at {self.registered_transform_path}. Using identity transform.")
+            self.registered_transform = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
+        return self.registered_transform
 
 class MRI_Dataloader:
-    def __init__(self, data_path='data/entire_yale_dataset/PRE_POST_YBML'):
+    def __init__(self, data_path='data/entire_yale_dataset/PRE_POST_YBML', fast_load=False):
 
-        globs = glob.glob(data_path + "/**/**/*POST.nii.gz", recursive=True)
-        self.pre_post_samples = list(set(sorted(globs))) 
+        if not fast_load:
+            globs = glob.glob(data_path + "/**/**/*POST.nii.gz", recursive=True)
+            self.pre_post_samples = list(set(sorted(globs))) 
+            self.patient_ids = sorted(list(set([path.split(os.path.sep)[-3] for path in self.pre_post_samples])))
+
         self.data_path = data_path
+        self.data_prediction_path = data_path.replace("PRE_POST_YBML", "predictions")
 
-        self.patient_ids = sorted(list(set([path.split(os.path.sep)[-3] for path in self.pre_post_samples])))
 
     def __iter__(self):
         for i in range(self.__len__()):
@@ -357,6 +369,7 @@ class Patient:
         self.samples = self.dataloader.find_by_patient_id(patient_id)
         self.path = os.path.join(self.dataloader.data_path, patient_id)
         self.registrator = registrator
+        self.load_registered_transforms()
 
     def register_all_to_first(self, registrator: Registrator = Registrator()):
         """Register all images to the first image using linear translation only."""
@@ -475,12 +488,12 @@ class Patient:
 
         fig.show()
 
-    def plot_registered_3d_lesion_position(self, registered_parameters=[], log_size=True):
+    def plot_registered_3d_lesion_position(self, registered_parameters=[], log_size=True, relative_size=False):
         """
         registered_parameters: List of parameter vectors (length 9) for each sample.
                 registered_parameters[0] should be the identity: [0,0,0,0,0,0,1,1,1]
         """
-        D_point, D_sizes, D_time, D_time_absolute = [], [], [], []
+        D_point, D_sizes, D_relative_sizes, D_time, D_time_absolute = [], [], [], [], []
         
         ref_shape = self.samples[0].load_mri().shape
         for i, mri in enumerate(self.samples):
@@ -510,6 +523,7 @@ class Patient:
                 
                 D_point.append(fixed_point)
                 D_sizes.append(mri.lesion_sizes[n])
+                D_relative_sizes.append(mri.relative_lesion_sizes[n])
                 D_time.append(i)
                 D_time_absolute.append(mri.date)
 
@@ -518,6 +532,7 @@ class Patient:
             return
 
         D_point = np.stack(D_point)
+        D_relative_sizes = (D_relative_sizes - min(D_relative_sizes)) / (max(D_relative_sizes) - min(D_relative_sizes) + 1e-8) * 10 
         
         # Clustering to identify the same lesion across different timepoints
         # We use the maximum number of lesions found in any single scan as n_clusters
@@ -528,6 +543,7 @@ class Patient:
             "y": ref_shape[0] -D_point[:, 0], 
             "z": D_point[:, 2], 
             "size": D_sizes,
+            "relative_size": D_relative_sizes,
             "log_size": np.log(D_sizes),
             "time": D_time,
             "date": D_time_absolute, 
@@ -535,6 +551,8 @@ class Patient:
         })
 
         scale_col = 'log_size' if log_size else 'size'
+        if relative_size:
+            scale_col = 'relative_size'
         
         fig = px.scatter_3d(
             df, x='x', y='y', z='z', 
@@ -613,33 +631,156 @@ class Patient:
         for sample in self.samples:
             sample.process_sample()
 
+    def load_registered_transforms(self):
+        self.registered_transforms = []
+        for sample in self.samples:
+            if hasattr(sample, "registered_transform") and sample.registered_transform is not None:
+                self.registered_transforms.append(sample.registered_transform)
+            else:
+                self.registered_transforms.append(sample.load_registered_transform())
+        return self.registered_transforms
+
+    def merge_lesion_to_trajectory(self):
+        vol_shape = self.samples[0].load_mri().shape
+
+        labeled_mask_cache = []
+        sum_mask = np.zeros(vol_shape, dtype=np.uint8)
+        for i, sample in enumerate(self.samples):
+            labeled_mask = patient.registrator.rigid_transform(
+                sample.load_mri_segmentation(), 
+                self.registered_transforms[i], 
+                vol_shape
+            )
+
+            labeled_mask_cache.append(labeled_mask)
+            sum_mask = sum_mask + labeled_mask
+
+        sum_mask = (sum_mask > 0).astype(np.uint8)            
+        # we introduce a little bit of bleeding, to connect nearby lesions
+        sum_mask_dialated = ndimage.binary_dilation(sum_mask, iterations=1).astype(np.uint8)
+        sum_mask_dialated = ndimage.binary_dilation(sum_mask_dialated, iterations=3, axes=(0,1)).astype(np.uint8)
+        labeled_lesion_mask, num_features = ndimage.label(sum_mask_dialated)
+        labeled_lesion_mask = sum_mask * labeled_lesion_mask
+
+        for i in range(1, num_features + 1):
+            lesion_mask = (labeled_lesion_mask == i).astype(np.uint8)
+
+            sample_ids = []
+            for j in range(len(self.samples)):
+                lesion_mask_sample = lesion_mask * labeled_mask_cache[j]
+                if np.sum(lesion_mask_sample) > 0:
+                    sample_ids.append(j)
+                    labeled_mask_cache[j][lesion_mask_sample > 0] = i
+            
+
+            trajectory = Lesion_Trajectory(self.patient_id, i, sample_ids)
+            trajectory.save_lesion_trajectory()
+
+        for i, sample in enumerate(self.samples):
+            np.savez(
+                sample.lesion_trajectory_path, 
+                num_features=num_features, 
+                labeled_array=labeled_mask_cache[i]
+            )
+
+
+    def plot_lesion_shape_trajectory(self):
+        fig = go.Figure()
+        
+        colors = px.colors.sequential.Agsunset
+
+        vol_shape = self.samples[0].load_mri().shape
+        
+        for i, sample in enumerate(self.samples):
+            labeled_mask = sample.load_mri_segmentation()
+            params = self.registered_transforms[i]
+            labeled_mask = patient.registrator.rigid_transform(labeled_mask, params, vol_shape)
+            
+            # Determine color for this timepoint
+            color_idx = int((i / len(self.samples)) * (len(colors) - 1))
+            time_color = colors[color_idx]
+
+            unique_labels = np.unique(labeled_mask)
+            for label in unique_labels:
+                if label == 0: continue # Skip background
+                
+                lesion_mask = (labeled_mask == label).astype(np.uint8)
+                
+                try:
+                    verts, faces, _, _= marching_cubes(lesion_mask, step_size=2, allow_degenerate=True, method="lewiner")        
+
+                    # sample random points via a barycentric sampling method
+                    n_samples = 10
+                    sampled_points = []
+
+                    for _ in range(n_samples):
+                        face_idx = np.random.randint(0, len(faces))
+                        face = faces[face_idx]
+                        
+                        r1, r2 = np.random.random(2)
+                        if r1 + r2 > 1:
+                            r1 = 1 - r1
+                            r2 = 1 - r2
+                        
+                        point = (1 - r1 - r2) * verts[face[0]] + r1 * verts[face[1]] + r2 * verts[face[2]]
+                        sampled_points.append(point)
+
+                    sampled_points = np.array(sampled_points)
+
+                    fig.add_trace(go.Scatter3d(
+                        x=sampled_points[:, 1],
+                        y=vol_shape[0] - sampled_points[:, 0],
+                        z=sampled_points[:, 2],
+                        mode="markers",
+                        marker=dict(size=5, color=time_color, opacity=0.3),
+                        showlegend=False,
+                        hoverinfo='skip'
+                    ))
+                except RuntimeError:
+                    # Marching cubes fails if the lesion is on the very edge or too thin
+                    continue
+
+        # Add reference brain outline for context
+        for x, y, z in self.samples[0].calculate_contours():
+            fig.add_trace(go.Scatter3d(
+                x=x, y=y, z=z,
+                mode="lines",
+                line=dict(width=1, color="rgba(50,50,50,1)"),
+                showlegend=False,
+                hoverinfo='skip'
+            ))
+
+        fig.update_layout(
+            title=f"3D Lesion Shape Trajectory for Patient {self.patient_id}",
+            width=1000,
+            height=800
+        )
+        
+        fig.show()
+
 
 class Lesion_Trajectory():
-
-    def __init__(self, patient_id, label_id, dates):
-        self.path = os.path.join(MRI_Dataloader().data_path, patient_id, f"lesion_trajectories_{label_id}.json")
+    def __init__(self, patient_id, label_id, sample_ids):
+        self.path = os.path.join(MRI_Dataloader(fast_load=True).data_prediction_path, patient_id, f"lesion_trajectories_{label_id}.json")
         self.patient_id = patient_id
         self.label_id = label_id
-        self.dates = dates
-        self.scans = len(dates)
-        self.sizes = []
-        self.registered_coordinates = []
+        self.sample_ids = sample_ids
+        self.dates = []
+        patient = Patient(patient_id)
+        for sample in patient.samples:
+            sample.load_mri_segmentation()
+            self.dates.append(sample.date)
+        self.n_scans = len(sample_ids)
 
     def save_lesion_trajectory(self):
         export = {
             "patient_id": self.patient_id,
             "label_id": self.label_id,
             "dates": self.dates,
-            "scans": self.scans,
-            "sizes": self.sizes,
-            "registered_coordinates": self.registered_coordinates
+            "n_scans": self.n_scans,
         }
-
-        with open(self.path, "w") as f:
-            json.dump(export, f)
-
-
-
+        
+        np.savez(self.path, **export)
 
 
 # if __name__ == "__main__":
