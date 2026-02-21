@@ -6,6 +6,7 @@ from mri_dataloader import Patient, MRI_Dataloader
 def process_and_save(input_path):
     patient = Patient(input_path)
     patient.process_samples()
+    return patient.patient_id
 
 if __name__ == "__main__":
     data_loader = MRI_Dataloader()

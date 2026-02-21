@@ -12,8 +12,6 @@ import matplotlib.cm as cm
 from IPython.display import HTML
 import plotly.express as px
 from sklearn.cluster import KMeans
-from scipy.optimize import minimize
-from scipy.ndimage import shift
 from skimage.measure import find_contours
 from scipy.ndimage import affine_transform
 from scipy.spatial.transform import Rotation as R
@@ -21,8 +19,7 @@ from plotly.colors import qualitative
 import plotly.graph_objects as go
 import itertools
 from sklearn.cluster import AffinityPropagation
-from scipy.ndimage import center_of_mass
-import json
+from skimage.measure import marching_cubes
 import torch
 
 class Registrator:
@@ -196,6 +193,10 @@ class DataSample:
         else:
             print(f"Lesion segmentation file not found at {self.lesion_segmentation_path}, processing sample to create it.")
             return self.process_sample()
+        
+    def load_lesion_trajectory_segmentation(self):
+        data = np.load(self.lesion_trajectory_path)
+        return data["labeled_array"], data["num_features"]
 
     def get_other_timepoint(self, date):
         glob_path = os.path.join(self.base_path, self.patient_id, date, f"**_POST.nii.gz")
@@ -327,16 +328,75 @@ class DataSample:
             self.registered_transform = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
         return self.registered_transform
 
+
+class Lesion_Trajectory():
+    def __init__(self, patient_id=None, label_id=None, sample_ids:list=None, sizes=None, load_from_trajectory_path=None):
+        if load_from_trajectory_path is not None:
+            self.path = load_from_trajectory_path
+            self.load_lesion_trajectory()
+            self.sample_ids = None
+        else:
+            self.path = os.path.join(MRI_Dataloader(fast_load=True).data_prediction_path, patient_id, f"lesion_trajectories_{label_id}.npz")
+            self.patient_id = patient_id
+            self.label_id = label_id
+            self.sample_ids = sample_ids
+            self.dates = []
+            patient = Patient(patient_id)
+            for sample in patient.samples:
+                sample.load_mri_segmentation()
+                self.dates.append(sample.date)
+            self.n_scans = len(sample_ids)
+            self.sizes = sizes
+
+    def save_lesion_trajectory(self):
+        export = {
+            "patient_id": self.patient_id,
+            "label_id": self.label_id,
+            "dates": self.dates,
+            "n_scans": self.n_scans,
+            "sizes": self.sizes,
+        }
+        
+        np.savez(self.path, **export)
+
+    def load_lesion_trajectory(self):
+        if os.path.exists(self.path):
+            data = np.load(self.path)
+            self.patient_id = data["patient_id"].item()
+            self.label_id = data["label_id"].item()
+            self.dates = data["dates"].tolist()
+            self.n_scans = data["n_scans"].item()
+        else:
+            print(f"Lesion trajectory file not found at {self.path}. Cannot load trajectory.")
+
+    def load_sizes(self):
+        sizes = []
+        patient = Patient(self.patient_id)
+        for i, date in enumerate(patient.dates):
+            if date not in self.dates:
+                continue
+            
+            sample = patient.samples[i]
+            data, num_features = sample.load_lesion_trajectory_segmentation()
+            size = np.sum(data == self.label_id)
+            sizes.append(size)
+        self.sizes = sizes
+        return sizes
+
+
 class MRI_Dataloader:
     def __init__(self, data_path='data/entire_yale_dataset/PRE_POST_YBML', fast_load=False):
+
+        self.data_path = data_path
+        self.data_prediction_path = data_path.replace("PRE_POST_YBML", "predictions")
 
         if not fast_load:
             globs = glob.glob(data_path + "/**/**/*POST.nii.gz", recursive=True)
             self.pre_post_samples = list(set(sorted(globs))) 
             self.patient_ids = sorted(list(set([path.split(os.path.sep)[-3] for path in self.pre_post_samples])))
 
-        self.data_path = data_path
-        self.data_prediction_path = data_path.replace("PRE_POST_YBML", "predictions")
+            globs = glob.glob(self.data_prediction_path + "/**/lesion_trajectories_*")
+            self.lesion_trajectory_paths = list(set(sorted(globs))) 
 
 
     def __iter__(self):
@@ -361,12 +421,18 @@ class MRI_Dataloader:
     def iterate_patients(self):
         for patient_id in self.patient_ids:
             yield Patient(patient_id, dataloader=self)
+    
+    def iterate_trajectories(self):
+        for trajectory_path in self.lesion_trajectory_paths:
+            yield Lesion_Trajectory(load_from_trajectory_path=trajectory_path)
+            
 
 class Patient:
     def __init__(self, patient_id, dataloader=MRI_Dataloader(), registrator=Registrator()):
         self.patient_id = patient_id
         self.dataloader = dataloader
         self.samples = self.dataloader.find_by_patient_id(patient_id)
+        self.dates = [sample.date for sample in self.samples]
         self.path = os.path.join(self.dataloader.data_path, patient_id)
         self.registrator = registrator
         self.load_registered_transforms()
@@ -646,7 +712,7 @@ class Patient:
         labeled_mask_cache = []
         sum_mask = np.zeros(vol_shape, dtype=np.uint8)
         for i, sample in enumerate(self.samples):
-            labeled_mask = patient.registrator.rigid_transform(
+            labeled_mask = self.registrator.rigid_transform(
                 sample.load_mri_segmentation(), 
                 self.registered_transforms[i], 
                 vol_shape
@@ -662,25 +728,30 @@ class Patient:
         labeled_lesion_mask, num_features = ndimage.label(sum_mask_dialated)
         labeled_lesion_mask = sum_mask * labeled_lesion_mask
 
+        sizes = np.zeros((len(self.samples), num_features), dtype=np.uint32)
+        # for every lesion trajectory
         for i in range(1, num_features + 1):
             lesion_mask = (labeled_lesion_mask == i).astype(np.uint8)
 
             sample_ids = []
+            # we check if the lesion is present in each sample
             for j in range(len(self.samples)):
                 lesion_mask_sample = lesion_mask * labeled_mask_cache[j]
                 if np.sum(lesion_mask_sample) > 0:
                     sample_ids.append(j)
+                    sizes[j][i-1] = np.sum(lesion_mask_sample)
                     labeled_mask_cache[j][lesion_mask_sample > 0] = i
             
 
-            trajectory = Lesion_Trajectory(self.patient_id, i, sample_ids)
+            trajectory = Lesion_Trajectory(patient_id=self.patient_id, label_id=i, sample_ids=sample_ids, sizes=sizes[:,i])
             trajectory.save_lesion_trajectory()
 
         for i, sample in enumerate(self.samples):
             np.savez(
                 sample.lesion_trajectory_path, 
                 num_features=num_features, 
-                labeled_array=labeled_mask_cache[i]
+                labeled_array=labeled_mask_cache[i],
+                sizes=sizes[i]
             )
 
 
@@ -694,7 +765,7 @@ class Patient:
         for i, sample in enumerate(self.samples):
             labeled_mask = sample.load_mri_segmentation()
             params = self.registered_transforms[i]
-            labeled_mask = patient.registrator.rigid_transform(labeled_mask, params, vol_shape)
+            labeled_mask = self.registrator.rigid_transform(labeled_mask, params, vol_shape)
             
             # Determine color for this timepoint
             color_idx = int((i / len(self.samples)) * (len(colors) - 1))
@@ -758,29 +829,6 @@ class Patient:
         
         fig.show()
 
-
-class Lesion_Trajectory():
-    def __init__(self, patient_id, label_id, sample_ids):
-        self.path = os.path.join(MRI_Dataloader(fast_load=True).data_prediction_path, patient_id, f"lesion_trajectories_{label_id}.json")
-        self.patient_id = patient_id
-        self.label_id = label_id
-        self.sample_ids = sample_ids
-        self.dates = []
-        patient = Patient(patient_id)
-        for sample in patient.samples:
-            sample.load_mri_segmentation()
-            self.dates.append(sample.date)
-        self.n_scans = len(sample_ids)
-
-    def save_lesion_trajectory(self):
-        export = {
-            "patient_id": self.patient_id,
-            "label_id": self.label_id,
-            "dates": self.dates,
-            "n_scans": self.n_scans,
-        }
-        
-        np.savez(self.path, **export)
 
 
 # if __name__ == "__main__":
