@@ -21,6 +21,7 @@ import itertools
 from sklearn.cluster import AffinityPropagation
 from skimage.measure import marching_cubes
 import torch
+from datetime import datetime
 
 class Registrator:
     def __init__(self, device=None):
@@ -328,8 +329,7 @@ class DataSample:
             self.registered_transform = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
         return self.registered_transform
 
-
-class Lesion_Trajectory():
+class Lesion_Trajectory:
     def __init__(self, patient_id=None, label_id=None, sample_ids:list=None, sizes=None, load_from_trajectory_path=None):
         if load_from_trajectory_path is not None:
             self.path = load_from_trajectory_path
@@ -383,7 +383,6 @@ class Lesion_Trajectory():
         self.sizes = sizes
         return sizes
 
-
 class MRI_Dataloader:
     def __init__(self, data_path='data/entire_yale_dataset/PRE_POST_YBML', fast_load=False):
 
@@ -397,6 +396,8 @@ class MRI_Dataloader:
 
             globs = glob.glob(self.data_prediction_path + "/**/lesion_trajectories_*")
             self.lesion_trajectory_paths = list(set(sorted(globs))) 
+        
+        self.cache_lesion_trajectories = None
 
 
     def __iter__(self):
@@ -425,7 +426,177 @@ class MRI_Dataloader:
     def iterate_trajectories(self):
         for trajectory_path in self.lesion_trajectory_paths:
             yield Lesion_Trajectory(load_from_trajectory_path=trajectory_path)
+    
+    def cache_lesion_trajectories_from_n_scans(self, n_scans=8):
+        trajectories = []
+        for trj in self.iterate_trajectories():
+            if len(trj.dates) < n_scans: continue
+            trajectories.append(trj)
+
+        print(f"Found {len(trajectories)} trajectories with at least {n_scans} scans.")
+        self.cache_lesion_trajectories = trajectories
             
+    def plot_lesion_trajectories_line_plot(self, trajectories=None, x_ticks_real_time=False):
+        if trajectories is None and self.cache_lesion_trajectories is not None:
+            trajectories = self.cache_lesion_trajectories
+        elif trajectories is None and self.cache_lesion_trajectories is None:
+            print("No trajectories provided and no cached trajectories found. Please provide trajectories or cache them first with self.cache_lesion_trajectories_from_n_scans().")
+            return
+        
+        fig = px.line()
+
+        for i, trj in enumerate(trajectories):
+            
+            if x_ticks_real_time:
+                dates = [datetime.strptime(d, "%Y-%m-%d") for d in trj.dates]
+                first_date = dates[0]
+                days_since_first = [(d - first_date).days for d in dates]
+            else:
+                days_since_first = list(range(len(trj.dates)))
+
+
+            fig.add_scatter(
+                x=days_since_first, 
+                y=np.exp(trj.sizes)**(1/3), 
+                mode='lines+markers',
+                name=f'Patient: {trj.patient_id}, Lesion: {trj.label_id}',
+                line=dict(color=px.colors.qualitative.Dark24[i % 24], width=1)
+            )
+
+        fig.update_layout(
+            title="Lesion Size Over Time",
+            xaxis_title="Time",
+            yaxis_title="Size",
+            yaxis_type="log",
+            template="plotly_white",
+            height=800
+        )
+
+        fig.show()
+
+    def plot_lesion_trajectories_heatmap(self, trajectories=None, skip_top=0, plot_change=False, normalize_rows=False):
+        """
+        Plot lesion trajectories as a heatmap.
+        
+        Args:
+            trajectories: List of trajectories to plot. Uses cached trajectories if None.
+            skip_top: Number of top trajectories to skip (by max size).
+            plot_change: If True, plot change rates instead of absolute sizes.
+            normalize_rows: If True, normalize each row to [0, 1].
+        """
+        if trajectories is None and self.cache_lesion_trajectories is not None:
+            trajectories = self.cache_lesion_trajectories
+        elif trajectories is None:
+            print("No trajectories provided and no cached trajectories found. "
+                "Please provide trajectories or cache them first with self.cache_lesion_trajectories_from_n_scans().")
+            return
+        
+        # Filter top trajectories if requested
+        trajectories = self._filter_top_trajectories(trajectories, skip_top)
+        
+        # Prepare heatmap data
+        heatmap_data, trj_list = self._prepare_heatmap_data(trajectories, plot_change, normalize_rows)
+        
+        # Sort by trajectory length
+        sorted_indices = sorted(range(len(trj_list)), key=lambda i: trj_list[i][1])
+        heatmap_data = heatmap_data[sorted_indices]
+        trj_list = [trj_list[i] for i in sorted_indices]
+        
+        # Create labels
+        labels = [f'Patient: {trj.patient_id}, Lesion: {trj.label_id} (n={length})' 
+                for trj, length in trj_list]
+        
+        # Create and display heatmap
+        self._create_heatmap(heatmap_data, labels, plot_change)
+
+    def _filter_top_trajectories(self, trajectories, skip_top):
+        """Filter out the top N trajectories by maximum size."""
+        trj_with_sizes = []
+        for trj in trajectories:
+            y = trj.sizes[trj.sizes != 0]
+            sizes = np.exp(y)**(1/3)
+            trj_with_sizes.append((trj, np.max(sizes)))
+        
+        # Sort by size and skip top ones
+        trj_with_sizes.sort(key=lambda x: x[1], reverse=True)
+        return [trj for trj, _ in trj_with_sizes[skip_top:]]
+
+    def _prepare_heatmap_data(self, trajectories, plot_change, normalize_rows):
+        """Prepare data for heatmap visualization."""
+        max_len = max([len(trj.sizes[trj.sizes != 0]) for trj in trajectories])
+        if plot_change:
+            max_len -= 1  # Change rates have one fewer point
+        
+        heatmap_data = []
+        trj_list = []
+        
+        for trj in trajectories:
+            y = trj.sizes[trj.sizes != 0]
+            sizes = np.exp(y)**(1/3)
+            
+            # Calculate change rates if requested
+            if plot_change:
+                data = np.diff(sizes)
+            else:
+                data = sizes
+            
+            # Pad with NaN
+            padded = np.full(max_len, np.nan)
+            padded[:len(data)] = data
+            
+            # Normalize rows if requested
+            if normalize_rows:
+                padded = self._normalize_row(padded)
+            
+            heatmap_data.append(padded)
+            trj_list.append((trj, len(sizes)))
+        
+        return np.array(heatmap_data), trj_list
+
+    def _normalize_row(self, row):
+        """Normalize a row to [0, 1]."""
+        valid_mask = ~np.isnan(row)
+        if not np.any(valid_mask):
+            return row
+        
+        min_val = np.nanmin(row)
+        max_val = np.nanmax(row)
+        
+        if max_val > min_val:
+            row[valid_mask] = (row[valid_mask] - min_val) / (max_val - min_val)
+        else:
+            row[valid_mask] = 0.5
+        
+        return row
+
+    def _create_heatmap(self, heatmap_data, labels, plot_change):
+        """Create and display the heatmap."""
+        max_len = heatmap_data.shape[1]
+        
+        if plot_change:
+            color_scale = "RdBu_r"
+            color_label = "Change Rate"
+            max_abs = np.nanmax(np.abs(heatmap_data))
+            zmin, zmax = -max_abs, max_abs
+        else:
+            color_scale = "Viridis"
+            color_label = "Size"
+            zmin, zmax = None, None
+        
+        fig = px.imshow(
+            heatmap_data,
+            labels=dict(x="Time", y="Trajectory", color=color_label),
+            x=list(range(max_len)),
+            y=labels,
+            color_continuous_scale=color_scale,
+            title=f"Lesion {'Change Rates' if plot_change else 'Size'} Over Time (Heatmap - sorted by length)",
+            zmin=zmin,
+            zmax=zmax
+        )
+        
+        fig.update_layout(height=max(600, len(labels) * 15), width=900)
+        fig.show()
+
 
 class Patient:
     def __init__(self, patient_id, dataloader=MRI_Dataloader(), registrator=Registrator()):
@@ -837,7 +1008,6 @@ class Patient:
         )
         
         fig.show()
-
 
 
 # if __name__ == "__main__":
