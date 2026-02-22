@@ -334,15 +334,14 @@ class Lesion_Trajectory():
         if load_from_trajectory_path is not None:
             self.path = load_from_trajectory_path
             self.load_lesion_trajectory()
-            self.sample_ids = None
         else:
             self.path = os.path.join(MRI_Dataloader(fast_load=True).data_prediction_path, patient_id, f"lesion_trajectories_{label_id}.npz")
             self.patient_id = patient_id
             self.label_id = label_id
-            self.sample_ids = sample_ids
             self.dates = []
             patient = Patient(patient_id)
-            for sample in patient.samples:
+            for i, sample in enumerate(patient.samples):
+                if i not in sample_ids: continue
                 sample.load_mri_segmentation()
                 self.dates.append(sample.date)
             self.n_scans = len(sample_ids)
@@ -366,6 +365,7 @@ class Lesion_Trajectory():
             self.label_id = data["label_id"].item()
             self.dates = data["dates"].tolist()
             self.n_scans = data["n_scans"].item()
+            self.sizes = data["sizes"]
         else:
             print(f"Lesion trajectory file not found at {self.path}. Cannot load trajectory.")
 
@@ -436,6 +436,7 @@ class Patient:
         self.path = os.path.join(self.dataloader.data_path, patient_id)
         self.registrator = registrator
         self.load_registered_transforms()
+        self.patient_trajectory_paths = glob.glob(os.path.join(self.dataloader.data_prediction_path, patient_id, "lesion_trajectories_*.npz"))
 
     def register_all_to_first(self, registrator: Registrator = Registrator()):
         """Register all images to the first image using linear translation only."""
@@ -708,6 +709,8 @@ class Patient:
 
     def merge_lesion_to_trajectory(self):
         vol_shape = self.samples[0].load_mri().shape
+        volume = self.samples[0].load_mri()
+        volume = np.sum(volume[volume > 0])
 
         labeled_mask_cache = []
         sum_mask = np.zeros(vol_shape, dtype=np.uint8)
@@ -716,7 +719,7 @@ class Patient:
                 sample.load_mri_segmentation(), 
                 self.registered_transforms[i], 
                 vol_shape
-            )
+            )   
 
             labeled_mask_cache.append(labeled_mask)
             sum_mask = sum_mask + labeled_mask
@@ -743,7 +746,7 @@ class Patient:
                     labeled_mask_cache[j][lesion_mask_sample > 0] = i
             
 
-            trajectory = Lesion_Trajectory(patient_id=self.patient_id, label_id=i, sample_ids=sample_ids, sizes=sizes[:,i])
+            trajectory = Lesion_Trajectory(patient_id=self.patient_id, label_id=i, sample_ids=sample_ids, sizes=np.log(sizes[:,i-1][sizes[:,i-1] != 0] / volume))
             trajectory.save_lesion_trajectory()
 
         for i, sample in enumerate(self.samples):
@@ -751,8 +754,14 @@ class Patient:
                 sample.lesion_trajectory_path, 
                 num_features=num_features, 
                 labeled_array=labeled_mask_cache[i],
-                sizes=sizes[i]
+                sizes=np.log(sizes[i]/volume),
             )
+    
+    def load_lesion_trajectories(self):
+        trajectories = []
+        for path in self.patient_trajectory_paths:
+            trajectories.append(Lesion_Trajectory(load_from_trajectory_path=path))
+        return trajectories
 
 
     def plot_lesion_shape_trajectory(self):
