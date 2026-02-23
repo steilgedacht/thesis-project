@@ -2,7 +2,6 @@ import torch
 import os
 from multiprocessing import freeze_support
 import glob
-import nibabel as nib
 import shutil
 
 PATH_TO_DATASET = "data/entire_yale_dataset/predictions/"

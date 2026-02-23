@@ -14,7 +14,6 @@ import plotly.express as px
 from sklearn.cluster import KMeans
 from skimage.measure import find_contours
 from scipy.ndimage import affine_transform
-from scipy.spatial.transform import Rotation as R
 from plotly.colors import qualitative
 import plotly.graph_objects as go
 import itertools
@@ -597,7 +596,6 @@ class MRI_Dataloader:
         fig.update_layout(height=max(600, len(labels) * 15), width=900)
         fig.show()
 
-
 class Patient:
     def __init__(self, patient_id, dataloader=MRI_Dataloader(), registrator=Registrator()):
         self.patient_id = patient_id
@@ -1008,11 +1006,4 @@ class Patient:
         )
         
         fig.show()
-
-
-# if __name__ == "__main__":
-#     dataloader = MRI_Dataloader()
-#     for i in dataloader:
-#         print(i)
-#         break
 
