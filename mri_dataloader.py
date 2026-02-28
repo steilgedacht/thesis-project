@@ -381,6 +381,31 @@ class Lesion_Trajectory:
             sizes.append(size)
         self.sizes = sizes
         return sizes
+    
+    def load_labels_for_inr(self, selected_date=None):
+
+        dates = [datetime.strptime(d, "%Y-%m-%d") for d in self.dates]
+        first_date = dates[0]
+        days_since_first = [(d - first_date).days for d in dates]
+
+        data = []
+        for i, date in enumerate(self.dates):
+            if selected_date is not None:
+                date = selected_date
+                i = self.dates.index(selected_date)
+
+            path = os.path.join(*self.path.split(os.path.sep)[:-1] + [date] + ["trajectory.npz"])
+            if os.path.exists(path):
+                data_segmentation = np.load(path)
+                data_segmentation = np.where(data_segmentation["labeled_array"] == self.label_id, 1, 0).astype(np.uint8)
+
+                data.append((data_segmentation, days_since_first[i]))
+                if selected_date is not None:
+                    return data[0]
+            else:
+                continue
+        
+        return data
 
 class MRI_Dataloader:
     def __init__(self, data_path='data/entire_yale_dataset/PRE_POST_YBML', fast_load=False):
