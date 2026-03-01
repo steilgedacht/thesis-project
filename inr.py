@@ -29,10 +29,9 @@ class SirenLayer(nn.Module):
                 # Hidden layers: uniform initialization based on omega_0
                 bound = np.sqrt(6 / self.in_features) / self.omega_0
                 self.linear.weight.uniform_(-bound, bound)
-            
-            if self.linear.bias is not None:
-                self.linear.bias.uniform_(-bound if not self.is_first else 1 / self.in_features, 
-                                         bound if not self.is_first else 1 / self.in_features)
+
+                if self.linear.bias is not None:
+                    self.linear.bias.uniform_(-bound if not self.is_first else 1 / self.in_features, bound if not self.is_first else 1 / self.in_features)
     
     def forward(self, x):
         return torch.sin(self.omega_0 * self.linear(x))
@@ -44,26 +43,21 @@ class LesionINR(nn.Module):
         self.layers = nn.ModuleList([
             SirenLayer(input_dim, hidden_dim, is_first=True, omega_0=omega_0),
             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-            SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
             SirenLayer(hidden_dim, output_dim, is_first=False, omega_0=omega_0),
         ])
-        # Final sigmoid for output normalization
         self.sigmoid = nn.Sigmoid()
     
-    def forward(self, coords):
-        x = coords
-        for i, layer in enumerate(self.layers):
+    def forward(self, x):
+        for layer in self.layers:
             x = layer(x)
-            # Apply sigmoid only to the final output
-            if i == len(self.layers) - 1:
-                x = self.sigmoid(x)
+        x = self.sigmoid(x)
         return x
 
 class LesionDataset(Dataset):
     def __init__(self, trajectories, device='cuda'):
         self.device = device
         self.trajectories = trajectories
-        self.shape = (64, 64, 20)
+        self.shape = (32, 32, 10)
         self.meshgrid = np.meshgrid(np.linspace(0, 1, self.shape[0]),
                               np.linspace(0, 1, self.shape[1]),
                               np.linspace(0, 1, self.shape[2]),
@@ -95,15 +89,12 @@ class LesionDataset(Dataset):
         )
         
         labels = zoom(labels, zoom_factors, order=1)
-        x, y, z = self.meshgrid
+        x, y, z = np.copy(self.meshgrid)
         
         coords = np.stack([x, y, z, np.full_like(x, time_point)], axis=-1)
         coords = coords.reshape(-1, 4)
         labels = np.concatenate([label.flatten() for label in labels])
-        
-        coords = torch.tensor(coords, dtype=torch.float32, device=self.device)
-        labels = torch.tensor(labels, dtype=torch.float32, device=self.device).unsqueeze(1)
-        
+                
         return coords, labels
     
 def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
@@ -111,6 +102,7 @@ def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
     criterion = nn.MSELoss()
     
     model.to(device)
+    model = model.to(torch.bfloat16)
     losses = []
     
     mlflow.log_param("epochs", epochs)
@@ -123,6 +115,10 @@ def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
         with mlflow.start_span(f"Epoch {epoch+1}"):
             total_loss = 0
             for coords, labels in train_loader:
+
+                coords = torch.tensor(coords, dtype=torch.bfloat16, device=device)
+                labels = torch.tensor(labels, dtype=torch.bfloat16, device=device).unsqueeze(1)
+
                 optimizer.zero_grad()
                 predictions = model(coords)
                 loss = criterion(predictions, labels)
@@ -150,24 +146,23 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # MLflow Run starten
 with mlflow.start_run():
-    with mlflow.start_span("Experiment"):
-        mlflow.log_param("device", device)
+    mlflow.log_param("device", device)
 
-        with mlflow.start_span("Data Loading and Preprocessing"):
-            mri_dataloader = MRI_Dataloader()
-            mri_dataloader.cache_lesion_trajectories_from_n_scans(6)
-            
-            trajectories = mri_dataloader.cache_lesion_trajectories
-            
-            dataset = LesionDataset(trajectories, device=device)
-            train_loader = DataLoader(dataset, batch_size=8, shuffle=True)
-            
-            mlflow.log_param("dataset_size", len(dataset))
-            
-            model = LesionINR(input_dim=4, hidden_dim=128, output_dim=1)
+    with mlflow.start_span("Data Loading and Preprocessing"):
+        mri_dataloader = MRI_Dataloader()
+        mri_dataloader.cache_lesion_trajectories_from_n_scans(6)
         
-        with mlflow.start_span("Model Training"):
-            losses = train_inr(model, train_loader, epochs=100, lr=1e-3, device=device)
+        trajectories = mri_dataloader.cache_lesion_trajectories
         
-        final_loss = losses[-1]
-        mlflow.log_metric("final_loss", final_loss)
+        dataset = LesionDataset(trajectories, device=device)
+        train_loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=1)
+        
+        mlflow.log_param("dataset_size", len(dataset))
+        
+        model = LesionINR(input_dim=4, hidden_dim=128, output_dim=1)
+    
+    with mlflow.start_span("Model Training"):
+        losses = train_inr(model, train_loader, epochs=100, lr=1e-3, device=device)
+    
+    final_loss = losses[-1]
+    mlflow.log_metric("final_loss", final_loss)
