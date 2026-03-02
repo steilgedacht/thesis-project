@@ -386,7 +386,8 @@ class Lesion_Trajectory:
 
         dates = [datetime.strptime(d, "%Y-%m-%d") for d in self.dates]
         first_date = dates[0]
-        days_since_first = [(d - first_date).days for d in dates]
+        total_days = (dates[-1] - first_date).days
+        days_since_first = [((d - first_date).days / total_days) * 2 - 1 for d in dates]
 
         data = []
         for i, date in enumerate(self.dates):
