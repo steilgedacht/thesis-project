@@ -261,6 +261,8 @@ def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
             optimizer.step()
             total_loss += loss.item()
             mlflow.log_metric("training_loss", loss.item(), step=global_step)
+            mlflow.log_metric("training_loss_bce", loss_bce.item(), step=global_step)
+            mlflow.log_metric("training_loss_dice", loss_dice.item(), step=global_step)
             mlflow.log_metric("number_of_correctly_predicted_1_labels", (predictions>0.5).sum().item() / (labels > 0.5).sum().item(), step=global_step)
             mlflow.log_metric("number_of_correctly_predicted_0_labels", (predictions<=0.5).sum().item() / (labels <= 0.5).sum().item(), step=global_step)
             global_step += 1
@@ -302,7 +304,7 @@ with mlflow.start_run():
     
     model = LesionINR(len(trajectories), latent_dim=64, input_dim=4, hidden_dim=2048, output_dim=1)
 
-    losses = train_inr(model, train_loader, epochs=150, lr=1e-4, device=device)
+    losses = train_inr(model, train_loader, epochs=150, lr=1e-5, device=device)
     
     final_loss = losses[-1]
     mlflow.log_metric("final_train_loss", final_loss)
