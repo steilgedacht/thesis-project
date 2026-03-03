@@ -78,6 +78,11 @@ class LesionINR(nn.Module):
             
         return self.final_layer(x)
 
+def dice_loss(pred, target, smooth=1e-6):
+    pred = torch.sigmoid(pred)
+    intersection = (pred * target).sum()
+    return 1 - ((2. * intersection + smooth) / (pred.sum() + target.sum() + smooth))
+
 # class SirenLayer(nn.Module):
 #     """SIREN layer with sine activation and proper weight initialization."""
 #     def __init__(self, in_features, out_features, is_first=False, omega_0=1.0, bias=True):
@@ -220,10 +225,10 @@ class LesionDataset(Dataset):
         return coords.astype(np.float32), labels_sampled.astype(np.float32), patient_idx        
     
 def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.BCEWithLogitsLoss()
-    
+
     model.to(device)
     losses = []
     
@@ -248,8 +253,11 @@ def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
 
             optimizer.zero_grad()
             predictions = model(coords, patient_idx)
-            loss = criterion(predictions, labels)
+            loss_bce = criterion(predictions, labels)
+            loss_dice = dice_loss(predictions, labels)
+            loss = loss_bce + loss_dice
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
             optimizer.step()
             total_loss += loss.item()
             mlflow.log_metric("training_loss", loss.item(), step=global_step)
@@ -283,7 +291,7 @@ with mlflow.start_run():
     mlflow.log_param("device", device)
 
     mri_dataloader = MRI_Dataloader()
-    mri_dataloader.cache_lesion_trajectories_from_n_scans(12)
+    mri_dataloader.cache_lesion_trajectories_from_n_scans(10)
     
     trajectories = mri_dataloader.cache_lesion_trajectories
     
