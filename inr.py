@@ -10,60 +10,126 @@ from scipy.ndimage import zoom
 from scipy.ndimage import binary_dilation
 from tqdm import tqdm
 
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
 mlflow.set_experiment("Lesion_INR_Training")
 
-class SirenLayer(nn.Module):
-    """SIREN layer with sine activation and proper weight initialization."""
-    def __init__(self, in_features, out_features, is_first=False, omega_0=1.0, bias=True):
+class ModulatedSirenLayer(nn.Module):
+    def __init__(self, in_features, out_features, latent_dim, is_first=False, omega_0=30.0):
         super().__init__()
-        self.in_features = in_features
-        self.is_first = is_first
         self.omega_0 = omega_0
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.is_first = is_first
+        self.linear = nn.Linear(in_features, out_features)
+        
+        # FiLM generator: projects latent vector to scale (gamma) and shift (beta)
+        # We use out_features * 2 because we need a pair for every neuron in this layer
+        self.conditioning_lin = nn.Linear(latent_dim, out_features) 
+        
         self.init_weights()
-    
+
     def init_weights(self):
         with torch.no_grad():
             if self.is_first:
-                # First layer: uniform initialization in [-1/in_features, 1/in_features]
-                self.linear.weight.uniform_(-1 / self.in_features, 1 / self.in_features)
+                self.linear.weight.uniform_(-1 / self.linear.in_features, 1 / self.linear.in_features)
             else:
-                # Hidden layers: uniform initialization based on omega_0
-                bound = np.sqrt(6 / self.in_features) / self.omega_0
+                bound = np.sqrt(6 / self.linear.in_features) / self.omega_0
                 self.linear.weight.uniform_(-bound, bound)
 
-                if self.linear.bias is not None:
-                    self.linear.bias.uniform_(-bound if not self.is_first else 1 / self.in_features, bound if not self.is_first else 1 / self.in_features)
-    
-    def forward(self, x):
-        return torch.sin(self.omega_0 * self.linear(x))
+    def forward(self, x, latent):
+        # x shape: [batch, num_samples, hidden_dim]
+        # latent shape: [batch, latent_dim]
+        
+        # Generate modulation parameter from latent vector
+        # Unsqueeze to align with spatial samples: [batch, 1, hidden_dim]
+        modulation = self.conditioning_lin(latent).unsqueeze(1)
+        
+        # Apply SIREN logic with FiLM modulation
+        # We modulate the pre-activation features
+        return torch.sin(self.omega_0 * (self.linear(x) + modulation))
 
 class LesionINR(nn.Module):
     def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=30.0):
         super().__init__()
-        self.omega_0 = omega_0
-        combined_input_dim = input_dim + latent_dim
-        self.layers = nn.ModuleList([
-            SirenLayer(combined_input_dim, hidden_dim, is_first=True, omega_0=omega_0),
-            SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-            SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-            SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-            SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-            SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-            SirenLayer(hidden_dim, output_dim, is_first=False, omega_0=omega_0),
-        ])
-        self.sigmoid = nn.Sigmoid()
-    
         self.latent_vectors = nn.Embedding(numpatients, latent_dim)
-        torch.nn.init.normal_(self.latent_vectors.weight, std=0.01)
+        
+        # First layer (takes coordinates)
+        self.first_layer = ModulatedSirenLayer(input_dim, hidden_dim, latent_dim, is_first=True, omega_0=omega_0)
+        
+        # Hidden layers
+        self.layers = nn.ModuleList([
+            ModulatedSirenLayer(hidden_dim, hidden_dim, latent_dim, is_first=False, omega_0=omega_0)
+            for _ in range(4)
+        ])
+        
+        # Final layer (no modulation needed usually, just maps to output)
+        self.final_layer = nn.Linear(hidden_dim, output_dim)
+        self.omega_0 = omega_0
+        
+        # Proper init for latent
+        torch.nn.init.normal_(self.latent_vectors.weight, std=1.0 / np.sqrt(latent_dim))
 
     def forward(self, x, patient_idx):
-        z = self.latent_vectors(patient_idx)
-        z_expanded = z.unsqueeze(1).expand(-1, x.size(1), -1) 
-        x = torch.cat([x, z_expanded], dim=-1)
+        # Get latent vector for the patient
+        z = self.latent_vectors(patient_idx) # [batch, latent_dim]
+        
+        # Pass through layers, injecting z at every step
+        x = self.first_layer(x, z)
         for layer in self.layers:
-            x = layer(x)
-        return x
+            x = layer(x, z)
+            
+        return self.final_layer(x)
+
+# class SirenLayer(nn.Module):
+#     """SIREN layer with sine activation and proper weight initialization."""
+#     def __init__(self, in_features, out_features, is_first=False, omega_0=1.0, bias=True):
+#         super().__init__()
+#         self.in_features = in_features
+#         self.is_first = is_first
+#         self.omega_0 = omega_0
+#         self.linear = nn.Linear(in_features, out_features, bias=bias)
+#         self.init_weights()
+    
+#     def init_weights(self):
+#         with torch.no_grad():
+#             if self.is_first:
+#                 # First layer: uniform initialization in [-1/in_features, 1/in_features]
+#                 self.linear.weight.uniform_(-1 / self.in_features, 1 / self.in_features)
+#             else:
+#                 # Hidden layers: uniform initialization based on omega_0
+#                 bound = np.sqrt(6 / self.in_features) / self.omega_0
+#                 self.linear.weight.uniform_(-bound, bound)
+
+#                 if self.linear.bias is not None:
+#                     self.linear.bias.uniform_(-bound if not self.is_first else 1 / self.in_features, bound if not self.is_first else 1 / self.in_features)
+    
+#     def forward(self, x):
+#         return torch.sin(self.omega_0 * self.linear(x))
+
+# class LesionINR(nn.Module):
+#     def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=30.0):
+#         super().__init__()
+#         self.omega_0 = omega_0
+#         combined_input_dim = input_dim + latent_dim
+#         self.layers = nn.ModuleList([
+#             SirenLayer(combined_input_dim, hidden_dim, is_first=True, omega_0=omega_0),
+#             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
+#             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
+#             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
+#             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
+#             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
+#             SirenLayer(hidden_dim, output_dim, is_first=False, omega_0=omega_0),
+#         ])
+#         self.sigmoid = nn.Sigmoid()
+    
+#         self.latent_vectors = nn.Embedding(numpatients, latent_dim)
+#         torch.nn.init.normal_(self.latent_vectors.weight, std=1.0 / (latent_dim**0.5))
+
+#     def forward(self, x, patient_idx):
+#         z = self.latent_vectors(patient_idx)
+#         z_expanded = z.unsqueeze(1).expand(-1, x.size(1), -1) 
+#         x = torch.cat([x, z_expanded], dim=-1)
+#         for layer in self.layers:
+#             x = layer(x)
+#         return x
 
 class LesionDataset(Dataset):
     def __init__(self, trajectories, device='cuda', context_radius=5, background_samples_proportion=1):
@@ -107,65 +173,51 @@ class LesionDataset(Dataset):
         labels = zoom(labels, zoom_factors, order=1)
         x, y, z = np.copy(self.meshgrid)
         
-        # find lesion voxels
+
+        # 1. Labels binarisieren für schnellere Logik
         lesion_mask = labels > 0.5
-        lesion_coords = np.argwhere(lesion_mask)
         
-        # Sammle Sample-Indizes
-        sampled_indices = []
+        # 2. Koordinaten der positiven Voxel (Läsion)
+        pos_coords = np.argwhere(lesion_mask)
         
-        # 1. Alle Läsions-Voxel
-        sampled_indices.extend([tuple(coord) for coord in lesion_coords])
+        # 3. Negative Voxel (Hintergrund) finden
+        # Trick: Statt argwhere auf dem ganzen Bild, sample einfach zufällige Punkte
+        # und schaue, ob sie NICHT in der Maske liegen.
+        MAX_SAMPLES = 1000
+        num_neg_needed = MAX_SAMPLES // 2
+        neg_coords = []
+        while len(neg_coords) < num_neg_needed:
+            candidate_coords = np.array([
+                np.random.randint(0, s, num_neg_needed) for s in self.shape
+            ]).T
+            # Prüfe welche Kandidaten Hintergrund sind
+            is_bg = labels[candidate_coords[:,0], candidate_coords[:,1], candidate_coords[:,2]] <= 0.5
+            neg_coords.extend(candidate_coords[is_bg])
         
-        # 2. Context um Läsion (Dilation)
-        context_mask = binary_dilation(lesion_mask, iterations=self.context_radius)
-        context_mask = context_mask & ~lesion_mask  # Nur Ring um Läsion, nicht Läsion selbst
-        context_coords = np.argwhere(context_mask)
-        sampled_indices.extend([tuple(coord) for coord in context_coords])
-
-        MAX_SAMPLES = 10_000
+        neg_coords = np.array(neg_coords)[:num_neg_needed]
         
-        # 3. Zufällige Background-Samples
-        background_coords = np.argwhere(~context_mask & ~lesion_mask)
-        if len(background_coords) > 0:
-            background_idx = np.random.choice(len(background_coords), 
-                                            #  size=int(len(sampled_indices) * self.background_samples_proportion), 
-                                             size=150_000, 
-                                             replace=False)
-            sampled_indices.extend([tuple(background_coords[i]) for i in background_idx])
+        # 4. Positive samples (mit Replacement falls Läsion klein ist)
+        if len(pos_coords) == 0:
+            all_sampled_indices = np.concatenate([neg_coords, neg_coords], axis=0)
         else:
-            sampled_indices.extend([tuple(coord) for coord in background_coords])
+            pos_idx = np.random.choice(len(pos_coords), size=MAX_SAMPLES//2, replace=True)
+            pos_sampled = pos_coords[pos_idx]
+            
+            # 5. Zusammenführen
+            all_sampled_indices = np.vstack([pos_sampled, neg_coords])
         
-        # Konvertiere zu Koordinaten und Labels
-        coords_list = []
-        labels_list = []
-
-        # shuffle sampled indices
-        np.random.shuffle(sampled_indices)
+        # 6. Vektorisierte Extraktion aus meshgrid (Kein Loop!)
+        i, j, k = all_sampled_indices.T
+        coords = np.stack([
+            self.meshgrid[0][i, j, k] * 2 - 1,
+            self.meshgrid[1][i, j, k] * 2 - 1,
+            self.meshgrid[2][i, j, k] * 2 - 1,
+            np.full(len(i), time_point)
+        ], axis=1)
         
-        for idx_tuple in sampled_indices:
-            i, j, k = idx_tuple
-            coords_list.append([x[i, j, k] * 2 - 1, y[i, j, k] * 2 - 1, z[i, j, k] * 2 - 1, time_point])
-            labels_list.append(labels[i, j, k])
-        
-        coords = np.array(coords_list)
-        labels = np.array(labels_list)
+        labels_sampled = labels[i, j, k]
 
-        # sample equal number of both classes to have a balanced dataset
-        pos_indices = np.where(labels > 0.5)[0]
-        neg_indices = np.where(labels <= 0.5)[0]
-
-        if len(pos_indices) == 0:
-            # If no positive samples, return all negative samples
-            sampled_indices = neg_indices[:MAX_SAMPLES]
-        else:
-            pos_sampled = np.random.choice(pos_indices, size=MAX_SAMPLES//2, replace=True)
-            neg_sampled = np.random.choice(neg_indices, size=MAX_SAMPLES//2, replace=True)
-            sampled_indices = np.concatenate([pos_sampled, neg_sampled])
-        coords = coords[sampled_indices]
-        labels = labels[sampled_indices]
-                
-        return coords, labels, patient_idx
+        return coords.astype(np.float32), labels_sampled.astype(np.float32), patient_idx        
     
 def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -173,7 +225,6 @@ def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
     criterion = nn.BCEWithLogitsLoss()
     
     model.to(device)
-    model = model.to(torch.float16)
     losses = []
     
     mlflow.log_param("epochs", epochs)
@@ -182,41 +233,45 @@ def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
     mlflow.log_param("omega_0", model.omega_0)
     mlflow.log_param("batch_size", train_loader.batch_size)
     
+    global_step = 0
+
     for epoch in range(epochs):
-        with mlflow.start_span(f"Epoch {epoch+1}"):
-            total_loss = 0
-            for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader)):
+        total_loss = 0
+        for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
 
-                coords = coords.to(device).to(torch.float16)
-                labels = labels.to(device).to(torch.float16).unsqueeze(-1)
-                patient_idx = patient_idx.to(device).long()
+            coords = coords.to(device)
+            labels = labels.to(device).unsqueeze(-1)
+            patient_idx = patient_idx.to(device)
 
-                if coords.shape[1] == 0:
-                    continue
+            if coords.shape[1] == 0:
+                continue
 
-                optimizer.zero_grad()
-                predictions = model(coords, patient_idx)
-                loss = criterion(predictions, labels)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                mlflow.log_metric("train_loss", loss.item(), step=epoch * len(train_loader) + i)
+            optimizer.zero_grad()
+            predictions = model(coords, patient_idx)
+            loss = criterion(predictions, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            mlflow.log_metric("training_loss", loss.item(), step=global_step)
+            mlflow.log_metric("number_of_correctly_predicted_1_labels", (predictions>0.5).sum().item() / (labels > 0.5).sum().item(), step=global_step)
+            mlflow.log_metric("number_of_correctly_predicted_0_labels", (predictions<=0.5).sum().item() / (labels <= 0.5).sum().item(), step=global_step)
+            global_step += 1
 
-                if i % 10 == 0:
-                    del coords, labels, patient_idx, predictions, loss
-                    torch.cuda.empty_cache()
-            scheduler.step()
+            if i % 10 == 0:
+                del coords, labels, patient_idx, predictions, loss
+                torch.cuda.empty_cache()
+        
+        mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
+        scheduler.step()
 
-            
-            avg_loss = total_loss / len(train_loader)
-            losses.append(avg_loss)
-            
-            mlflow.log_metric("train_loss_after_epoch", avg_loss, step=epoch * len(train_loader))
-            
-            if (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+        
+        avg_loss = total_loss / len(train_loader)
+        losses.append(avg_loss)        
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
     
-    mlflow.pytorch.log_model(model, "lesion_inr_model")
+    mlflow.pytorch.log_model(model, name="lesion_inr_model")
     
     return losses
 
@@ -227,21 +282,19 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 with mlflow.start_run():
     mlflow.log_param("device", device)
 
-    with mlflow.start_span("Data Loading and Preprocessing"):
-        mri_dataloader = MRI_Dataloader()
-        mri_dataloader.cache_lesion_trajectories_from_n_scans(5)
-        
-        trajectories = mri_dataloader.cache_lesion_trajectories
-        
-        dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device)
-        train_loader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=6)
-        
-        mlflow.log_param("dataset_size", len(dataset))
-        
-        model = LesionINR(len(trajectories), input_dim=4, hidden_dim=512, output_dim=1)
+    mri_dataloader = MRI_Dataloader()
+    mri_dataloader.cache_lesion_trajectories_from_n_scans(12)
     
-    with mlflow.start_span("Model Training"):
-        losses = train_inr(model, train_loader, epochs=100, lr=1e-3, device=device)
+    trajectories = mri_dataloader.cache_lesion_trajectories
+    
+    dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device)
+    train_loader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=6)
+    
+    mlflow.log_param("dataset_size", len(dataset))
+    
+    model = LesionINR(len(trajectories), latent_dim=64, input_dim=4, hidden_dim=2048, output_dim=1)
+
+    losses = train_inr(model, train_loader, epochs=150, lr=1e-4, device=device)
     
     final_loss = losses[-1]
-    mlflow.log_metric("final_loss", final_loss)
+    mlflow.log_metric("final_train_loss", final_loss)
