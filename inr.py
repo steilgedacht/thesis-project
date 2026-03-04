@@ -7,7 +7,6 @@ import mlflow
 import mlflow.pytorch
 from mri_dataloader import MRI_Dataloader, Patient
 from scipy.ndimage import zoom
-from scipy.ndimage import binary_dilation
 from tqdm import tqdm
 
 mlflow.set_tracking_uri("http://127.0.0.1:5000")
@@ -82,59 +81,6 @@ def dice_loss(pred, target, smooth=1e-6):
     pred = torch.sigmoid(pred)
     intersection = (pred * target).sum()
     return 1 - ((2. * intersection + smooth) / (pred.sum() + target.sum() + smooth))
-
-# class SirenLayer(nn.Module):
-#     """SIREN layer with sine activation and proper weight initialization."""
-#     def __init__(self, in_features, out_features, is_first=False, omega_0=1.0, bias=True):
-#         super().__init__()
-#         self.in_features = in_features
-#         self.is_first = is_first
-#         self.omega_0 = omega_0
-#         self.linear = nn.Linear(in_features, out_features, bias=bias)
-#         self.init_weights()
-    
-#     def init_weights(self):
-#         with torch.no_grad():
-#             if self.is_first:
-#                 # First layer: uniform initialization in [-1/in_features, 1/in_features]
-#                 self.linear.weight.uniform_(-1 / self.in_features, 1 / self.in_features)
-#             else:
-#                 # Hidden layers: uniform initialization based on omega_0
-#                 bound = np.sqrt(6 / self.in_features) / self.omega_0
-#                 self.linear.weight.uniform_(-bound, bound)
-
-#                 if self.linear.bias is not None:
-#                     self.linear.bias.uniform_(-bound if not self.is_first else 1 / self.in_features, bound if not self.is_first else 1 / self.in_features)
-    
-#     def forward(self, x):
-#         return torch.sin(self.omega_0 * self.linear(x))
-
-# class LesionINR(nn.Module):
-#     def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=30.0):
-#         super().__init__()
-#         self.omega_0 = omega_0
-#         combined_input_dim = input_dim + latent_dim
-#         self.layers = nn.ModuleList([
-#             SirenLayer(combined_input_dim, hidden_dim, is_first=True, omega_0=omega_0),
-#             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-#             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-#             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-#             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-#             SirenLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
-#             SirenLayer(hidden_dim, output_dim, is_first=False, omega_0=omega_0),
-#         ])
-#         self.sigmoid = nn.Sigmoid()
-    
-#         self.latent_vectors = nn.Embedding(numpatients, latent_dim)
-#         torch.nn.init.normal_(self.latent_vectors.weight, std=1.0 / (latent_dim**0.5))
-
-#     def forward(self, x, patient_idx):
-#         z = self.latent_vectors(patient_idx)
-#         z_expanded = z.unsqueeze(1).expand(-1, x.size(1), -1) 
-#         x = torch.cat([x, z_expanded], dim=-1)
-#         for layer in self.layers:
-#             x = layer(x)
-#         return x
 
 class LesionDataset(Dataset):
     def __init__(self, trajectories, device='cuda', context_radius=5, background_samples_proportion=1):
@@ -226,7 +172,7 @@ class LesionDataset(Dataset):
     
 def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)    
     criterion = nn.BCEWithLogitsLoss()
 
     model.to(device)
@@ -293,7 +239,7 @@ with mlflow.start_run():
     mlflow.log_param("device", device)
 
     mri_dataloader = MRI_Dataloader()
-    mri_dataloader.cache_lesion_trajectories_from_n_scans(10)
+    mri_dataloader.cache_lesion_trajectories_from_n_scans(3)
     
     trajectories = mri_dataloader.cache_lesion_trajectories
     
