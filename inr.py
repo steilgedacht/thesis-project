@@ -8,6 +8,7 @@ import mlflow.pytorch
 from mri_dataloader import MRI_Dataloader, Patient
 from scipy.ndimage import zoom
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 mlflow.set_tracking_uri("http://127.0.0.1:5000")
 mlflow.set_experiment("Lesion_INR_Training")
@@ -83,7 +84,7 @@ def dice_loss(pred, target, smooth=1e-6):
     return 1 - ((2. * intersection + smooth) / (pred.sum() + target.sum() + smooth))
 
 class LesionDataset(Dataset):
-    def __init__(self, trajectories, device='cuda', context_radius=5, background_samples_proportion=1):
+    def __init__(self, trajectories, device='cuda', context_radius=5, background_samples_proportion=1, mode='train', val_date_idx=None, val_end_date_idx=None):
         self.device = device
         self.trajectories = trajectories
         self.shape = (500, 500, 50)
@@ -94,6 +95,20 @@ class LesionDataset(Dataset):
         self.context_radius = context_radius
         self.background_samples_proportion = background_samples_proportion
         self.patient_to_idx = {p.patient_id: i for i, p in enumerate(trajectories)}
+        self.mode = mode
+
+        if val_date_idx is None:
+            self.val_date_idx = [np.random.choice(trj.dates[1:-1]) for trj in trajectories]
+        else:
+            self.val_date_idx = val_date_idx
+
+        if val_end_date_idx is None:
+            self.val_end_date_idx = np.random.choice(range(len(trajectories)), size=len(trajectories) // 10, replace=False)
+        else:
+            self.val_end_date_idx = val_end_date_idx
+        
+        if self.mode == 'valid_extrapolation':
+            self.trajectories = [trj for i, trj in enumerate(trajectories) if i in self.val_end_date_idx]
 
     def __len__(self):
         return len(self.trajectories)
@@ -101,7 +116,18 @@ class LesionDataset(Dataset):
     def __getitem__(self, idx):
         trj = self.trajectories[idx]
         patient_idx = self.patient_to_idx[trj.patient_id]
-        random_time_point = str(np.random.choice(trj.dates))
+
+        if self.mode == 'train':
+            if idx in self.val_end_date_idx:
+                random_time_point = str(np.random.choice(trj.dates[:-1]))            
+            else:
+                random_time_point = str(np.random.choice(trj.dates))
+        else:
+            if self.mode == 'valid_extrapolation':
+                random_time_point = str(trj.dates[-1])
+            else:
+                random_time_point = str(self.val_date_idx[idx])
+
         try:
             labels, time_point = trj.load_labels_for_inr(selected_date=random_time_point)
         except:
@@ -169,8 +195,39 @@ class LesionDataset(Dataset):
         labels_sampled = labels[i, j, k]
 
         return coords.astype(np.float32), labels_sampled.astype(np.float32), patient_idx        
-    
-def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
+
+def plot_predictions(v_preds, v_labels, v_coords, epoch, title=""):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+
+    # Get 3D prediction volume by reshaping predictions
+    pred_volume = v_preds[0].squeeze().cpu().numpy()
+    label_volume = v_labels[0].squeeze().cpu().numpy()
+    pred_coords = v_coords[0,:,:3].squeeze().cpu().numpy()
+
+    # Top view (XY plane, max projection along Z)
+    axes[1,0].scatter(pred_coords[:,0], pred_coords[:,1], c=pred_volume, s=5, alpha=0.5, cmap='viridis', vmin=0, vmax=1)
+    axes[1,0].set_title('Prediction - Top View')
+    axes[1,0].axis('off')
+
+    # Side view (XZ plane, max projection along Y)
+    axes[0,0].scatter(pred_coords[:,0], pred_coords[:,2], c=pred_volume, s=5, alpha=0.5, cmap='viridis', vmin=0, vmax=1)
+    axes[0,0].set_title('Prediction - Front View')
+    axes[0,0].axis('off')
+
+    axes[0,1].scatter(pred_coords[:,1], pred_coords[:,2], c=pred_volume, s=5, alpha=0.5, cmap='viridis', vmin=0, vmax=1)
+    axes[0,1].set_title('Prediction - Side View')
+    axes[0,1].axis('off')
+
+    axes[1,1].scatter(pred_coords[:,0], pred_coords[:,1], c=label_volume, s=5, alpha=0.5, cmap='viridis', vmin=0, vmax=1)
+    axes[1,1].set_title('Labels')
+    axes[1,1].axis('off')
+
+
+    plt.tight_layout()
+    mlflow.log_figure(fig, f"{epoch}_epoch_predictions_{title}.png")
+    plt.close(fig)
+
+def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=100, lr=1e-3, device='cuda'):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)    
     criterion = nn.BCEWithLogitsLoss()
@@ -188,6 +245,7 @@ def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
 
     for epoch in range(epochs):
         total_loss = 0
+        model.train()
         for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
 
             coords = coords.to(device)
@@ -198,14 +256,18 @@ def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
                 continue
 
             optimizer.zero_grad()
+
             predictions = model(coords, patient_idx)
+
             loss_bce = criterion(predictions, labels)
             loss_dice = dice_loss(predictions, labels)
             loss = loss_bce + loss_dice
             loss.backward()
+            
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
             optimizer.step()
             total_loss += loss.item()
+
             mlflow.log_metric("training_loss", loss.item(), step=global_step)
             mlflow.log_metric("training_loss_bce", loss_bce.item(), step=global_step)
             mlflow.log_metric("training_loss_dice", loss_dice.item(), step=global_step)
@@ -217,9 +279,33 @@ def train_inr(model, train_loader, epochs=100, lr=1e-3, device='cuda'):
                 del coords, labels, patient_idx, predictions, loss
                 torch.cuda.empty_cache()
         
-        mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
-        scheduler.step()
+        plot_predictions(predictions, labels, coords, epoch, "train")
 
+        
+
+        model.eval()
+        total_val_inter = 0
+        with torch.no_grad():
+            for v_coords, v_labels, v_p_idx in valid_interpolation_loader:
+                v_coords, v_labels, v_p_idx = v_coords.to(device), v_labels.unsqueeze(-1).to(device), v_p_idx.to(device)
+                v_preds = model(v_coords, v_p_idx)
+                total_val_inter += (1 - dice_loss(v_preds, v_labels)).item()
+
+        total_val_extrap = 0
+        with torch.no_grad():
+            for v_coords, v_labels, v_p_idx in valid_extrapolation_loader:
+                v_coords, v_labels, v_p_idx = v_coords.to(device), v_labels.unsqueeze(-1).to(device), v_p_idx.to(device)
+                v_preds = model(v_coords, v_p_idx)
+                total_val_extrap += (1 - dice_loss(v_preds, v_labels)).item()
+        
+        with torch.no_grad():
+            plot_predictions(v_preds, v_labels, v_coords, epoch, "validation")
+
+        mlflow.log_metric("validation_interpolation", total_val_inter / len(valid_interpolation_loader), step=global_step)
+        mlflow.log_metric("validation_extrapolation", total_val_extrap / len(valid_extrapolation_loader), step=global_step)
+        mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
+
+        scheduler.step()
         
         avg_loss = total_loss / len(train_loader)
         losses.append(avg_loss)        
@@ -239,18 +325,23 @@ with mlflow.start_run():
     mlflow.log_param("device", device)
 
     mri_dataloader = MRI_Dataloader()
-    mri_dataloader.cache_lesion_trajectories_from_n_scans(3)
-    
+    mri_dataloader.cache_lesion_trajectories_from_n_scans(10)
     trajectories = mri_dataloader.cache_lesion_trajectories
     
-    dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device)
-    train_loader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=6)
+    train_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='train')
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=8)
     
-    mlflow.log_param("dataset_size", len(dataset))
+    valid_interpolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_interpolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
+    valid_interpolation_loader = DataLoader(valid_interpolation_dataset, batch_size=16, shuffle=False)
+
+    valid_extrapolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_extrapolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
+    valid_extrapolation_loader = DataLoader(valid_extrapolation_dataset, batch_size=16, shuffle=False)
+
+    mlflow.log_param("dataset_size", len(train_dataset))
     
     model = LesionINR(len(trajectories), latent_dim=64, input_dim=4, hidden_dim=2048, output_dim=1)
 
-    losses = train_inr(model, train_loader, epochs=150, lr=1e-5, device=device)
+    losses = train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=40, lr=1e-5, device=device)
     
     final_loss = losses[-1]
     mlflow.log_metric("final_train_loss", final_loss)
