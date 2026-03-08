@@ -8,20 +8,19 @@ import mlflow.pytorch
 from mri_dataloader import MRI_Dataloader, Patient
 from scipy.ndimage import zoom
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 mlflow.set_tracking_uri("http://127.0.0.1:5000")
 mlflow.set_experiment("Lesion_INR_Training")
 
-class ModulatedSirenLayer(nn.Module):
+class SirenLayer(nn.Module):
     def __init__(self, in_features, out_features, latent_dim, is_first=False, omega_0=30.0):
         super().__init__()
         self.omega_0 = omega_0
         self.is_first = is_first
         self.linear = nn.Linear(in_features, out_features)
-        
-        # FiLM generator: projects latent vector to scale (gamma) and shift (beta)
-        # We use out_features * 2 because we need a pair for every neuron in this layer
         self.conditioning_lin = nn.Linear(latent_dim, out_features) 
         
         self.init_weights()
@@ -35,43 +34,26 @@ class ModulatedSirenLayer(nn.Module):
                 self.linear.weight.uniform_(-bound, bound)
 
     def forward(self, x, latent):
-        # x shape: [batch, num_samples, hidden_dim]
-        # latent shape: [batch, latent_dim]
-        
-        # Generate modulation parameter from latent vector
-        # Unsqueeze to align with spatial samples: [batch, 1, hidden_dim]
         modulation = self.conditioning_lin(latent).unsqueeze(1)
-        
-        # Apply SIREN logic with FiLM modulation
-        # We modulate the pre-activation features
         return torch.sin(self.omega_0 * (self.linear(x) + modulation))
 
 class LesionINR(nn.Module):
     def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=30.0):
         super().__init__()
         self.latent_vectors = nn.Embedding(numpatients, latent_dim)
-        
-        # First layer (takes coordinates)
-        self.first_layer = ModulatedSirenLayer(input_dim, hidden_dim, latent_dim, is_first=True, omega_0=omega_0)
-        
-        # Hidden layers
+        self.first_layer = SirenLayer(input_dim, hidden_dim, latent_dim, is_first=True, omega_0=omega_0)
         self.layers = nn.ModuleList([
-            ModulatedSirenLayer(hidden_dim, hidden_dim, latent_dim, is_first=False, omega_0=omega_0)
+            SirenLayer(hidden_dim, hidden_dim, latent_dim, is_first=False, omega_0=omega_0)
             for _ in range(4)
         ])
         
-        # Final layer (no modulation needed usually, just maps to output)
         self.final_layer = nn.Linear(hidden_dim, output_dim)
         self.omega_0 = omega_0
         
-        # Proper init for latent
         torch.nn.init.normal_(self.latent_vectors.weight, std=1.0 / np.sqrt(latent_dim))
 
     def forward(self, x, patient_idx):
-        # Get latent vector for the patient
-        z = self.latent_vectors(patient_idx) # [batch, latent_dim]
-        
-        # Pass through layers, injecting z at every step
+        z = self.latent_vectors(patient_idx)
         x = self.first_layer(x, z)
         for layer in self.layers:
             x = layer(x, z)
@@ -125,7 +107,7 @@ class LesionDataset(Dataset):
         else:
             if self.mode == 'valid_extrapolation':
                 random_time_point = str(trj.dates[-1])
-            else:
+            if self.mode == 'valid_interpolation':
                 random_time_point = str(self.val_date_idx[idx])
 
         try:
@@ -200,32 +182,71 @@ def plot_predictions(v_preds, v_labels, v_coords, epoch, title=""):
     fig, axes = plt.subplots(2, 2, figsize=(12, 12))
 
     # Get 3D prediction volume by reshaping predictions
-    pred_volume = v_preds[0].squeeze().cpu().numpy()
-    label_volume = v_labels[0].squeeze().cpu().numpy()
-    pred_coords = v_coords[0,:,:3].squeeze().cpu().numpy()
+    pred_volume = v_preds[0].squeeze().detach().cpu().numpy()
+    label_volume = v_labels[0].squeeze().detach().cpu().numpy()
+    pred_coords = v_coords[0,:,:3].squeeze().detach().cpu().numpy()
 
     # Top view (XY plane, max projection along Z)
-    axes[1,0].scatter(pred_coords[:,0], pred_coords[:,1], c=pred_volume, s=5, alpha=0.5, cmap='viridis', vmin=0, vmax=1)
+    axes[1,0].scatter(pred_coords[:,0], pred_coords[:,1], c=pred_volume, s=5, alpha=0.5, cmap='copper', vmin=0, vmax=1)
     axes[1,0].set_title('Prediction - Top View')
     axes[1,0].axis('off')
 
     # Side view (XZ plane, max projection along Y)
-    axes[0,0].scatter(pred_coords[:,0], pred_coords[:,2], c=pred_volume, s=5, alpha=0.5, cmap='viridis', vmin=0, vmax=1)
+    axes[0,0].scatter(pred_coords[:,0], pred_coords[:,2], c=pred_volume, s=5, alpha=0.5, cmap='copper', vmin=0, vmax=1)
     axes[0,0].set_title('Prediction - Front View')
     axes[0,0].axis('off')
 
-    axes[0,1].scatter(pred_coords[:,1], pred_coords[:,2], c=pred_volume, s=5, alpha=0.5, cmap='viridis', vmin=0, vmax=1)
+    axes[0,1].scatter(pred_coords[:,1], pred_coords[:,2], c=pred_volume, s=5, alpha=0.5, cmap='copper', vmin=0, vmax=1)
     axes[0,1].set_title('Prediction - Side View')
     axes[0,1].axis('off')
 
-    axes[1,1].scatter(pred_coords[:,0], pred_coords[:,1], c=label_volume, s=5, alpha=0.5, cmap='viridis', vmin=0, vmax=1)
+    axes[1,1].scatter(pred_coords[:,0], pred_coords[:,1], c=label_volume, s=5, alpha=0.5, cmap='copper', vmin=0, vmax=1)
     axes[1,1].set_title('Labels')
     axes[1,1].axis('off')
 
-
     plt.tight_layout()
-    mlflow.log_figure(fig, f"{epoch}_epoch_predictions_{title}.png")
+    mlflow.log_figure(fig, f"{epoch:04d}_epoch_predictions_{title}.png")
     plt.close(fig)
+
+def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, time_point=None):
+    # get the height where the lesion is located
+    center_of_mass = torch.mean(coords.squeeze()[:len(labels.squeeze())//2,:3], axis=0).detach().cpu().numpy()
+    lesion_z = center_of_mass[2]
+
+    if time_point is not None:
+        sample_id = str(sample_id) + "_time_point_" + str(time_point)
+    
+    meshgrid = np.meshgrid(np.linspace(0, 1, 500), np.linspace(0, 1, 500), indexing='ij')
+    x = meshgrid[0].flatten() * 2 - 1
+    y = meshgrid[1].flatten() * 2 - 1
+    
+    z = np.full_like(x, lesion_z)
+    if time_point is None:
+        time_point = np.full_like(x, coords[0,0,-1].detach().cpu().numpy()) 
+    else:
+        time_point = np.full_like(x, time_point) 
+
+    hm_coords = np.stack([x, y, z, time_point], axis=1)
+    coords_tensor = torch.from_numpy(hm_coords).float().to(next(model.parameters()).device).unsqueeze(0)
+
+    with torch.no_grad():
+        for slice_idx in range(0, coords_tensor.shape[1], 1000):
+            slice_coords = coords_tensor[:, slice_idx:slice_idx+1000]
+            slice_preds = model(slice_coords, torch.tensor([0], device=coords_tensor.device))
+            if slice_idx == 0:
+                heatmap_preds = slice_preds.cpu().numpy()
+            else:
+                heatmap_preds = np.concatenate([heatmap_preds, slice_preds.cpu().numpy()], axis=1)
+
+    heatmap_preds = heatmap_preds.reshape(500, 500)
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(heatmap_preds, cmap='copper', vmin=0, vmax=1)
+    ax.set_title(f'Predicted Lesion Heatmap {patient_idx.item()}')
+    ax.axis('off')
+    mlflow.log_figure(fig, f"{epoch:04d}_epoch_lesion_heatmap_patient_{patient_idx.item()}_sample_{sample_id}.png")
+    plt.close(fig)
+    
 
 def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=100, lr=1e-3, device='cuda'):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -242,6 +263,8 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
     mlflow.log_param("batch_size", train_loader.batch_size)
     
     global_step = 0
+
+    monitoring_samples = np.random.choice(len(train_loader), size=5, replace=False)
 
     for epoch in range(epochs):
         total_loss = 0
@@ -279,27 +302,53 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
                 del coords, labels, patient_idx, predictions, loss
                 torch.cuda.empty_cache()
         
-        plot_predictions(predictions, labels, coords, epoch, "train")
-
-        
+        # visualize trainingprogress
+        for sample_idx in monitoring_samples:
+            coords, labels, patient_idx = train_loader.dataset[sample_idx]
+            coords = torch.from_numpy(coords).float().unsqueeze(0).to(device)
+            labels = torch.from_numpy(labels).float().unsqueeze(0).unsqueeze(-1).to(device)
+            patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
+            with torch.no_grad():
+                predictions = model(coords, patient_idx)
+                plot_predictions(predictions, labels, coords, epoch, "train")
 
         model.eval()
+
+        # validate on both interpolation and extrapolation tasks
         total_val_inter = 0
         with torch.no_grad():
-            for v_coords, v_labels, v_p_idx in valid_interpolation_loader:
+            for v_coords, v_labels, v_p_idx in tqdm(valid_interpolation_loader, desc="Validating Interpolation", total=len(valid_interpolation_loader)):
                 v_coords, v_labels, v_p_idx = v_coords.to(device), v_labels.unsqueeze(-1).to(device), v_p_idx.to(device)
                 v_preds = model(v_coords, v_p_idx)
-                total_val_inter += (1 - dice_loss(v_preds, v_labels)).item()
+                total_val_inter += dice_loss(v_preds, v_labels).item()
 
         total_val_extrap = 0
         with torch.no_grad():
-            for v_coords, v_labels, v_p_idx in valid_extrapolation_loader:
+            for v_coords, v_labels, v_p_idx in tqdm(valid_extrapolation_loader, desc="Validating Extrapolation", total=len(valid_extrapolation_loader)):
                 v_coords, v_labels, v_p_idx = v_coords.to(device), v_labels.unsqueeze(-1).to(device), v_p_idx.to(device)
                 v_preds = model(v_coords, v_p_idx)
-                total_val_extrap += (1 - dice_loss(v_preds, v_labels)).item()
+                total_val_extrap += dice_loss(v_preds, v_labels).item()
         
+        # visualize validation progress
+        for sample_idx in monitoring_samples:
+            coords, labels, patient_idx = valid_interpolation_loader.dataset[sample_idx]
+            coords = torch.from_numpy(coords).unsqueeze(0).float().to(device)
+            labels = torch.from_numpy(labels).unsqueeze(0).float().unsqueeze(-1).to(device)
+            patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
+            with torch.no_grad():
+                predictions = model(coords, patient_idx)      
+                plot_predictions(predictions, labels, coords, epoch, f"validation_patient_{patient_idx.item()}_sample_{sample_idx}")
+                plot_heatmap(model, labels, coords, patient_idx, epoch, sample_idx)
+        
+        # visualize a space transition
+        sample_idx = monitoring_samples[0]
+        coords, labels, patient_idx = valid_interpolation_loader.dataset[sample_idx]
+        coords = torch.from_numpy(coords).unsqueeze(0).float().to(device)
+        labels = torch.from_numpy(labels).unsqueeze(0).float().unsqueeze(-1).to(device)
+        patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
         with torch.no_grad():
-            plot_predictions(v_preds, v_labels, v_coords, epoch, "validation")
+            for time_point in np.linspace(-1,1, 30):
+                plot_heatmap(model, labels, coords, patient_idx, epoch, sample_idx, time_point=time_point)
 
         mlflow.log_metric("validation_interpolation", total_val_inter / len(valid_interpolation_loader), step=global_step)
         mlflow.log_metric("validation_extrapolation", total_val_extrap / len(valid_extrapolation_loader), step=global_step)
@@ -308,7 +357,7 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
         scheduler.step()
         
         avg_loss = total_loss / len(train_loader)
-        losses.append(avg_loss)        
+        losses.append(avg_loss)
         
         if (epoch + 1) % 10 == 0:
             print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
@@ -329,7 +378,7 @@ with mlflow.start_run():
     trajectories = mri_dataloader.cache_lesion_trajectories
     
     train_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='train')
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=8)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=6)
     
     valid_interpolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_interpolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
     valid_interpolation_loader = DataLoader(valid_interpolation_dataset, batch_size=16, shuffle=False)
@@ -341,7 +390,7 @@ with mlflow.start_run():
     
     model = LesionINR(len(trajectories), latent_dim=64, input_dim=4, hidden_dim=2048, output_dim=1)
 
-    losses = train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=40, lr=1e-5, device=device)
+    losses = train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=150, lr=1e-5, device=device)
     
     final_loss = losses[-1]
     mlflow.log_metric("final_train_loss", final_loss)
