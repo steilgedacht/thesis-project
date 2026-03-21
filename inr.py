@@ -11,6 +11,9 @@ from tqdm import tqdm
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, ImageMagickWriter
+import concurrent.futures
+
 
 mlflow.set_tracking_uri("http://127.0.0.1:5000")
 mlflow.set_experiment("Lesion_INR_Training")
@@ -60,10 +63,21 @@ class LesionINR(nn.Module):
             
         return self.final_layer(x)
 
-def dice_loss(pred, target, smooth=1e-6):
-    pred = torch.sigmoid(pred)
-    intersection = (pred * target).sum()
-    return 1 - ((2. * intersection + smooth) / (pred.sum() + target.sum() + smooth))
+class Loss_BCE_Dice():
+    def __init__(self, loss_fn_1=nn.BCEWithLogitsLoss()):
+        self.loss_fn_1 = loss_fn_1
+        self.loss_bce = 0
+        self.loss_dice = 0
+    
+    def __call__(self, pred, target):
+        self.loss_bce = self.loss_fn_1(pred, target)
+        self.loss_dice = self.dice_loss(pred, target)
+        return self.loss_bce + self.loss_dice
+
+    def dice_loss(pred, target, smooth=1e-6):
+        pred = torch.sigmoid(pred)
+        intersection = (pred * target).sum()
+        return 1 - ((2. * intersection + smooth) / (pred.sum() + target.sum() + smooth))
 
 class LesionDataset(Dataset):
     def __init__(self, trajectories, device='cuda', context_radius=5, background_samples_proportion=1, mode='train', val_date_idx=None, val_end_date_idx=None):
@@ -95,7 +109,7 @@ class LesionDataset(Dataset):
     def __len__(self):
         return len(self.trajectories)
     
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, full_data=False):
         trj = self.trajectories[idx]
         patient_idx = self.patient_to_idx[trj.patient_id]
 
@@ -176,7 +190,7 @@ class LesionDataset(Dataset):
         
         labels_sampled = labels[i, j, k]
 
-        return coords.astype(np.float32), labels_sampled.astype(np.float32), patient_idx        
+        return coords.astype(np.float32), labels_sampled.astype(np.float32), patient_idx
 
 def plot_predictions(v_preds, v_labels, v_coords, epoch, title=""):
     fig, axes = plt.subplots(2, 2, figsize=(12, 12))
@@ -232,7 +246,7 @@ def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, time_poin
     with torch.no_grad():
         for slice_idx in range(0, coords_tensor.shape[1], 1000):
             slice_coords = coords_tensor[:, slice_idx:slice_idx+1000]
-            slice_preds = model(slice_coords, torch.tensor([0], device=coords_tensor.device))
+            slice_preds = model(slice_coords, patient_idx)
             if slice_idx == 0:
                 heatmap_preds = slice_preds.cpu().numpy()
             else:
@@ -247,20 +261,130 @@ def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, time_poin
     mlflow.log_figure(fig, f"{epoch:04d}_epoch_lesion_heatmap_patient_{patient_idx.item()}_sample_{sample_id}.png")
     plt.close(fig)
     
+def plot_heatmap_animation(model, labels, trj, coords, patient_idx, epoch, sample_id, time_point=None, steps=50):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+    
+    full_matrix_labels = trj.load_labels_for_inr()
+
+    original_shape = labels.shape
+    zoom_factors = (
+        500 / original_shape[0],
+        500 / original_shape[1],
+        50 / original_shape[2]
+    )
+    
+    full_matrix_labels = zoom(full_matrix_labels, zoom_factors, order=1)
+
+    heatmaps = []
+    labels_list = []
+    with torch.no_grad():
+
+        # get the height where the lesion is located
+        center_of_mass = torch.mean(coords.squeeze()[:len(labels.squeeze())//2,:3], axis=0).detach().cpu().numpy()
+        lesion_z = center_of_mass[2]
+        
+        meshgrid = np.meshgrid(np.linspace(0, 1, 500), np.linspace(0, 1, 500), indexing='ij')
+        x = meshgrid[0].flatten() * 2 - 1
+        y = meshgrid[1].flatten() * 2 - 1
+        z = np.full_like(x, lesion_z)
+
+        for time_point in np.linspace(-1,1, steps):
+
+            if time_point is None:
+                time_point = np.full_like(x, coords[0,0,-1].detach().cpu().numpy()) 
+            else:
+                time_point = np.full_like(x, time_point) 
+
+            hm_coords = np.stack([x, y, z, time_point], axis=1)
+            coords_tensor = torch.from_numpy(hm_coords).float().to(next(model.parameters()).device).unsqueeze(0)
+
+            with torch.no_grad():
+                for slice_idx in range(0, coords_tensor.shape[1], 1000):
+                    slice_coords = coords_tensor[:, slice_idx:slice_idx+1000]
+                    slice_preds = model(slice_coords, patient_idx)
+                    if slice_idx == 0:
+                        heatmap_preds = slice_preds.cpu().numpy()
+                    else:
+                        heatmap_preds = np.concatenate([heatmap_preds, slice_preds.cpu().numpy()], axis=1)
+
+            heatmap_preds = heatmap_preds.reshape(500, 500)
+            heatmaps.append(heatmap_preds)
+        
+    heatmaps = np.array(heatmaps)
+
+    im = ax1.imshow(heatmaps[0], cmap='copper', vmin=0, vmax=1, animated=True)
+    ax1.set_title(f"Predicted Lesion Heatmap {patient_idx.item()} frame 0/{len(heatmaps)}")
+    ax1.axis('off')
+
+    # label_grid = np.zeros_like(heatmaps)
+    # streched_coordinates = np.astype((coords[:,:,:3].cpu().numpy()+1)/2 * np.array(heatmaps.shape), np.int16).squeeze()
+    # streched_coordinates = streched_coordinates[:len(streched_coordinates)//2]
+    # label_grid[tuple(streched_coordinates.T)] = 1
+
+    label_grid = full_label_array.transpose(2,0,1)
+    
+    im_label = ax2.imshow(label_grid[0], cmap='copper', vmin=0, vmax=1)
+    ax2.set_title("Ground Truth")
+    ax2.axis('off')
+
+    def update(i):
+        im.set_array(heatmaps[i])
+        im_label.set_array(label_grid[i])
+        ax1.set_title(f'Predicted Lesion Heatmap {patient_idx.item()} frame {i:03d}/{len(heatmaps)}')
+        return [im, im_label, ax1.title]
+    
+    ani = FuncAnimation(fig, update, frames=len(heatmaps), interval=50, blit=True)
+
+    plt.rcParams['animation.convert_path'] = 'magick'
+    writer = ImageMagickWriter(fps=10, extra_args=['-layers', 'Optimize'])
+    file_name = f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_{patient_idx.item()}_sample_{sample_id}.gif"
+    ani.save(file_name, writer=writer, dpi=50)
+
+    mlflow.log_artifact(file_name)
+    
+    plt.close(fig)
+
+def visualize_samples(model, epoch, monitoring_samples, dataloader, text):
+    for sample_idx in monitoring_samples:
+        coords, labels, patient_idx, _ = dataloader.dataset[sample_idx]
+        coords = torch.from_numpy(coords).float().unsqueeze(0).to(device)
+        labels = torch.from_numpy(labels).float().unsqueeze(0).unsqueeze(-1).to(device)
+        patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
+        predictions = model(coords, patient_idx)
+        plot_predictions(predictions, labels, coords, epoch, f"{text}_patient_{patient_idx.item()}_sample_{sample_idx}")
+        plot_heatmap(model, labels, coords, patient_idx, epoch, sample_idx)
+
+def validate_polation(dataloader, text, global_step, criterion):
+    loss = 0
+    for v_coords, v_labels, v_p_idx, _ in tqdm(dataloader, desc=text, total=len(dataloader)):
+        v_coords, v_labels, v_p_idx = v_coords.to(device), v_labels.unsqueeze(-1).to(device), v_p_idx.to(device)
+        v_preds = model(v_coords, v_p_idx)
+        loss += criterion.dice_loss(v_preds, v_labels).item()
+    mlflow.log_metric(text.lower().replace(" ", "_"), loss / len(dataloader), step=global_step)
+
+def plot_lesion_time_evolution(model, epoch, sample_idx):
+    coords, labels, patient_idx, trj = valid_interpolation_loader.dataset[sample_idx]
+    coords = torch.from_numpy(coords).unsqueeze(0).float().to(device)
+    labels = torch.from_numpy(labels).unsqueeze(0).float().unsqueeze(-1).to(device)
+    patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
+    plot_heatmap_animation(model, labels, trj, coords, patient_idx, epoch, sample_idx)
+
 
 def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=100, lr=1e-3, device='cuda'):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)    
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = Loss_BCE_Dice()
 
     model.to(device)
     losses = []
     
-    mlflow.log_param("epochs", epochs)
-    mlflow.log_param("learning_rate", lr)
-    mlflow.log_param("hidden_dim", model.layers[0].linear.out_features)
-    mlflow.log_param("omega_0", model.omega_0)
-    mlflow.log_param("batch_size", train_loader.batch_size)
+    mlflow.log_params({
+        "epochs": epochs,
+        "learning_rate": lr,
+        "hidden_dim": model.layers[0].linear.out_features,
+        "omega_0": model.omega_0,
+        "batch_size": train_loader.batch_size
+    })
     
     global_step = 0
 
@@ -269,7 +393,7 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
     for epoch in range(epochs):
         total_loss = 0
         model.train()
-        for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
+        for i, (coords, labels, patient_idx, _) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
 
             coords = coords.to(device)
             labels = labels.to(device).unsqueeze(-1)
@@ -282,78 +406,49 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
 
             predictions = model(coords, patient_idx)
 
-            loss_bce = criterion(predictions, labels)
-            loss_dice = dice_loss(predictions, labels)
-            loss = loss_bce + loss_dice
+            loss = criterion(predictions, labels)
             loss.backward()
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
             optimizer.step()
             total_loss += loss.item()
 
-            mlflow.log_metric("training_loss", loss.item(), step=global_step)
-            mlflow.log_metric("training_loss_bce", loss_bce.item(), step=global_step)
-            mlflow.log_metric("training_loss_dice", loss_dice.item(), step=global_step)
-            mlflow.log_metric("number_of_correctly_predicted_1_labels", (predictions>0.5).sum().item() / (labels > 0.5).sum().item(), step=global_step)
-            mlflow.log_metric("number_of_correctly_predicted_0_labels", (predictions<=0.5).sum().item() / (labels <= 0.5).sum().item(), step=global_step)
+            mlflow.log_metrics(
+                {
+                    "training_loss" : loss.item(),
+                    "training_loss_bce" : criterion.loss_bce.item(),
+                    "training_loss_dice" : criterion.loss_dice.item(),
+                    "number_of_correctly_predicted_1_labels" : (predictions>0.5).sum().item() / (labels > 0.5).sum().item(),
+                    "number_of_correctly_predicted_0_labels" : (predictions<=0.5).sum().item() / (labels <= 0.5).sum().item()
+                },
+                step=global_step
+            )
+
             global_step += 1
 
             if i % 10 == 0:
                 del coords, labels, patient_idx, predictions, loss
                 torch.cuda.empty_cache()
         
-        # visualize trainingprogress
-        for sample_idx in monitoring_samples:
-            coords, labels, patient_idx = train_loader.dataset[sample_idx]
-            coords = torch.from_numpy(coords).float().unsqueeze(0).to(device)
-            labels = torch.from_numpy(labels).float().unsqueeze(0).unsqueeze(-1).to(device)
-            patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
-            with torch.no_grad():
-                predictions = model(coords, patient_idx)
-                plot_predictions(predictions, labels, coords, epoch, "train")
-
         model.eval()
 
-        # validate on both interpolation and extrapolation tasks
-        total_val_inter = 0
         with torch.no_grad():
-            for v_coords, v_labels, v_p_idx in tqdm(valid_interpolation_loader, desc="Validating Interpolation", total=len(valid_interpolation_loader)):
-                v_coords, v_labels, v_p_idx = v_coords.to(device), v_labels.unsqueeze(-1).to(device), v_p_idx.to(device)
-                v_preds = model(v_coords, v_p_idx)
-                total_val_inter += dice_loss(v_preds, v_labels).item()
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [
+                    executor.submit(visualize_samples, model, epoch, monitoring_samples, train_loader, "train"),
+                    executor.submit(visualize_samples, model, epoch, monitoring_samples, valid_interpolation_loader, "valid"),
+                    executor.submit(validate_polation, valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion),
+                    executor.submit(validate_polation, valid_interpolation_loader, "Valid Interpolation", global_step, criterion),
+                    executor.submit(plot_lesion_time_evolution, model, epoch, monitoring_samples[0])
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"An error occurred: {e}")
 
-        total_val_extrap = 0
-        with torch.no_grad():
-            for v_coords, v_labels, v_p_idx in tqdm(valid_extrapolation_loader, desc="Validating Extrapolation", total=len(valid_extrapolation_loader)):
-                v_coords, v_labels, v_p_idx = v_coords.to(device), v_labels.unsqueeze(-1).to(device), v_p_idx.to(device)
-                v_preds = model(v_coords, v_p_idx)
-                total_val_extrap += dice_loss(v_preds, v_labels).item()
-        
-        # visualize validation progress
-        for sample_idx in monitoring_samples:
-            coords, labels, patient_idx = valid_interpolation_loader.dataset[sample_idx]
-            coords = torch.from_numpy(coords).unsqueeze(0).float().to(device)
-            labels = torch.from_numpy(labels).unsqueeze(0).float().unsqueeze(-1).to(device)
-            patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
-            with torch.no_grad():
-                predictions = model(coords, patient_idx)      
-                plot_predictions(predictions, labels, coords, epoch, f"validation_patient_{patient_idx.item()}_sample_{sample_idx}")
-                plot_heatmap(model, labels, coords, patient_idx, epoch, sample_idx)
-        
-        # visualize a space transition
-        sample_idx = monitoring_samples[0]
-        coords, labels, patient_idx = valid_interpolation_loader.dataset[sample_idx]
-        coords = torch.from_numpy(coords).unsqueeze(0).float().to(device)
-        labels = torch.from_numpy(labels).unsqueeze(0).float().unsqueeze(-1).to(device)
-        patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
-        with torch.no_grad():
-            for time_point in np.linspace(-1,1, 30):
-                plot_heatmap(model, labels, coords, patient_idx, epoch, sample_idx, time_point=time_point)
 
-        mlflow.log_metric("validation_interpolation", total_val_inter / len(valid_interpolation_loader), step=global_step)
-        mlflow.log_metric("validation_extrapolation", total_val_extrap / len(valid_extrapolation_loader), step=global_step)
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
-
         scheduler.step()
         
         avg_loss = total_loss / len(train_loader)
@@ -363,34 +458,40 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
             print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
     
     mlflow.pytorch.log_model(model, name="lesion_inr_model")
-    
     return losses
 
-# Trainingscode
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# MLflow Run starten
 with mlflow.start_run():
-    mlflow.log_param("device", device)
-
     mri_dataloader = MRI_Dataloader()
     mri_dataloader.cache_lesion_trajectories_from_n_scans(10)
     trajectories = mri_dataloader.cache_lesion_trajectories
+
+    batchsize = 16
+    epochs = 100
     
     train_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='train')
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=6)
+    train_loader = DataLoader(train_dataset, batch_size=batchsize, shuffle=True, num_workers=6)
     
     valid_interpolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_interpolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
-    valid_interpolation_loader = DataLoader(valid_interpolation_dataset, batch_size=16, shuffle=False)
+    valid_interpolation_loader = DataLoader(valid_interpolation_dataset, batch_size=batchsize, shuffle=False)
 
     valid_extrapolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_extrapolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
-    valid_extrapolation_loader = DataLoader(valid_extrapolation_dataset, batch_size=16, shuffle=False)
+    valid_extrapolation_loader = DataLoader(valid_extrapolation_dataset, batch_size=batchsize, shuffle=False)
 
-    mlflow.log_param("dataset_size", len(train_dataset))
-    
     model = LesionINR(len(trajectories), latent_dim=64, input_dim=4, hidden_dim=2048, output_dim=1)
+    mlflow.log_params({
+        "dataset_size": len(train_dataset), 
+        "batch_size": batchsize,
+        "latent_dim": model.latent_dim,
+        "hidden_dim": model.hidden_dim,
+        "input_dim": model.input_dim,
+        "output_dim": model.output_dim,
+        "device": device,
+        "epochs": epochs
+    })
 
-    losses = train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=150, lr=1e-5, device=device)
+    losses = train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=epochs, lr=1e-5, device=device)
     
     final_loss = losses[-1]
     mlflow.log_metric("final_train_loss", final_loss)
