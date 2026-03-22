@@ -13,6 +13,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, ImageMagickWriter
 import concurrent.futures
+import threading
 
 
 mlflow.set_tracking_uri("http://127.0.0.1:5000")
@@ -284,7 +285,7 @@ def validate_polation(dataloader, text, global_step, criterion):
         loss += criterion.dice_loss(v_preds, v_labels).item()
     mlflow.log_metric(text.lower().replace(" ", "_"), loss / len(dataloader), step=global_step)
 
-def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps = 50 ):
+def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50):
     coords, labels, patient_idx = data_loader.dataset[sample_idx]
     coords = torch.from_numpy(coords).unsqueeze(0).float().to(device)
     labels = torch.from_numpy(labels).unsqueeze(0).float().unsqueeze(-1).to(device)
@@ -345,19 +346,19 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps = 50
     label_grid = np.array(labels_list)
     list_3d = np.array(list_3d)
 
-    fig = plt.figure(figsize=(18, 6))
+    fig = plt.figure(figsize=(12, 12))
 
-    ax1 = fig.add_subplot(1, 3, 1)
+    ax1 = fig.add_subplot(2, 2, 1)
     im = ax1.imshow(heatmaps[0], cmap='copper', vmin=0, vmax=1, animated=True)
     ax1.set_title(f"Predicted Lesion Heatmap {patient_idx.item()} frame 0/{len(heatmaps)}")
     ax1.axis('off')
     
-    ax2 = fig.add_subplot(1, 3, 2)
+    ax2 = fig.add_subplot(2, 2, 2)
     im_label = ax2.imshow(label_grid[0], cmap='copper', vmin=0, vmax=1)
     ax2.set_title("Ground Truth")
     ax2.axis('off')
 
-    ax3 = fig.add_subplot(1, 3, 3, projection='3d')
+    ax3 = fig.add_subplot(2, 2, 3, projection='3d')
     xs, ys, zs = np.where(list_3d[0]==1)
     scatter = ax3.scatter(xs, ys, zs=zs)
     ax2.set_title("Ground Truth in 3D space")
@@ -371,27 +372,35 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps = 50
     Z_p = np.full_like(X_p, int(((lesion_z + 1) / 2) * 50)) 
     ax3.plot_surface(X_p, Y_p, Z_p, alpha=0.3, color='lightblue', antialiased=False, label="slice_of_heatmap")
 
+    ax4 = fig.add_subplot(2, 2, 4)
+    im_label_4 = ax4.imshow(heatmaps[0], cmap='copper', vmin=0, vmax=1, animated=True)
+    im_seg_4 = ax4.imshow(label_grid[0], cmap='Reds', vmin=0, vmax=1, alpha=0.5)
+    ax4.set_title("Ground Truth")
+    ax4.axis('off')
+
+
     fig.legend()
 
     def update(i):
         if i == len(heatmaps) - 1:
-            # Set images to all zeros (black) or ones (white) 
-            # Since vmin=0/vmax=1 and cmap='copper', ones will be bright
             im.set_array(np.ones_like(heatmaps[0]))
             im_label.set_array(np.ones_like(label_grid[0]))
+            im_label_4.set_array(np.ones_like(heatmaps[0]))
+            im_seg_4.set_array(np.ones_like(label_grid[0]))
             
-            # Clear the 3D scatter
             scatter._offsets3d = ([], [], [])
             
             ax1.set_title("--- End of Sequence ---")
         else:
             im.set_array(heatmaps[i])
             im_label.set_array(label_grid[i])
+            im_label_4.set_array(heatmaps[i])
+            im_seg_4.set_array(label_grid[i])
             xs, ys, zs = np.where(list_3d[i]==1)
             scatter._offsets3d = (xs, ys, zs)
 
             ax1.set_title(f'Predicted Lesion Heatmap {patient_idx.item()} frame {i:03d}/{len(heatmaps)}')
-        return [im, im_label, ax1.title]
+        return [im, im_label, im_label_4, im_seg_4, ax1.title]
     
     ani = FuncAnimation(fig, update, frames=len(heatmaps), interval=50)
 
@@ -465,23 +474,36 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
             if i % 10 == 0:
                 del coords, labels, patient_idx, predictions, loss
                 torch.cuda.empty_cache()
-        
+
         model.eval()
+        torch.cuda.empty_cache()
+
+        # semaphore = threading.Semaphore(2)
 
         with torch.no_grad():
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = [
-                    # executor.submit(visualize_samples, model, epoch, monitoring_samples, train_loader, "train"),
-                    # executor.submit(visualize_samples, model, epoch, monitoring_samples, valid_interpolation_loader, "valid"),
-                    # executor.submit(validate_polation, valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion),
-                    # executor.submit(validate_polation, valid_interpolation_loader, "Valid Interpolation", global_step, criterion),
-                    executor.submit(plot_lesion_time_evolution, model, epoch, monitoring_samples[0], valid_interpolation_loader)
-                ]
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        print(f"An error occurred: {e}")
+            # visualize_samples(model, epoch, monitoring_samples, train_loader, "train")
+            # visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid")
+            # validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
+            # validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
+            plot_lesion_time_evolution(model, epoch, monitoring_samples[0], train_loader)
+
+            # with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            #     def submit_with_semaphore(task, *args, **kwargs):
+            #         with semaphore:
+            #             return task(*args, **kwargs)
+            #     futures = [
+            #         executor.submit(submit_with_semaphore, visualize_samples, model, epoch, monitoring_samples, train_loader, "train"),
+            #         executor.submit(submit_with_semaphore, visualize_samples, model, epoch, monitoring_samples, valid_interpolation_loader, "valid"),
+            #         executor.submit(submit_with_semaphore, validate_polation, valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion),
+            #         executor.submit(submit_with_semaphore, validate_polation, valid_interpolation_loader, "Valid Interpolation", global_step, criterion),
+            #         executor.submit(submit_with_semaphore, plot_lesion_time_evolution, model, epoch, monitoring_samples[0], valid_interpolation_loader)
+            #     ]
+            #     for future in concurrent.futures.as_completed(futures):
+            #         try:
+            #             future.result()
+            #             torch.cuda.empty_cache()
+            #         except Exception as e:
+            #             print(f"An error occurred: {e}")
 
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
@@ -509,10 +531,10 @@ with mlflow.start_run():
     train_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='train')
     train_loader = DataLoader(train_dataset, batch_size=batchsize, shuffle=True, num_workers=6)
     
-    valid_interpolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device="cpu", mode='valid_interpolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
+    valid_interpolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_interpolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
     valid_interpolation_loader = DataLoader(valid_interpolation_dataset, batch_size=batchsize, shuffle=False)
 
-    valid_extrapolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device="cpu", mode='valid_extrapolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
+    valid_extrapolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_extrapolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
     valid_extrapolation_loader = DataLoader(valid_extrapolation_dataset, batch_size=batchsize, shuffle=False)
 
     model = LesionINR(len(trajectories), latent_dim=64, input_dim=4, hidden_dim=2048, output_dim=1)
