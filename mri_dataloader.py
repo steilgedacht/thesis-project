@@ -1,5 +1,6 @@
 import glob
 import os
+import json
 import pandas as pd
 import nibabel as nib
 import numpy as np
@@ -11,14 +12,12 @@ from matplotlib.colors import ListedColormap
 import matplotlib.cm as cm
 from IPython.display import HTML
 import plotly.express as px
-from sklearn.cluster import KMeans
-from skimage.measure import find_contours
-from scipy.ndimage import affine_transform
+from sklearn.cluster import KMeans, AffinityPropagation
+from skimage.measure import find_contours, marching_cubes
+from scipy.ndimage import affine_transform, zoom
 from plotly.colors import qualitative
 import plotly.graph_objects as go
 import itertools
-from sklearn.cluster import AffinityPropagation
-from skimage.measure import marching_cubes
 import torch
 from datetime import datetime
 
@@ -101,8 +100,10 @@ class DataSample:
             self.registered_transform = None
 
         self.lesion_prediction_nnUnet_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["0.nii.gz"])
-        self.lesion_segmentation_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["label.npz"])
+        self.lesion_segmentation_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["label.nii.gz"])
         self.lesion_trajectory_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["trajectory.npz"])
+        self.zoomed_segmentation_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["zoomed_label.nii.gz"])
+        self.zoomed_pre_post_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["zoomed_mri.nii.gz"])
 
         # get the meta information
         self.patient_id = pre_post_path.split(os.path.sep)[-3]
@@ -173,6 +174,11 @@ class DataSample:
     def load_mri(self):
         """Loads the pre post Niabel file """
         return nib.load(self.pre_post_path).get_fdata()
+    
+    def load_mri_with_affine(self):
+        """Loads the pre post Niabel file """
+        img = nib.load(self.pre_post_path)
+        return img.get_fdata(), img.affine 
 
     def load_nnUNet_prediction(self):
         """Loads the output file from the nnUNet prediction"""
@@ -181,18 +187,36 @@ class DataSample:
         else:
             raise FileNotFoundError(f"nnUNet prediction file not found at {self.lesion_prediction_nnUnet_path}")
 
-    def load_mri_segmentation(self):
-        """Loads the lesion segmentation file"""
-        if os.path.exists(self.lesion_segmentation_path):
-            segmentation = np.load(self.lesion_segmentation_path)
-            self.num_lesions = segmentation["num_features"].item()
-            self.lesion_sizes = segmentation["lesion_sizes"]
-            self.lesion_coords = segmentation["lesion_positions"]
-            self.relative_lesion_sizes = segmentation["relative_lesion_sizes"]
-            return segmentation["labeled_array"]
-        else:
-            print(f"Lesion segmentation file not found at {self.lesion_segmentation_path}, processing sample to create it.")
-            return self.process_sample()
+    def load_mri_segmentation(self, affine=False):
+        segmentation = nib.load(self.lesion_segmentation_path)
+        metadata = {}
+        for ext in segmentation.header.extensions:
+            if ext.get_code() == 44:
+                # Den Byte-String dekodieren und zurück in ein Dictionary umwandeln
+                content = ext.get_content().decode('utf-8')
+                metadata = json.loads(content)
+                break
+        
+        self.num_lesions = metadata["num_features"]
+        self.lesion_sizes = metadata["lesion_sizes"]
+        self.lesion_coords = metadata["lesion_positions"]
+        self.relative_lesion_sizes = metadata["relative_lesion_sizes"]
+
+        if affine:
+            return segmentation.get_fdata(), segmentation.affine
+        return segmentation.get_fdata()
+
+        # """Loads the lesion segmentation file"""
+        # if os.path.exists(self.lesion_segmentation_path):
+        #     segmentation = np.load(self.lesion_segmentation_path)
+        #     self.num_lesions = segmentation["num_features"].item()
+        #     self.lesion_sizes = segmentation["lesion_sizes"]
+        #     self.lesion_coords = segmentation["lesion_positions"]
+        #     self.relative_lesion_sizes = segmentation["relative_lesion_sizes"]
+        #     return segmentation["labeled_array"]
+        # else:
+        #     print(f"Lesion segmentation file not found at {self.lesion_segmentation_path}, processing sample to create it.")
+        #     return self.process_sample()
         
     def load_lesion_trajectory_segmentation(self):
         data = np.load(self.lesion_trajectory_path)
@@ -203,11 +227,11 @@ class DataSample:
         return DataSample(glob.glob(glob_path, recursive=True)[0])
 
     def process_sample(self):
-        mri_image = self.load_mri()
+        mri_image, affine = self.load_mri_with_affine()
         nnUNet_prediction = self.load_nnUNet_prediction()
 
-        # we introduce bleeding, to connect nearby lesions
-        nnUNet_prediction_dilated = ndimage.binary_dilation(nnUNet_prediction, iterations=5)
+        # we introduce bleeding, to connect nearby lesions, that might be fragmented
+        nnUNet_prediction_dilated = ndimage.binary_dilation(nnUNet_prediction, iterations=4)
         # now we label connected lesions
         labeled_array, num_features = ndimage.label(nnUNet_prediction_dilated)
         # we want to have the original lesion size again so we multiply with the original seg
@@ -220,7 +244,7 @@ class DataSample:
             labeled_array[convex_hull] = i + 1
 
         # we calculate the sizes of each lesion
-        sizes = ndimage.sum(nnUNet_prediction, labeled_array, range(1, num_features + 1))
+        lesion_sizes = ndimage.sum(nnUNet_prediction, labeled_array, range(1, num_features + 1))
 
         # we save the position of the lesions in euclidean roation coordinates
         lesion_positions = ndimage.center_of_mass(nnUNet_prediction, labeled_array, range(1, num_features + 1))
@@ -229,11 +253,22 @@ class DataSample:
         total_area = np.sum((mri_image > 0).astype(np.float32))
 
         self.num_lesions = num_features
-        self.lesion_sizes = sizes
-        self.relative_lesion_sizes = sizes / total_area
+        self.lesion_sizes = lesion_sizes
+        self.relative_lesion_sizes = lesion_sizes / total_area
         self.lesion_coords = lesion_positions
 
-        np.savez(self.lesion_segmentation_path, num_features=num_features, lesion_sizes=sizes, relative_lesion_sizes=sizes / total_area, lesion_positions=lesion_positions, labeled_array=labeled_array)
+        img = nib.Nifti1Image(labeled_array, affine)
+
+        metadata = {
+            "num_features": num_features,
+            "lesion_sizes": lesion_sizes.tolist(), 
+            "relative_lesion_sizes": (lesion_sizes / total_area).tolist(),
+            "lesion_positions": lesion_positions
+        }
+        json_str = json.dumps(metadata)
+        extension = nib.nifti1.Nifti1Extension(44, json_str.encode('utf-8'))
+        img.header.extensions.append(extension)
+        nib.save(img, self.lesion_segmentation_path)
 
         return labeled_array
 
@@ -327,6 +362,28 @@ class DataSample:
             print(f"Registered transform file not found at {self.registered_transform_path}. Using identity transform.")
             self.registered_transform = np.array([0,0,0,0,0,0,1.0,1.0,1.0])
         return self.registered_transform
+
+    def zoom(self, target_shape=(500, 500, 50)):
+        image, affine = self.load_mri_with_affine()
+        labels = self.load_mri_segmentation()
+        mask = image > 0
+        coords = np.argwhere(mask)
+        y0, x0, z0 = coords.min(axis=0)
+        y1, x1, z1 = coords.max(axis=0) + 1
+        
+        cropped_img = image[y0:y1, x0:x1, z0:z1]
+        cropped_lab = labels[y0:y1, x0:x1, z0:z1]
+        
+        factors = [t / o for t, o in zip(target_shape, cropped_img.shape)]
+              
+        scaled_image = zoom(cropped_img, factors[:-1] + [1], order=1)
+        scaled_image = zoom(scaled_image, [1,1] + [factors[-1]], order=0)
+
+        scaled_labels = zoom(cropped_lab, factors, order=0)
+
+        nib.save(nib.Nifti1Image(scaled_labels, affine), self.zoomed_segmentation_path)
+        nib.save(nib.Nifti1Image(scaled_image, affine), self.zoomed_pre_post_path)
+        
 
 class Lesion_Trajectory:
     def __init__(self, patient_id=None, label_id=None, sample_ids:list=None, sizes=None, load_from_trajectory_path=None):

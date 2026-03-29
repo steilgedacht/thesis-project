@@ -6,15 +6,12 @@ import numpy as np
 import mlflow
 import mlflow.pytorch
 from mri_dataloader import MRI_Dataloader, Patient
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, binary_dilation
 from tqdm import tqdm
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, ImageMagickWriter
-import concurrent.futures
-import threading
-
 
 mlflow.set_tracking_uri("http://127.0.0.1:5000")
 mlflow.set_experiment("Lesion_INR_Training")
@@ -149,22 +146,24 @@ class LesionDataset(Dataset):
             self.shape[2] / original_shape[2]
         )
         
-        labels = zoom(labels, zoom_factors, order=1)
-        x, y, z = np.copy(self.meshgrid)
-        
-
-        # 1. Labels binarisieren für schnellere Logik
-        lesion_mask = labels > 0.5
-        
-        # 2. Koordinaten der positiven Voxel (Läsion)
+        labels = zoom(labels, zoom_factors, order=1)        
+        lesion_mask = labels > 0.5        
         pos_coords = np.argwhere(lesion_mask)
+
+        border_samples = binary_dilation(labels) - labels
+        border_samples_coords = np.argwhere(border_samples)
+
         
         # 3. Negative Voxel (Hintergrund) finden
         # Trick: Statt argwhere auf dem ganzen Bild, sample einfach zufällige Punkte
         # und schaue, ob sie NICHT in der Maske liegen.
         MAX_SAMPLES = 1000
         num_neg_needed = MAX_SAMPLES // 2
-        neg_coords = []
+        neg_coords = border_samples_coords.tolist()
+
+        if len(neg_coords) > num_neg_needed // 2:
+            neg_coords = [neg_coords[i] for i in np.random.choice(len(neg_coords), size=num_neg_needed // 2, replace=True).tolist()]
+
         while len(neg_coords) < num_neg_needed:
             candidate_coords = np.array([
                 np.random.randint(0, s, num_neg_needed) for s in self.shape
@@ -267,23 +266,24 @@ def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, time_poin
     mlflow.log_figure(fig, f"{epoch:04d}_epoch_lesion_heatmap_patient_{patient_idx.item()}_sample_{sample_id}.png")
     plt.close(fig)
     
-def visualize_samples(model, epoch, monitoring_samples, dataloader, text):
+def visualize_samples(model, epoch, monitoring_samples, data_loader, text):
     for sample_idx in monitoring_samples:
-        coords, labels, patient_idx = dataloader.dataset[sample_idx]
+        coords, labels, patient_idx = data_loader.dataset[sample_idx]
         coords = torch.from_numpy(coords).float().unsqueeze(0).to(device)
         labels = torch.from_numpy(labels).float().unsqueeze(0).unsqueeze(-1).to(device)
         patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
         predictions = model(coords, patient_idx)
         plot_predictions(predictions, labels, coords, epoch, f"{text}_patient_{patient_idx.item()}_sample_{sample_idx}")
-        plot_heatmap(model, labels, coords, patient_idx, epoch, sample_idx)
+        # plot_heatmap(model, labels, coords, patient_idx, epoch, sample_idx)
+        plot_lesion_time_evolution(model, epoch, sample_idx, data_loader)
 
-def validate_polation(dataloader, text, global_step, criterion):
+def validate_polation(data_loader, text, global_step, criterion):
     loss = 0
-    for v_coords, v_labels, v_p_idx in tqdm(dataloader, desc=text, total=len(dataloader)):
+    for v_coords, v_labels, v_p_idx in tqdm(data_loader, desc=text, total=len(data_loader)):
         v_coords, v_labels, v_p_idx = v_coords.to(device), v_labels.unsqueeze(-1).to(device), v_p_idx.to(device)
         v_preds = model(v_coords, v_p_idx)
         loss += criterion.dice_loss(v_preds, v_labels).item()
-    mlflow.log_metric(text.lower().replace(" ", "_"), loss / len(dataloader), step=global_step)
+    mlflow.log_metric(text.lower().replace(" ", "_"), loss / len(data_loader), step=global_step)
 
 def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50):
     coords, labels, patient_idx = data_loader.dataset[sample_idx]
@@ -481,10 +481,10 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
         # semaphore = threading.Semaphore(2)
 
         with torch.no_grad():
-            # visualize_samples(model, epoch, monitoring_samples, train_loader, "train")
-            # visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid")
-            # validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
-            # validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
+            visualize_samples(model, epoch, monitoring_samples, train_loader, "train")
+            visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid")
+            validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
+            validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
             plot_lesion_time_evolution(model, epoch, monitoring_samples[0], train_loader)
 
             # with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
