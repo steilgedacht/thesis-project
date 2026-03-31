@@ -454,10 +454,10 @@ class Lesion_Trajectory:
                 date = selected_date
                 i = self.dates.index(selected_date)
 
-            path = os.path.join(*self.path.split(os.path.sep)[:-1] + [date] + ["trajectory.npz"])
+            path = os.path.join(*self.path.split(os.path.sep)[:-1] + [date] + ["trajectory.nii.gz"])
             if os.path.exists(path):
-                data_segmentation = np.load(path)
-                data_segmentation = np.where(data_segmentation["labeled_array"] == self.label_id, 1, 0).astype(np.uint8)
+                data_segmentation = nib.load(path).get_fdata()
+                data_segmentation = np.where(data_segmentation == self.label_id, 1, 0).astype(np.uint8)
 
                 data.append((data_segmentation, days_since_first[i]))
                 if selected_date is not None:

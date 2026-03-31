@@ -36,18 +36,22 @@ class SirenLayer(nn.Module):
 
     def forward(self, x, latent):
         modulation = self.conditioning_lin(latent).unsqueeze(1)
-        return torch.sin(self.omega_0 * (self.linear(x) + modulation))
+        return torch.sin(modulation * (self.omega_0 * self.linear(x)))
 
 class LesionINR(nn.Module):
     def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=30.0):
         super().__init__()
         self.latent_vectors = nn.Embedding(numpatients, latent_dim)
-        self.first_layer = SirenLayer(input_dim, hidden_dim, latent_dim, is_first=True, omega_0=omega_0)
+        self.first_layer = SirenLayer(input_dim, hidden_dim, latent_dim, is_first=True, omega_0=omega_0*4)
         self.layers = nn.ModuleList([
-            SirenLayer(hidden_dim, hidden_dim, latent_dim, is_first=False, omega_0=omega_0)
-            for _ in range(4)
+            SirenLayer(hidden_dim, hidden_dim, latent_dim, is_first=False, omega_0=omega_0*((4-l)**.5))
+            for l in range(4)
         ])
         
+        self.latend_adapation_1 = nn.Linear(latent_dim, latent_dim)
+        self.latend_adapation_2 = nn.Linear(latent_dim, latent_dim)
+        self.relu = nn.LeakyReLU()
+
         self.final_layer = nn.Linear(hidden_dim, output_dim)
         self.omega_0 = omega_0
 
@@ -60,6 +64,8 @@ class LesionINR(nn.Module):
 
     def forward(self, x, patient_idx):
         z = self.latent_vectors(patient_idx)
+        z = self.relu(self.latend_adapation_1(z))
+        z = self.relu(self.latend_adapation_2(z))
         x = self.first_layer(x, z)
         for layer in self.layers:
             x = layer(x, z)
@@ -127,36 +133,14 @@ class LesionDataset(Dataset):
             if self.mode == 'valid_interpolation':
                 random_time_point = str(self.val_date_idx[idx])
 
-        try:
-            labels, time_point = trj.load_labels_for_inr(selected_date=random_time_point)
-        except:
-            patient = Patient(trj.patient_id)
-            patient.merge_lesion_to_trajectory()
-            try:
-                labels, time_point = trj.load_labels_for_inr(selected_date=random_time_point)
-            except:
-                print(trj.patient_id, random_time_point)
-                raise 
-
-        # interpoltate the labels to the shape
-        original_shape = labels.shape
-        zoom_factors = (
-            self.shape[0] / original_shape[0],
-            self.shape[1] / original_shape[1],
-            self.shape[2] / original_shape[2]
-        )
+        labels, time_point = trj.load_labels_for_inr(selected_date=random_time_point)
         
-        labels = zoom(labels, zoom_factors, order=1)        
         lesion_mask = labels > 0.5        
         pos_coords = np.argwhere(lesion_mask)
 
         border_samples = binary_dilation(labels) - labels
         border_samples_coords = np.argwhere(border_samples)
 
-        
-        # 3. Negative Voxel (Hintergrund) finden
-        # Trick: Statt argwhere auf dem ganzen Bild, sample einfach zufällige Punkte
-        # und schaue, ob sie NICHT in der Maske liegen.
         MAX_SAMPLES = 1000
         num_neg_needed = MAX_SAMPLES // 2
         neg_coords = border_samples_coords.tolist()
@@ -168,23 +152,18 @@ class LesionDataset(Dataset):
             candidate_coords = np.array([
                 np.random.randint(0, s, num_neg_needed) for s in self.shape
             ]).T
-            # Prüfe welche Kandidaten Hintergrund sind
             is_bg = labels[candidate_coords[:,0], candidate_coords[:,1], candidate_coords[:,2]] <= 0.5
             neg_coords.extend(candidate_coords[is_bg])
         
         neg_coords = np.array(neg_coords)[:num_neg_needed]
         
-        # 4. Positive samples (mit Replacement falls Läsion klein ist)
         if len(pos_coords) == 0:
             all_sampled_indices = np.concatenate([neg_coords, neg_coords], axis=0)
         else:
             pos_idx = np.random.choice(len(pos_coords), size=MAX_SAMPLES//2, replace=True)
             pos_sampled = pos_coords[pos_idx]
-            
-            # 5. Zusammenführen
             all_sampled_indices = np.vstack([pos_sampled, neg_coords])
         
-        # 6. Vektorisierte Extraktion aus meshgrid (Kein Loop!)
         i, j, k = all_sampled_indices.T
         coords = np.stack([
             self.meshgrid[0][i, j, k] * 2 - 1,
@@ -274,8 +253,7 @@ def visualize_samples(model, epoch, monitoring_samples, data_loader, text):
         patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
         predictions = model(coords, patient_idx)
         plot_predictions(predictions, labels, coords, epoch, f"{text}_patient_{patient_idx.item()}_sample_{sample_idx}")
-        # plot_heatmap(model, labels, coords, patient_idx, epoch, sample_idx)
-        plot_lesion_time_evolution(model, epoch, sample_idx, data_loader)
+        # plot_lesion_time_evolution(model, epoch, sample_idx, data_loader)
 
 def validate_polation(data_loader, text, global_step, criterion):
     loss = 0
@@ -292,26 +270,20 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50):
     patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
     
     full_matrix_labels = data_loader.dataset.trajectories[sample_idx].load_labels_for_inr()
-    zoomed_full_matrix_labels = []
-    for matrix in full_matrix_labels:
-        original_shape = matrix[0].shape
-        zoom_factors = (
-            500 / original_shape[0],
-            500 / original_shape[1],
-            50 / original_shape[2]
-        )
-        zoomed_full_matrix_labels.append((zoom(matrix[0], zoom_factors, order=1), matrix[1]))
+
+    SIDE_LENGTH = 50
 
     heatmaps = []
     labels_list = []
     list_3d = []
+    
     with torch.no_grad():
 
         # get the height where the lesion is located
         center_of_mass = torch.mean(coords.squeeze()[:len(labels.squeeze())//2,:3], axis=0).detach().cpu().numpy()
         lesion_z = center_of_mass[2]
         
-        meshgrid = np.meshgrid(np.linspace(0, 1, 500), np.linspace(0, 1, 500), indexing='ij')
+        meshgrid = np.meshgrid(np.linspace(0, 1, SIDE_LENGTH), np.linspace(0, 1, SIDE_LENGTH), indexing='ij')
         x = meshgrid[0].flatten() * 2 - 1
         y = meshgrid[1].flatten() * 2 - 1
         z = np.full_like(x, lesion_z)
@@ -324,19 +296,19 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50):
             coords_tensor = torch.from_numpy(hm_coords).float().to(next(model.parameters()).device).unsqueeze(0)
 
             with torch.no_grad():
-                for slice_idx in range(0, coords_tensor.shape[1], 1000):
-                    slice_coords = coords_tensor[:, slice_idx:slice_idx+1000]
+                for slice_idx in range(0, coords_tensor.shape[1], 150_000):
+                    slice_coords = coords_tensor[:, slice_idx:slice_idx+150_000]
                     slice_preds = model(slice_coords, patient_idx)
                     if slice_idx == 0:
                         heatmap_preds = slice_preds.cpu().numpy()
                     else:
                         heatmap_preds = np.concatenate([heatmap_preds, slice_preds.cpu().numpy()], axis=1)
 
-            heatmap_preds = heatmap_preds.reshape(500, 500)
+            heatmap_preds = heatmap_preds.reshape(SIDE_LENGTH, SIDE_LENGTH)
             heatmaps.append(heatmap_preds)
 
 
-            for element in reversed(zoomed_full_matrix_labels):
+            for element in reversed(full_matrix_labels):
                 if element[1] <= t:
                     labels_list.append(element[0][:,:,int(((lesion_z + 1) / 2) * 50)])
                     list_3d.append(element[0])
@@ -373,7 +345,7 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50):
     ax3.plot_surface(X_p, Y_p, Z_p, alpha=0.3, color='lightblue', antialiased=False, label="slice_of_heatmap")
 
     ax4 = fig.add_subplot(2, 2, 4)
-    im_label_4 = ax4.imshow(heatmaps[0], cmap='copper', vmin=0, vmax=1, animated=True)
+    im_label_4 = ax4.imshow(heatmaps[0].repeat(500//SIDE_LENGTH,axis=0).repeat(500//SIDE_LENGTH,axis=1), cmap='copper', vmin=0, vmax=1, animated=True)
     im_seg_4 = ax4.imshow(label_grid[0], cmap='Reds', vmin=0, vmax=1, alpha=0.5)
     ax4.set_title("Ground Truth")
     ax4.axis('off')
@@ -394,7 +366,7 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50):
         else:
             im.set_array(heatmaps[i])
             im_label.set_array(label_grid[i])
-            im_label_4.set_array(heatmaps[i])
+            im_label_4.set_array(heatmaps[i].repeat(500//SIDE_LENGTH,axis=0).repeat(500//SIDE_LENGTH,axis=1))
             im_seg_4.set_array(label_grid[i])
             xs, ys, zs = np.where(list_3d[i]==1)
             scatter._offsets3d = (xs, ys, zs)
@@ -478,33 +450,13 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
         model.eval()
         torch.cuda.empty_cache()
 
-        # semaphore = threading.Semaphore(2)
-
         with torch.no_grad():
             visualize_samples(model, epoch, monitoring_samples, train_loader, "train")
             visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid")
             validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
             validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
-            plot_lesion_time_evolution(model, epoch, monitoring_samples[0], train_loader)
-
-            # with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            #     def submit_with_semaphore(task, *args, **kwargs):
-            #         with semaphore:
-            #             return task(*args, **kwargs)
-            #     futures = [
-            #         executor.submit(submit_with_semaphore, visualize_samples, model, epoch, monitoring_samples, train_loader, "train"),
-            #         executor.submit(submit_with_semaphore, visualize_samples, model, epoch, monitoring_samples, valid_interpolation_loader, "valid"),
-            #         executor.submit(submit_with_semaphore, validate_polation, valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion),
-            #         executor.submit(submit_with_semaphore, validate_polation, valid_interpolation_loader, "Valid Interpolation", global_step, criterion),
-            #         executor.submit(submit_with_semaphore, plot_lesion_time_evolution, model, epoch, monitoring_samples[0], valid_interpolation_loader)
-            #     ]
-            #     for future in concurrent.futures.as_completed(futures):
-            #         try:
-            #             future.result()
-            #             torch.cuda.empty_cache()
-            #         except Exception as e:
-            #             print(f"An error occurred: {e}")
-
+            for m in monitoring_samples:
+                plot_lesion_time_evolution(model, epoch, m, train_loader)
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
         scheduler.step()
@@ -525,7 +477,7 @@ with mlflow.start_run():
     mri_dataloader.cache_lesion_trajectories_from_n_scans(10)
     trajectories = mri_dataloader.cache_lesion_trajectories
 
-    batchsize = 16
+    batchsize = 8
     epochs = 100
     
     train_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='train')
