@@ -21,6 +21,7 @@ import itertools
 import torch
 from datetime import datetime
 
+
 class Registrator:
     def __init__(self, device=None):
         self.device = device if device else torch.device(
@@ -101,7 +102,7 @@ class DataSample:
 
         self.lesion_prediction_nnUnet_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["0.nii.gz"])
         self.lesion_segmentation_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["label.nii.gz"])
-        self.lesion_trajectory_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["trajectory.npz"])
+        self.lesion_trajectory_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["trajectory.nii.gz"])
         self.zoomed_segmentation_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["zoomed_label.nii.gz"])
         self.zoomed_pre_post_path = os.path.join(*self.pre_post_path.replace("PRE_POST_YBML", "predictions").split(os.path.sep)[:-1] + ["zoomed_mri.nii.gz"])
 
@@ -171,15 +172,15 @@ class DataSample:
     def get_path(self):
         return self.pre_post_path
 
-    def load_mri(self):
+    def load_mri(self, zoomed:bool=False, affine:bool=False):
         """Loads the pre post Niabel file """
-        return nib.load(self.pre_post_path).get_fdata()
+        path = self.zoomed_pre_post_path if zoomed else self.pre_post_path 
+        
+        if affine:
+            img = nib.load(path)
+            return img.get_fdata(), img.affine 
+        return nib.load(path).get_fdata()
     
-    def load_mri_with_affine(self):
-        """Loads the pre post Niabel file """
-        img = nib.load(self.pre_post_path)
-        return img.get_fdata(), img.affine 
-
     def load_nnUNet_prediction(self):
         """Loads the output file from the nnUNet prediction"""
         if os.path.exists(self.lesion_prediction_nnUnet_path):
@@ -187,8 +188,9 @@ class DataSample:
         else:
             raise FileNotFoundError(f"nnUNet prediction file not found at {self.lesion_prediction_nnUnet_path}")
 
-    def load_mri_segmentation(self, affine=False):
-        segmentation = nib.load(self.lesion_segmentation_path)
+    def load_mri_segmentation(self, affine=False, zoomed=False):
+        path = self.zoomed_segmentation_path if zoomed else self.lesion_segmentation_path
+        segmentation = nib.load(path)
         metadata = {}
         for ext in segmentation.header.extensions:
             if ext.get_code() == 44:
@@ -197,10 +199,10 @@ class DataSample:
                 metadata = json.loads(content)
                 break
         
-        self.num_lesions = metadata["num_features"]
-        self.lesion_sizes = metadata["lesion_sizes"]
-        self.lesion_coords = metadata["lesion_positions"]
-        self.relative_lesion_sizes = metadata["relative_lesion_sizes"]
+        self.num_lesions = metadata.get("num_features", None)
+        self.lesion_sizes = metadata.get("lesion_sizes", None)
+        self.lesion_coords = metadata.get("lesion_positions", None)
+        self.relative_lesion_sizes = metadata.get("relative_lesion_sizes", None)
 
         if affine:
             return segmentation.get_fdata(), segmentation.affine
@@ -227,7 +229,7 @@ class DataSample:
         return DataSample(glob.glob(glob_path, recursive=True)[0])
 
     def process_sample(self):
-        mri_image, affine = self.load_mri_with_affine()
+        mri_image, affine = self.load_mri(affine=True)
         nnUNet_prediction = self.load_nnUNet_prediction()
 
         # we introduce bleeding, to connect nearby lesions, that might be fragmented
@@ -364,7 +366,7 @@ class DataSample:
         return self.registered_transform
 
     def zoom(self, target_shape=(500, 500, 50)):
-        image, affine = self.load_mri_with_affine()
+        image, affine = self.load_mri(affine=True)
         labels = self.load_mri_segmentation()
         mask = image > 0
         coords = np.argwhere(mask)
@@ -960,19 +962,15 @@ class Patient:
         return self.registered_transforms
 
     def merge_lesion_to_trajectory(self):
-        vol_shape = self.samples[0].load_mri().shape
-        volume = self.samples[0].load_mri()
+        vol_shape = (500, 500, 50)
+        volume, affine = self.samples[0].load_mri(zoomed=True, affine=True)
         volume = np.sum(volume[volume > 0])
 
         labeled_mask_cache = []
         sum_mask = np.zeros(vol_shape, dtype=np.uint8)
-        for i, sample in enumerate(self.samples):
-            labeled_mask = self.registrator.rigid_transform(
-                sample.load_mri_segmentation(), 
-                self.registered_transforms[i], 
-                vol_shape
-            )   
 
+        for i, sample in enumerate(self.samples):
+            labeled_mask = sample.load_mri_segmentation(zoomed=True)
             labeled_mask_cache.append(labeled_mask)
             sum_mask = sum_mask + labeled_mask
 
@@ -1002,12 +1000,17 @@ class Patient:
             trajectory.save_lesion_trajectory()
 
         for i, sample in enumerate(self.samples):
-            np.savez(
-                sample.lesion_trajectory_path, 
-                num_features=num_features, 
-                labeled_array=labeled_mask_cache[i],
-                sizes=np.log(sizes[i]/volume),
-            )
+            img = nib.Nifti1Image(labeled_mask_cache[i], affine)
+            metadata = {
+                "num_features": num_features,
+                "sizes": np.log(sizes[i]/volume + 1e-7).tolist()
+            }
+
+            json_str = json.dumps(metadata)
+            extension = nib.nifti1.Nifti1Extension(44, json_str.encode('utf-8'))
+            img.header.extensions.append(extension)
+            nib.save(img, sample.lesion_trajectory_path)
+
     
     def load_lesion_trajectories(self):
         trajectories = []
