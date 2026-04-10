@@ -441,12 +441,14 @@ class Lesion_Trajectory:
         self.sizes = sizes
         return sizes
     
-    def load_labels_for_inr(self, selected_date=None):
+    def load_labels_for_inr(self, selected_date=None, absolute_day_number=False):
 
         dates = [datetime.strptime(d, "%Y-%m-%d") for d in self.dates]
         first_date = dates[0]
-        total_days = (dates[-1] - first_date).days
-        days_since_first = [((d - first_date).days / total_days) * 2 - 1 for d in dates]
+        total_days = (dates[-1] - first_date).days if not absolute_day_number else 1
+        days_since_first = [((d - first_date).days / total_days) for d in dates]
+        if not absolute_day_number:
+            days_since_first = [d * 2 - 1 for d in days_since_first]
 
         data = []
         for i, date in enumerate(self.dates):

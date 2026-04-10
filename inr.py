@@ -5,8 +5,8 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import mlflow
 import mlflow.pytorch
-from mri_dataloader import MRI_Dataloader, Patient
-from scipy.ndimage import zoom, binary_dilation
+from mri_dataloader import MRI_Dataloader
+from scipy.ndimage import binary_dilation
 from tqdm import tqdm
 import matplotlib
 matplotlib.use('Agg')
@@ -16,61 +16,112 @@ from matplotlib.animation import FuncAnimation, ImageMagickWriter
 mlflow.set_tracking_uri("http://127.0.0.1:5000")
 mlflow.set_experiment("Lesion_INR_Training")
 
+class TimeEncoder(nn.Module):
+    def __init__(self, num_frequencies, max_t):
+        super().__init__()
+        self.num_frequencies = num_frequencies
+        self.max_t = max_t
+        self.frequencies = 2**torch.linspace(0, num_frequencies - 1, num_frequencies)
+
+    def forward(self, t):
+        t_norm = t / self.max_t 
+        angles = t_norm.unsqueeze(-1) * self.frequencies.to(t.device) * np.pi # [B x 1 x n_frequencies]
+        embeddings = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1) # [B x 1 x 2*n_frequencies]
+        return embeddings
+
 class SirenLayer(nn.Module):
     def __init__(self, in_features, out_features, latent_dim, is_first=False, omega_0=30.0):
         super().__init__()
         self.omega_0 = omega_0
         self.is_first = is_first
+        self.out_features = out_features
+        self.latent_dim = latent_dim
+        
         self.linear = nn.Linear(in_features, out_features)
-        self.conditioning_lin = nn.Linear(latent_dim, out_features) 
+        self.conditioning_lin = nn.Linear(latent_dim, 2 * out_features) 
         
         self.init_weights()
 
     def init_weights(self):
         with torch.no_grad():
+            # Standard SIREN initialization for the main path
             if self.is_first:
                 self.linear.weight.uniform_(-1 / self.linear.in_features, 1 / self.linear.in_features)
             else:
                 bound = np.sqrt(6 / self.linear.in_features) / self.omega_0
                 self.linear.weight.uniform_(-bound, bound)
+            
+            # FiLM Initialization:
+            # We want gamma (scale) to start at 1 and beta (shift) to start at 0.
+            # This makes the initial state of the network a standard SIREN.
+            nn.init.zeros_(self.conditioning_lin.weight)
+            nn.init.zeros_(self.conditioning_lin.bias)
+            
+            # The first half of the bias corresponds to gamma
+            # We add 1.0 so that: gamma = 0 (from linear) + 1 = 1
+            self.conditioning_lin.bias.data[:self.out_features] = 1.0
 
     def forward(self, x, latent):
         modulation = self.conditioning_lin(latent).unsqueeze(1)
-        return torch.sin(modulation * (self.omega_0 * self.linear(x)))
+        
+        # Split into scale (gamma) and shift (beta)
+        gamma, beta = modulation.chunk(2, dim=-1)
+        
+        # FiLM: sin(omega * (gamma * (W*x + b) + beta))
+        return torch.sin(self.omega_0 * (gamma * self.linear(x) + beta))
 
 class LesionINR(nn.Module):
-    def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=30.0):
+    def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=45.0, n_layers=8):
         super().__init__()
         self.latent_vectors = nn.Embedding(numpatients, latent_dim)
-        self.first_layer = SirenLayer(input_dim, hidden_dim, latent_dim, is_first=True, omega_0=omega_0*4)
-        self.layers = nn.ModuleList([
-            SirenLayer(hidden_dim, hidden_dim, latent_dim, is_first=False, omega_0=omega_0*((4-l)**.5))
-            for l in range(4)
-        ])
         
-        self.latend_adapation_1 = nn.Linear(latent_dim, latent_dim)
-        self.latend_adapation_2 = nn.Linear(latent_dim, latent_dim)
-        self.relu = nn.LeakyReLU()
-
-        self.final_layer = nn.Linear(hidden_dim, output_dim)
-        self.omega_0 = omega_0
+        self.time_encoding_dims = 12
+        self.time_encoder = TimeEncoder(num_frequencies=self.time_encoding_dims, max_t=3650.0)
+        
+        self.latent_adapt = nn.Sequential(
+            nn.Linear(latent_dim + (2 * self.time_encoding_dims), latent_dim),
+            nn.LeakyReLU(),
+            nn.Linear(latent_dim, latent_dim),
+            nn.LeakyReLU(),
+            nn.LayerNorm(latent_dim)
+        )
 
         self.latent_dim = latent_dim
-        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.omega_0 = omega_0
+        self.input_dim = input_dim
         self.output_dim = output_dim
+        self.n_layers = n_layers
+
+        self.first_layer = SirenLayer(3, hidden_dim, latent_dim, is_first=True, omega_0=omega_0)
+        self.layers = nn.ModuleList([
+            SirenLayer(hidden_dim, hidden_dim, latent_dim, is_first=False, omega_0=omega_0)
+            for _ in range(n_layers)
+        ])
+
+        self.final_layer = nn.Linear(hidden_dim, output_dim)
+        
+        with torch.no_grad():
+            self.final_layer.weight.uniform_(-np.sqrt(6 / hidden_dim) / omega_0, 
+                                             np.sqrt(6 / hidden_dim) / omega_0)
         
         torch.nn.init.normal_(self.latent_vectors.weight, std=1.0 / np.sqrt(latent_dim))
 
     def forward(self, x, patient_idx):
-        z = self.latent_vectors(patient_idx)
-        z = self.relu(self.latend_adapation_1(z))
-        z = self.relu(self.latend_adapation_2(z))
-        x = self.first_layer(x, z)
+        spatial_coords = x[..., :3]  # [B, N, 3]
+        
+        raw_time = x[:, 0:1, 3] # [B, 1]
+        t_encoded = self.time_encoder(raw_time) # [B, 1, 2*n_frequencies]
+        z_patient = self.latent_vectors(patient_idx).unsqueeze(1) # [B, 1, latenddim]
+
+        z_combined = torch.cat([z_patient, t_encoded], dim=-1) # [B, 1, 2*n_frequencies + latenddim]
+        z = self.latent_adapt(z_combined).squeeze(1) 
+        
+        x_out = self.first_layer(spatial_coords, z) 
         for layer in self.layers:
-            x = layer(x, z)
-            
-        return self.final_layer(x)
+            x_out = layer(x_out, z)
+
+        return self.final_layer(x_out) 
 
 class Loss_BCE_Dice():
     def __init__(self, loss_fn_1=nn.BCEWithLogitsLoss()):
@@ -118,7 +169,7 @@ class LesionDataset(Dataset):
     def __len__(self):
         return len(self.trajectories)
     
-    def __getitem__(self, idx, full_data=False):
+    def __getitem__(self, idx):
         trj = self.trajectories[idx]
         patient_idx = self.patient_to_idx[trj.patient_id]
 
@@ -133,7 +184,7 @@ class LesionDataset(Dataset):
             if self.mode == 'valid_interpolation':
                 random_time_point = str(self.val_date_idx[idx])
 
-        labels, time_point = trj.load_labels_for_inr(selected_date=random_time_point)
+        labels, time_point = trj.load_labels_for_inr(selected_date=random_time_point, absolute_day_number=True)
         
         lesion_mask = labels > 0.5        
         pos_coords = np.argwhere(lesion_mask)
@@ -174,7 +225,7 @@ class LesionDataset(Dataset):
         
         labels_sampled = labels[i, j, k]
 
-        return coords.astype(np.float32), labels_sampled.astype(np.float32), patient_idx
+        return coords.astype(np.float32), labels_sampled.astype(np.float32), np.int64((patient_idx * 100) + self.trajectories[idx].label_id)
 
 def plot_predictions(v_preds, v_labels, v_coords, epoch, title=""):
     fig, axes = plt.subplots(2, 2, figsize=(12, 12))
@@ -253,7 +304,6 @@ def visualize_samples(model, epoch, monitoring_samples, data_loader, text):
         patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
         predictions = model(coords, patient_idx)
         plot_predictions(predictions, labels, coords, epoch, f"{text}_patient_{patient_idx.item()}_sample_{sample_idx}")
-        # plot_lesion_time_evolution(model, epoch, sample_idx, data_loader)
 
 def validate_polation(data_loader, text, global_step, criterion):
     loss = 0
@@ -388,8 +438,8 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50):
 
 
 def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=100, lr=1e-3, device='cuda'):
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)    
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)    
     criterion = Loss_BCE_Dice()
 
     model.to(device)
@@ -450,13 +500,14 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
         model.eval()
         torch.cuda.empty_cache()
 
-        with torch.no_grad():
-            visualize_samples(model, epoch, monitoring_samples, train_loader, "train")
-            visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid")
-            validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
-            validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
-            for m in monitoring_samples:
-                plot_lesion_time_evolution(model, epoch, m, train_loader)
+        if epoch % 101 == 0:
+            with torch.no_grad():
+                visualize_samples(model, epoch, monitoring_samples, train_loader, "train")
+                visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid")
+                validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
+                validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
+                for m in monitoring_samples:
+                    plot_lesion_time_evolution(model, epoch, m, train_loader)
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
         scheduler.step()
@@ -477,8 +528,8 @@ with mlflow.start_run():
     mri_dataloader.cache_lesion_trajectories_from_n_scans(10)
     trajectories = mri_dataloader.cache_lesion_trajectories
 
-    batchsize = 8
-    epochs = 100
+    batchsize = 16
+    epochs = 1011
     
     train_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='train')
     train_loader = DataLoader(train_dataset, batch_size=batchsize, shuffle=True, num_workers=6)
@@ -489,7 +540,7 @@ with mlflow.start_run():
     valid_extrapolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_extrapolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
     valid_extrapolation_loader = DataLoader(valid_extrapolation_dataset, batch_size=batchsize, shuffle=False)
 
-    model = LesionINR(len(trajectories), latent_dim=64, input_dim=4, hidden_dim=2048, output_dim=1)
+    model = LesionINR(len(trajectories)*100, latent_dim=64, input_dim=4, hidden_dim=2048, output_dim=1, n_layers=8)
     mlflow.log_params({
         "dataset_size": len(train_dataset), 
         "batch_size": batchsize,
@@ -497,10 +548,12 @@ with mlflow.start_run():
         "hidden_dim": model.hidden_dim,
         "input_dim": model.input_dim,
         "output_dim": model.output_dim,
+        "n_layers": model.n_layers,
         "omega" : model.omega_0,
         "device": device,
         "epochs": epochs
     })
+    mlflow.log_artifact("inr.py")
 
     losses = train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=epochs, lr=1e-5, device=device)
     
