@@ -20,34 +20,21 @@ class TimeEncoder(nn.Module):
     def __init__(self, num_frequencies, max_t):
         super().__init__()
         self.num_frequencies = num_frequencies
-        self.max_t = max_t
-        # Fixed frequencies - standard positional encoding
-        self.register_buffer('frequencies', torch.linspace(0, num_frequencies - 1, num_frequencies))
+        self.max_t = max_t # The longest possible time in your dataset
+        # We create frequencies from 2^0 to 2^{L-1}
+        # self.frequencies = 2**torch.arange(num_frequencies).float()
+        self.frequencies = 2**torch.linspace(0, num_frequencies - 1, num_frequencies)
 
     def forward(self, t):
-        t_norm = t / self.max_t  # Normalize to [0, 1]
-        # Simple sine/cosine encoding: sin(2^k * t) and cos(2^k * t)
-        angles = t_norm.unsqueeze(-1) * (2.0 ** self.frequencies) * np.pi
-        sin_encodings = torch.sin(angles)
-        cos_encodings = torch.cos(angles)
-        embeddings = torch.cat([sin_encodings, cos_encodings], dim=-1)
-        return embeddings
-    
-class SpatialEncoder(nn.Module):
-    def __init__(self, num_frequencies):
-        super().__init__()
-        self.num_frequencies = num_frequencies
-        # Initialize learnable frequencies for spatial coordinates
-        init_freqs = torch.logspace(-2, 2, num_frequencies)
-        self.frequencies = nn.Parameter(init_freqs)
-
-    def forward(self, coords):
-        # coords: [..., 3]
-        angles = coords.unsqueeze(-1) * torch.abs(self.frequencies).to(coords.device) * np.pi
+        # Normalize t to [0, 1] relative to the global max
+        t_norm = t / self.max_t 
+        
+        # Calculate angles: shape [batch, num_coords, num_frequencies]
+        angles = t_norm.unsqueeze(-1) * self.frequencies.to(t.device) * np.pi
+        
+        # Concatenate sin and cos
         embeddings = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-        # embeddings shape: [..., 3, 2*num_frequencies]
-        embeddings = embeddings.reshape(*embeddings.shape[:-2], -1)  # Flatten: [..., 6*num_frequencies]
-        return embeddings
+        return embeddings # Output dimension is 2 * num_frequencies
 
 class SirenLayer(nn.Module):
     def __init__(self, in_features, out_features, latent_dim, is_first=False, omega_0=30.0):
@@ -58,6 +45,7 @@ class SirenLayer(nn.Module):
         self.latent_dim = latent_dim
         
         self.linear = nn.Linear(in_features, out_features)
+        # MUST be 2 * out_features to split into gamma and beta
         self.conditioning_lin = nn.Linear(latent_dim, 2 * out_features) 
         
         self.init_weights()
@@ -82,33 +70,30 @@ class SirenLayer(nn.Module):
             self.conditioning_lin.bias.data[:self.out_features] = 1.0
 
     def forward(self, x, latent):
-        # latent shape: [B, N, latent_dim] (per-sample conditioning)
-        modulation = self.conditioning_lin(latent)  # [B, N, 2*out_features]
+        # Modulation shape: [batch, 1, 2 * out_features]
+        modulation = self.conditioning_lin(latent).unsqueeze(1)
         
         # Split into scale (gamma) and shift (beta)
         gamma, beta = modulation.chunk(2, dim=-1)
         
-        # FiLM: sin(omega * (gamma * (W*x + b) + beta))
+        # Apply FiLM: sin(omega * (gamma * (W*x + b) + beta))
         return torch.sin(self.omega_0 * (gamma * self.linear(x) + beta))
 
 class LesionINR(nn.Module):
-    def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=1.0, n_layers=8):
+    def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=45.0, n_layers=8):
         super().__init__()
         self.latent_vectors = nn.Embedding(numpatients, latent_dim)
         
-        # Increase time encoding significantly - it's crucial for learning temporal patterns
-        self.time_encoding_dims = 32
-        self.spatial_encoding_dims = 12
+        # Note: All layers now receive the same adapted latent dimension
+        # Let's standardize the latent adaptation output to hidden_dim * 2
+        # for a more direct mapping, or keep your adaptation logic.
+        self.time_encoding_dims = 12
         self.time_encoder = TimeEncoder(num_frequencies=self.time_encoding_dims, max_t=3650.0)
-        self.spatial_encoder = SpatialEncoder(num_frequencies=self.spatial_encoding_dims)
-        
-        # Combined latent: patient embedding + time encoding + spatial encoding
-        combined_size = latent_dim + (2 * self.time_encoding_dims) + (6 * self.spatial_encoding_dims)
         
         self.latent_adapt = nn.Sequential(
-            nn.Linear(combined_size, latent_dim * 2),
+            nn.Linear(latent_dim + (2 * self.time_encoding_dims), latent_dim),
             nn.LeakyReLU(),
-            nn.Linear(latent_dim * 2, latent_dim),
+            nn.Linear(latent_dim, latent_dim),
             nn.LeakyReLU(),
             nn.LayerNorm(latent_dim)
         )
@@ -120,8 +105,8 @@ class LesionINR(nn.Module):
         self.output_dim = output_dim
         self.n_layers = n_layers
 
-        # First layer takes encoded spatial info only (coordinates are encoded separately)
-        self.first_layer = SirenLayer(1, hidden_dim, latent_dim, is_first=True, omega_0=omega_0)
+
+        self.first_layer = SirenLayer(3, hidden_dim, latent_dim, is_first=True, omega_0=omega_0)
         self.layers = nn.ModuleList([
             SirenLayer(hidden_dim, hidden_dim, latent_dim, is_first=False, omega_0=omega_0)
             for _ in range(n_layers)
@@ -129,6 +114,7 @@ class LesionINR(nn.Module):
 
         self.final_layer = nn.Linear(hidden_dim, output_dim)
         
+        # SIREN final layer initialization
         with torch.no_grad():
             self.final_layer.weight.uniform_(-np.sqrt(6 / hidden_dim) / omega_0, 
                                              np.sqrt(6 / hidden_dim) / omega_0)
@@ -137,95 +123,34 @@ class LesionINR(nn.Module):
 
     def forward(self, x, patient_idx):
         spatial_coords = x[..., :3]  # [B, N, 3]
+        raw_time = x[:, 0:1, 3] 
+        t_encoded = self.time_encoder(raw_time) 
+        z_patient = self.latent_vectors(patient_idx).unsqueeze(1) 
+        z_combined = torch.cat([z_patient, t_encoded], dim=-1)
+        z = self.latent_adapt(z_combined)
+        z = z.squeeze(1)
         
-        raw_time = x[:, 0:1, 3] # [B, 1]
-        t_encoded = self.time_encoder(raw_time) # [B, 1, 2*n_frequencies]
-        s_encoded = self.spatial_encoder(spatial_coords) # [B, N, 6*n_frequencies]
-        z_patient = self.latent_vectors(patient_idx).unsqueeze(1) # [B, 1, latent_dim]
-
-        # Expand patient embedding and time encoding to match spatial dimension
-        z_patient_expanded = z_patient.expand(-1, s_encoded.shape[1], -1)  # [B, N, latent_dim]
-        t_encoded_expanded = t_encoded.expand(-1, s_encoded.shape[1], -1)  # [B, N, 2*n_frequencies]
-        
-        z_combined = torch.cat([z_patient_expanded, t_encoded_expanded, s_encoded], dim=-1) # [B, N, combined_size]
-        z = self.latent_adapt(z_combined)  # [B, N, latent_dim]
-        
-        # Use a dummy input (ones) since all information is in the conditioning
-        dummy_input = torch.ones(z.shape[0], z.shape[1], 1, device=z.device)
-        x_out = self.first_layer(dummy_input, z) 
+        x_out = self.first_layer(spatial_coords, z) 
         for layer in self.layers:
             x_out = layer(x_out, z)
 
-        return self.final_layer(x_out) 
+        return self.final_layer(x_out)
 
 class Loss_BCE_Dice():
-    def __init__(self, loss_fn_1=nn.BCEWithLogitsLoss(), lambda_temporal=2.0):
+    def __init__(self, loss_fn_1=nn.BCEWithLogitsLoss()):
         self.loss_fn_1 = loss_fn_1
         self.loss_bce = 0
         self.loss_dice = 0
-        self.loss_temporal = 0
-        self.lambda_temporal = lambda_temporal
     
-    def __call__(self, pred, target, coords=None):
+    def __call__(self, pred, target):
         self.loss_bce = self.loss_fn_1(pred, target)
         self.loss_dice = self.dice_loss(pred, target)
-        self.loss_temporal = 0
-        
-        # Add temporal variance loss - encourages model to use time information
-        if coords is not None:
-            self.loss_temporal = self.temporal_variance_loss(pred, target, coords)
-            return self.loss_bce + self.loss_dice + self.lambda_temporal * self.loss_temporal
-        
         return self.loss_bce + self.loss_dice
 
     def dice_loss(self, pred, target, smooth=1e-6):
         pred = torch.sigmoid(pred)
         intersection = (pred * target).sum()
         return 1 - ((2. * intersection + smooth) / (pred.sum() + target.sum() + smooth))
-    
-    def temporal_variance_loss(self, pred, target, coords):
-        """
-        Force model to use temporal coordinate by penalizing uniform predictions
-        when there's time variation in the coordinates.
-        
-        The intuition: if a batch has coordinates with varied times,
-        and the model ignores time, it will produce near-identical predictions.
-        This loss penalizes that.
-        """
-        pred_sig = torch.sigmoid(pred)
-        
-        # Extract time coordinates
-        times = coords[:, :, 3]  # [B, N]
-        
-        # Compute how much each prediction differs from the batch mean at same time
-        # Expected: high variance in predictions = model is using time
-        B, N = times.shape
-        
-        # Compute temporal range in this batch
-        time_range = torch.max(times) - torch.min(times)
-        
-        # If time_range is small, loss is small (no penalty if little time variation)
-        # If time_range is large but predictions are uniform, loss is large
-        
-        # Stratify by time: group coordinates by whether they're early/late in time
-        time_median = torch.median(times)
-        early_mask = times <= time_median
-        late_mask = times > time_median
-        
-        # Predictions should differ between early and late timepoints
-        if early_mask.any() and late_mask.any():
-            early_pred = pred_sig[early_mask].mean()
-            late_pred = pred_sig[late_mask].mean()
-            
-            # Loss: penalize if predictions are too similar when times are far apart
-            pred_diff = torch.abs(early_pred - late_pred)
-            target_diff = torch.abs(target[early_mask].mean() - target[late_mask].mean())
-            
-            # If targets differ but predictions don't, that's bad
-            temporal_loss = torch.nn.functional.relu(target_diff - pred_diff)
-            return temporal_loss
-        
-        return torch.tensor(0.0, device=pred.device)
 
 class LesionDataset(Dataset):
     def __init__(self, trajectories, device='cuda', context_radius=5, background_samples_proportion=1, mode='train', val_date_idx=None, val_end_date_idx=None):
@@ -538,8 +463,7 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
         "learning_rate": lr,
         "hidden_dim": model.layers[0].linear.out_features,
         "omega_0": model.omega_0,
-        "batch_size": train_loader.batch_size,
-        "time_encoding_dims": model.time_encoding_dims,
+        "batch_size": train_loader.batch_size
     })
     
     global_step = 0
@@ -562,7 +486,7 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
 
             predictions = model(coords, patient_idx)
 
-            loss = criterion(predictions, labels, coords=coords)
+            loss = criterion(predictions, labels)
             loss.backward()
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
@@ -614,24 +538,22 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 with mlflow.start_run():
     mri_dataloader = MRI_Dataloader()
-    mri_dataloader.cache_lesion_trajectories_from_n_scans(10)
+    mri_dataloader.cache_lesion_trajectories_from_n_scans(33)
     trajectories = mri_dataloader.cache_lesion_trajectories
 
-    epochs = 1011
-    batchsize = 32
+    batchsize = 1
+    epochs = 100
     
     train_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='train')
-    # num_workers=7 keeps 1 core free for main process; prefetch_factor=2 for small epoch (7 batches)
     train_loader = DataLoader(train_dataset, batch_size=batchsize, shuffle=True, num_workers=7, prefetch_factor=2)
     
     valid_interpolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_interpolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
     valid_interpolation_loader = DataLoader(valid_interpolation_dataset, batch_size=batchsize, shuffle=False)
 
     valid_extrapolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_extrapolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
-    valid_extrapolation_loader = DataLoader(valid_extrapolation_dataset, batch_size=batchsize, shuffle=False) 
+    valid_extrapolation_loader = DataLoader(valid_extrapolation_dataset, batch_size=batchsize, shuffle=False)
 
-    model = LesionINR(numpatients=len(trajectories) * 100, latent_dim=128, hidden_dim=512, omega_0=1.0, n_layers=8)
-
+    model = LesionINR(len(trajectories)*100, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, n_layers=8)
     mlflow.log_params({
         "dataset_size": len(train_dataset), 
         "batch_size": batchsize,
