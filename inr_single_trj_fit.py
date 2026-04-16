@@ -35,7 +35,7 @@ class TimeEncoder(nn.Module):
         # 3. Concatenate sin and cos: Output dim is 2 * num_frequencies
         embeddings = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
         return embeddings
-    
+
 class SirenLayer(nn.Module):
     def __init__(self, in_features, out_features, latent_dim, is_first=False, omega_0=30.0):
         super().__init__()
@@ -70,11 +70,11 @@ class LesionINR(nn.Module):
     def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=30.0, n_layers=8):
         super().__init__()
         self.latent_vectors = nn.Embedding(numpatients, latent_dim)
-        
+
         self.time_freqs = 6
         self.time_encoder = TimeEncoder(max_t=3650.0, num_frequencies=self.time_freqs)
-        
-        # input_dim for latent_adapt is now latent_dim + 1 (for the single normalized time scalar)
+
+        # Input dim = 128 (patient) + 12 (time features)
         self.latent_adapt = nn.Sequential(
             nn.Linear(latent_dim + (2 * self.time_freqs), latent_dim),
             nn.LeakyReLU(),
@@ -107,15 +107,24 @@ class LesionINR(nn.Module):
         torch.nn.init.normal_(self.latent_vectors.weight, std=1.0 / np.sqrt(latent_dim))
 
     def forward(self, x, patient_idx):
+        # x shape: [Batch, N, 4] -> (x, y, z, t)
         spatial_coords = x[..., :3]  
+        
+        # Extract raw time from the first coordinate of the batch
+        # Assuming t is constant for the spatial points in this sample
         raw_time = x[:, 0:1, 3] 
+        
+        # Map time to [-1, 1]
         t_encoded = self.time_encoder(raw_time) 
         
-        z_patient = self.latent_vectors(patient_idx)
-        z_combined = torch.cat([z_patient, t_encoded], dim=-1)
+        # Get patient latent and combine with the single time scalar
+        z_patient = self.latent_vectors(patient_idx) # [B, latent_dim]
+        z_combined = torch.cat([z_patient, t_encoded], dim=-1) # [B, latent_dim + 1]
         
+        # Process through adaptation layers
         z = self.latent_adapt(z_combined)
         
+        # Pass through SIREN layers
         x_out = self.first_layer(spatial_coords, z) 
         for layer in self.layers:
             x_out = layer(x_out, z)
@@ -191,7 +200,7 @@ class LesionDataset(Dataset):
         border_samples = binary_dilation(labels) - labels
         border_samples_coords = np.argwhere(border_samples)
 
-        MAX_SAMPLES = 700
+        MAX_SAMPLES = 2500
         num_neg_needed = MAX_SAMPLES // 2
         neg_coords = border_samples_coords.tolist()
 
@@ -310,15 +319,17 @@ def validate_polation(data_loader, text, global_step, criterion):
         v_coords, v_labels, v_p_idx = v_coords.to(device), v_labels.unsqueeze(-1).to(device), v_p_idx.to(device)
         v_preds = model(v_coords, v_p_idx)
         loss += criterion.dice_loss(v_preds, v_labels).item()
-    mlflow.log_metric(text.lower().replace(" ", "_"), loss / len(data_loader), step=global_step)
+    mlflow.log_metric(text.lower().replace(" ", "_"), loss , step=global_step)
 
-def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50, side_length=50):
+def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50):
     coords, labels, patient_idx = data_loader.dataset[sample_idx]
     coords = torch.from_numpy(coords).unsqueeze(0).float().to(device)
     labels = torch.from_numpy(labels).unsqueeze(0).float().unsqueeze(-1).to(device)
     patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
     
     full_matrix_labels = data_loader.dataset.trajectories[sample_idx].load_labels_for_inr(absolute_day_number=True)
+
+    SIDE_LENGTH = 50
 
     heatmaps = []
     labels_list = []
@@ -330,12 +341,12 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50, 
         center_of_mass = torch.mean(coords.squeeze()[:len(labels.squeeze())//2,:3], axis=0).detach().cpu().numpy()
         lesion_z = center_of_mass[2]
         
-        meshgrid = np.meshgrid(np.linspace(0, 1, side_length), np.linspace(0, 1, side_length), indexing='ij')
+        meshgrid = np.meshgrid(np.linspace(0, 1, SIDE_LENGTH), np.linspace(0, 1, SIDE_LENGTH), indexing='ij')
         x = meshgrid[0].flatten() * 2 - 1
         y = meshgrid[1].flatten() * 2 - 1
         z = np.full_like(x, lesion_z)
 
-        for t in np.linspace(0, 3650, steps):
+        for t in np.linspace(0,3650, steps):
 
             time_point = np.full_like(x, t) 
 
@@ -351,7 +362,7 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50, 
                     else:
                         heatmap_preds = np.concatenate([heatmap_preds, slice_preds.cpu().numpy()], axis=1)
 
-            heatmap_preds = heatmap_preds.reshape(side_length, side_length)
+            heatmap_preds = heatmap_preds.reshape(SIDE_LENGTH, SIDE_LENGTH)
             heatmaps.append(heatmap_preds)
 
 
@@ -392,7 +403,7 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50, 
     ax3.plot_surface(X_p, Y_p, Z_p, alpha=0.3, color='lightblue', antialiased=False, label="slice_of_heatmap")
 
     ax4 = fig.add_subplot(2, 2, 4)
-    im_label_4 = ax4.imshow(heatmaps[0].repeat(500//side_length,axis=0).repeat(500//side_length,axis=1), cmap='copper', vmin=0, vmax=1, animated=True)
+    im_label_4 = ax4.imshow(heatmaps[0].repeat(500//SIDE_LENGTH,axis=0).repeat(500//SIDE_LENGTH,axis=1), cmap='copper', vmin=0, vmax=1, animated=True)
     im_seg_4 = ax4.imshow(label_grid[0], cmap='Reds', vmin=0, vmax=1, alpha=0.5)
     ax4.set_title("Ground Truth")
     ax4.axis('off')
@@ -413,7 +424,7 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50, 
         else:
             im.set_array(heatmaps[i])
             im_label.set_array(label_grid[i])
-            im_label_4.set_array(heatmaps[i].repeat(500//side_length,axis=0).repeat(500//side_length,axis=1))
+            im_label_4.set_array(heatmaps[i].repeat(500//SIDE_LENGTH,axis=0).repeat(500//SIDE_LENGTH,axis=1))
             im_seg_4.set_array(label_grid[i])
             xs, ys, zs = np.where(list_3d[i]==1)
             scatter._offsets3d = (xs, ys, zs)
@@ -452,7 +463,7 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
     
     global_step = 0
 
-    monitoring_samples = np.random.choice(len(train_loader), size=5, replace=False)
+    monitoring_samples = np.random.choice(len(train_loader), size=5, replace=True)
 
     for epoch in range(epochs):
         total_loss = 0
@@ -497,7 +508,7 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
         model.eval()
         torch.cuda.empty_cache()
 
-        if epoch % 101 == 100:
+        if epoch % 101 == 0:
             with torch.no_grad():
                 visualize_samples(model, epoch, monitoring_samples, train_loader, "train")
                 visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid")
@@ -516,20 +527,16 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
             print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
     
     mlflow.pytorch.log_model(model, name="lesion_inr_model")
-    
-    for m in monitoring_samples:
-        plot_lesion_time_evolution(model, epoch, m, train_loader, side_length=500)
-
     return losses
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 with mlflow.start_run():
     mri_dataloader = MRI_Dataloader()
-    mri_dataloader.cache_lesion_trajectories_from_n_scans(10)
-    trajectories = mri_dataloader.cache_lesion_trajectories * 10
+    mri_dataloader.cache_lesion_trajectories_from_n_scans(33)
+    trajectories = mri_dataloader.cache_lesion_trajectories * 200
 
-    batchsize = 100
+    batchsize = 32
     epochs = 1011
     
     train_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='train')
