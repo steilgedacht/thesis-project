@@ -173,10 +173,13 @@ class LesionDataset(Dataset):
         patient_idx = self.patient_to_idx[trj.patient_id]
 
         if self.mode == 'train':
+            dates_list = trj.dates
             if idx in self.val_end_date_idx:
-                random_time_point = str(np.random.choice(trj.dates[:-1]))            
-            else:
-                random_time_point = str(np.random.choice(trj.dates))
+                dates_list = trj.dates[:-1]
+            if hasattr(trj, 'allowed_dates'):
+                dates_list = trj.allowed_dates
+                print("Here!!")
+            random_time_point = str(np.random.choice(dates_list))
         else:
             if self.mode == 'valid_extrapolation':
                 random_time_point = str(trj.dates[-1])
@@ -312,7 +315,7 @@ def validate_polation(data_loader, text, global_step, criterion):
         loss += criterion.dice_loss(v_preds, v_labels).item()
     mlflow.log_metric(text.lower().replace(" ", "_"), loss / len(data_loader), step=global_step)
 
-def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=50, side_length=50):
+def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=100, side_length=50):
     coords, labels, patient_idx = data_loader.dataset[sample_idx]
     coords = torch.from_numpy(coords).unsqueeze(0).float().to(device)
     labels = torch.from_numpy(labels).unsqueeze(0).float().unsqueeze(-1).to(device)
@@ -497,7 +500,7 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
         model.eval()
         torch.cuda.empty_cache()
 
-        if epoch % 101 == 100:
+        if epoch % 20 == 0 and epoch != 0:
             with torch.no_grad():
                 visualize_samples(model, epoch, monitoring_samples, train_loader, "train")
                 visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid")
@@ -526,11 +529,11 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 with mlflow.start_run():
     mri_dataloader = MRI_Dataloader()
-    mri_dataloader.cache_lesion_trajectories_from_n_scans(10)
+    mri_dataloader.cache_lesion_trajectories_from_n_scans(n_scans=6, only_growing=True)
     trajectories = mri_dataloader.cache_lesion_trajectories * 10
 
     batchsize = 100
-    epochs = 1011
+    epochs = 200
     
     train_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='train')
     train_loader = DataLoader(train_dataset, batch_size=batchsize, shuffle=True, num_workers=7, prefetch_factor=2, pin_memory=True, persistent_workers=True)

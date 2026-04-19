@@ -5,11 +5,13 @@ import pandas as pd
 import nibabel as nib
 import numpy as np
 from scipy import ndimage
+from scipy.optimize import linear_sum_assignment
 from skimage.morphology import convex_hull_image
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.colors import ListedColormap
 import matplotlib.cm as cm
+from matplotlib.ticker import FuncFormatter
 from IPython.display import HTML
 import plotly.express as px
 from sklearn.cluster import KMeans, AffinityPropagation
@@ -20,6 +22,7 @@ import plotly.graph_objects as go
 import itertools
 import torch
 from datetime import datetime
+from scipy.signal import savgol_filter
 
 
 class Registrator:
@@ -441,8 +444,15 @@ class Lesion_Trajectory:
         self.sizes = sizes
         return sizes
     
-    def load_labels_for_inr(self, selected_date=None, absolute_day_number=False):
-
+    def load_labels_for_inr(self, selected_date=None, absolute_day_number=False, skip_empty=True):
+        """
+        Load trajectory labels for each date.
+        
+        Args:
+            selected_date: If provided, only load this specific date
+            absolute_day_number: Use absolute days or normalized time
+            skip_empty: If True, skip frames with no voxels (helpful for trajectories with gaps)
+        """
         dates = [datetime.strptime(d, "%Y-%m-%d") for d in self.dates]
         first_date = dates[0]
         total_days = (dates[-1] - first_date).days if not absolute_day_number else 1
@@ -451,6 +461,8 @@ class Lesion_Trajectory:
             days_since_first = [d * 2 - 1 for d in days_since_first]
 
         data = []
+        skipped_count = 0
+        
         for i, date in enumerate(self.dates):
             if selected_date is not None:
                 date = selected_date
@@ -460,14 +472,163 @@ class Lesion_Trajectory:
             if os.path.exists(path):
                 data_segmentation = nib.load(path).get_fdata()
                 data_segmentation = np.where(data_segmentation == self.label_id, 1, 0).astype(np.uint8)
-
-                data.append((data_segmentation, days_since_first[i]))
-                if selected_date is not None:
-                    return data[0]
+                
+                voxel_count = np.count_nonzero(data_segmentation)
+                
+                # Skip empty frames if requested (helps with gap-filled trajectories)
+                if skip_empty and voxel_count == 0:
+                    skipped_count += 1
+                    if selected_date is None:  # Only skip if loading full trajectory
+                        continue
+                    # If specific date requested but empty, still return it
+                    data.append((data_segmentation, days_since_first[i]))
+                    if selected_date is not None:
+                        return data[0]
+                else:
+                    data.append((data_segmentation, days_since_first[i]))
+                    if selected_date is not None:
+                        return data[0]
             else:
+                if selected_date is not None:
+                    print(f"Path not found: {path}")
                 continue
         
+        if selected_date is None and skipped_count > 0:
+            print(f"Note: Skipped {skipped_count} empty frames from trajectory")
+        
         return data
+    
+    def plot_trajectory_sizes(self):
+        fig, ax = plt.subplots()
+        ax.plot(self.dates, np.exp(self.sizes))
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Size")
+        ax.set_title(f"Lesion Trajectory for Patient {self.patient_id}, Lesion {self.label_id}")
+        ax.tick_params(axis='x', rotation=45)
+        ax.set_ylim(0, 1.1 * np.max(np.exp(self.sizes)))
+        formatter = FuncFormatter(lambda x, p: f'{x:.2e}')
+        ax.yaxis.set_major_formatter(formatter)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_animation(self):
+        fig, ax = plt.subplots()
+        im = ax.imshow(np.zeros((500, 500)), cmap='gray', vmin=0, vmax=1)
+        ax.set_title(f"Lesion Trajectory for Patient {self.patient_id}, Lesion {self.label_id}")
+
+        def update(frame):
+            data_segmentation, _ = self.load_labels_for_inr(selected_date=self.dates[frame])
+            # Take maximum projection across z-axis to convert 3D to 2D
+            data_2d = np.max(data_segmentation, axis=2)
+            im.set_data(data_2d)
+
+        ani = animation.FuncAnimation(fig, update, frames=len(self.dates), repeat=False)
+        plt.close()
+        return HTML(ani.to_jshtml())
+
+
+    def extract_growth_phase(self, sizes, smoothing_window=5, min_start_idx=1):
+        """
+        Extract the main growth phase of a lesion trajectory, ignoring early peaks.
+        
+        Args:
+            sizes: array of lesion sizes (can be log-scale)
+            dates: optional dates for reference
+            smoothing_window: window size for Savitzky-Golay filter
+            min_start_idx: minimum index to consider as peak (avoids very early spikes)
+            
+        Returns:
+            start_idx, end_idx, plot_data
+        """
+        sizes_array = np.array(sizes)
+        n = len(sizes_array)
+        
+        # Smooth the signal
+        if n > smoothing_window:
+            smoothed = savgol_filter(sizes_array, smoothing_window, 2)
+        else:
+            smoothed = sizes_array
+        
+        # Compute first derivative (growth rate)
+        derivative = np.gradient(smoothed)
+        
+        # Find peak, but ignore very early peaks (skip first few points)
+        valid_range_start = min(min_start_idx, n - 2)
+        peak_idx = valid_range_start + np.argmax(smoothed[valid_range_start:])
+        
+        threshold = np.std(derivative) * 0.5
+        
+        # Find growth start: first index where derivative becomes significantly positive
+        growth_start_candidates = np.where(derivative[:peak_idx] > threshold)[0]
+        if len(growth_start_candidates) > 0:
+            start_idx = growth_start_candidates[0]
+        else:
+            start_idx = max(0, peak_idx - 3)
+        
+        # Find growth end: first index after peak where derivative becomes negative
+        growth_end_candidates = np.where(derivative[peak_idx:] < -threshold)[0]
+        if len(growth_end_candidates) > 0:
+            end_idx = peak_idx + growth_end_candidates[0]
+        else:
+            end_idx = min(n - 1, peak_idx + 1)
+        
+        # Optimize start_idx: search in window around initial start_idx for lowest value
+        start_idx = max(0, min(start_idx, n - 1))
+        search_start_left = max(0, start_idx - 5)
+        search_start_right = min(n - 1, start_idx + 5)
+        
+        best_start = start_idx
+        best_start_value = sizes_array[start_idx]
+        
+        for idx in range(search_start_left, search_start_right + 1):
+            if sizes_array[idx] < best_start_value:
+                best_start = idx
+                best_start_value = sizes_array[idx]
+        
+        start_idx = best_start
+        
+        # Optimize end_idx: search in window around initial end_idx for highest value
+        end_idx = max(0, min(end_idx, n - 1))
+        search_end_left = max(0, end_idx - 5)
+        search_end_right = min(n - 1, end_idx + 5)
+        
+        best_end = end_idx
+        best_end_value = sizes_array[end_idx]
+        
+        for idx in range(search_end_left, search_end_right + 1):
+            if sizes_array[idx] > best_end_value:
+                best_end = idx
+                best_end_value = sizes_array[idx]
+        
+        end_idx = best_end
+        
+        # Ensure start_idx is always before end_idx
+        if start_idx >= end_idx:
+            start_idx = max(0, end_idx - 1)
+        
+        # After enforcing start < end, further optimize:
+        # Descend the start: search backwards from start_idx for lower values
+        # Allow up to 5% increase before stopping
+        for idx in range(start_idx - 1, max(-1, start_idx - 10), -1):
+            if idx >= 0 and idx < end_idx:
+                # Allow the value to be up to 5% higher than start_idx
+                if sizes_array[idx] <= sizes_array[start_idx] + np.log(1.05):
+                    start_idx = idx
+                else:
+                    break
+        
+        # Ascend the end: search forwards from end_idx for higher values
+        # Allow up to 5% decrease before stopping
+        for idx in range(end_idx + 1, min(n, end_idx + 10)):
+            if idx > start_idx:
+                # Allow the value to be up to 5% lower than end_idx
+                if sizes_array[idx] >= sizes_array[end_idx] + np.log(0.95):
+                    end_idx = idx
+                else:
+                    break
+
+
+        return start_idx, end_idx, {'smoothed': smoothed, 'derivative': derivative, 'peak': peak_idx}
 
 class MRI_Dataloader:
     def __init__(self, data_path='data/entire_yale_dataset/PRE_POST_YBML', fast_load=False):
@@ -505,6 +666,14 @@ class MRI_Dataloader:
         filtered_samples = [sample for sample in self.pre_post_samples if f"{os.path.sep}{patient_id}{os.path.sep}" in sample and f"{os.path.sep}{date}{os.path.sep}" in sample]
         return DataSample(filtered_samples[0])
 
+    def find_lesion_trajectory(self, patient_id, label_id):
+        trajectory_path = os.path.join(self.data_prediction_path, patient_id, f"lesion_trajectories_{label_id}.npz")
+        if os.path.exists(trajectory_path):
+            return Lesion_Trajectory(load_from_trajectory_path=trajectory_path)
+        else:
+            print(f"Lesion trajectory file not found at {trajectory_path}. Cannot load trajectory.")
+            return None
+
     def iterate_patients(self):
         for patient_id in self.patient_ids:
             yield Patient(patient_id, dataloader=self)
@@ -513,10 +682,17 @@ class MRI_Dataloader:
         for trajectory_path in self.lesion_trajectory_paths:
             yield Lesion_Trajectory(load_from_trajectory_path=trajectory_path)
     
-    def cache_lesion_trajectories_from_n_scans(self, n_scans=8):
+    def cache_lesion_trajectories_from_n_scans(self, n_scans=8, only_growing=False):
         trajectories = []
         for trj in self.iterate_trajectories():
-            if len(trj.dates) < n_scans: continue
+            sizes = len(trj.dates)
+            if only_growing:
+                start_idx, end_idx, _ = trj.extract_growth_phase(trj.sizes)
+                sizes = end_idx - start_idx
+                trj.allowed_dates = trj.dates[start_idx:end_idx+1]
+
+            if sizes < n_scans: continue
+            
             trajectories.append(trj)
 
         print(f"Found {len(trajectories)} trajectories with at least {n_scans} scans.")
@@ -963,55 +1139,537 @@ class Patient:
                 self.registered_transforms.append(sample.load_registered_transform())
         return self.registered_transforms
 
-    def merge_lesion_to_trajectory(self):
+    def _transform_points(self, points, transform_params):
+        """
+        Apply rigid transformation to 3D points.
+        
+        Args:
+            points: Nx3 array of 3D points
+            transform_params: 9-element array [tx, ty, tz, rx, ry, rz, sx, sy, sz]
+        
+        Returns:
+            Transformed Nx3 array
+        """
+        tx, ty, tz, rx, ry, rz, sx, sy, sz = transform_params
+        
+        # Apply scaling and translation
+        transformed = points.copy()
+        transformed[:, 0] = (points[:, 0] - tx) / sx
+        transformed[:, 1] = (points[:, 1] - ty) / sy
+        transformed[:, 2] = (points[:, 2] - tz) / sz
+        
+        return transformed
+
+    def _match_lesions_between_scans(self, scan_idx, prev_centroids, prev_sizes, curr_centroids, 
+                                     curr_sizes, distance_threshold=None, debug=False):
+        """
+        Find optimal matching between lesions in CONSECUTIVE scans using Hungarian algorithm.
+        
+        **Simplified approach without registration transforms:**
+        - Matches based on spatial proximity in original scan coordinates
+        - Uses generous distance thresholds (brain doesn't move much between scans)
+        - Validates with size ratios
+        
+        Args:
+            scan_idx: Current scan index (only for debugging)
+            prev_centroids: Mx3 array of centroids from previous scan
+            prev_sizes: M array of lesion sizes from previous scan
+            curr_centroids: Nx3 array of centroids from current scan
+            curr_sizes: N array of lesion sizes from current scan
+            distance_threshold: Maximum distance for matching. If None, uses 100 pixels
+            debug: If True, print diagnostic information
+        
+        Returns:
+            List of (prev_idx, curr_idx) tuples for valid matches
+        """
+        if len(prev_centroids) == 0 or len(curr_centroids) == 0:
+            return []
+        
+        if distance_threshold is None:
+            distance_threshold = 100  # Generous default for consecutive scans
+        
+        # Compute pairwise Euclidean distances (direct, no transforms)
+        distances = np.linalg.norm(
+            prev_centroids[:, np.newaxis, :] - curr_centroids[np.newaxis, :, :],
+            axis=2
+        )
+        
+        if debug:
+            print(f"    Scan {scan_idx-1}->{scan_idx}: distance matrix (min/max): {distances.min():.2f}/{distances.max():.2f}")
+        
+        # Apply size penalty: penalize matches with very different sizes
+        # Be more lenient here: allow 0.3-3.0x size changes between scans
+        size_ratio_matrix = np.zeros_like(distances)
+        for i in range(len(prev_centroids)):
+            for j in range(len(curr_centroids)):
+                ratio = curr_sizes[j] / (prev_sizes[i] + 1e-6)
+                # Penalize extreme size changes but don't eliminate them
+                if ratio < 0.3 or ratio > 3.0:
+                    size_ratio_matrix[i, j] = 100  # Moderate penalty
+                elif ratio < 0.5 or ratio > 2.0:
+                    size_ratio_matrix[i, j] = 10   # Mild penalty
+        
+        # Combined cost matrix: distance + size penalty
+        cost_matrix = distances + size_ratio_matrix
+        
+        # Hungarian algorithm for optimal assignment
+        prev_indices, curr_indices = linear_sum_assignment(cost_matrix)
+        
+        # Only keep matches within distance threshold and reasonable size
+        matches = []
+        for p_idx, c_idx in zip(prev_indices, curr_indices):
+            distance = distances[p_idx, c_idx]
+            size_ratio = curr_sizes[c_idx] / (prev_sizes[p_idx] + 1e-6)
+            
+            # Accept if within distance threshold AND size is somewhat reasonable
+            if distance < distance_threshold and 0.2 <= size_ratio <= 5.0:
+                matches.append((p_idx, c_idx))
+                if debug:
+                    print(f"      MATCH: lesion {p_idx}->{c_idx}, dist={distance:.1f}px, size_ratio={size_ratio:.2f}x")
+        
+        if debug:
+            print(f"      -> {len(matches)} matches found\n")
+        
+        return matches
+
+    def _find_continuation(self, scan_idx, lesion_centroids, lesion_sizes, 
+                          scan_lesions, visited, max_gap=2, spatial_threshold=50, 
+                          allow_size_change=2.0):
+        """
+        Find the next occurrence of a lesion, allowing gaps.
+        
+        Args:
+            scan_idx: Current scan index
+            lesion_centroids: Centroid of current lesion
+            lesion_sizes: Size of current lesion
+            scan_lesions: List of all scan lesion data
+            visited: Set of already-visited (scan, lesion_idx) tuples
+            max_gap: Maximum number of scans to look ahead
+            spatial_threshold: Max distance to search
+            allow_size_change: Max size ratio to allow (e.g., 2.0 = up to 2x size change)
+        
+        Returns:
+            (next_scan, next_lesion_idx) or (None, None) if not found
+        """
+        # Search forward in subsequent scans, allowing gaps
+        for future_scan in range(scan_idx + 1, min(scan_idx + 1 + max_gap, len(scan_lesions))):
+            if len(scan_lesions[future_scan]['centroids']) == 0:
+                continue
+            
+            # Find unvisited lesion closest to current position
+            best_dist = float('inf')
+            best_idx = None
+            
+            for lesion_idx in range(len(scan_lesions[future_scan]['labels'])):
+                if (future_scan, lesion_idx) in visited:
+                    continue
+                
+                # Check spatial proximity and size consistency
+                future_centroid = scan_lesions[future_scan]['centroids'][lesion_idx]
+                future_size = scan_lesions[future_scan]['sizes'][lesion_idx]
+                
+                dist = np.linalg.norm(lesion_centroids - future_centroid)
+                size_ratio = future_size / (lesion_sizes + 1e-6)
+                
+                # Both distance and size must be reasonable
+                # Allow more size variation when bridging gaps
+                inv_ratio = (lesion_sizes + 1e-6) / future_size if future_size > 0 else float('inf')
+                size_valid = (1.0/allow_size_change <= size_ratio <= allow_size_change)
+                
+                if dist < spatial_threshold and size_valid:
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = lesion_idx
+            
+            if best_idx is not None:
+                return future_scan, best_idx
+        
+        return None, None
+
+    def _build_trajectories_from_matches(self, scan_lesions, matches, num_scans,
+                                         max_gap=2, spatial_threshold=50, 
+                                         size_ratio_threshold=4.0):
+        """
+        Build lesion trajectories by following match chains across scans, allowing gaps.
+        
+        Key feature: Seeds trajectories from ALL scans, not just the first one.
+        This ensures that:
+        - Lesions present in scan 0 start trajectories forward
+        - NEW lesions appearing in scan i (unmatched) start fresh trajectories
+        - Every detected lesion is part of exactly one trajectory
+        
+        Trajectories can skip timepoints if a lesion is absent (labeling error, registration
+        issue, or real disappearance). Only scans where the lesion is actually present are
+        included in the trajectory.
+        
+        Args:
+            scan_lesions: List of dicts with 'centroids', 'sizes', 'labels' for each scan
+            matches: List of (scan_idx, prev_idx, curr_idx) tuples
+            num_scans: Number of scans
+            max_gap: Max scans to skip (default 2)
+            spatial_threshold: Max distance for gap-filling (default 50)
+            size_ratio_threshold: Allow size changes up to this factor (default 4.0)
+        
+        Returns:
+            List of trajectory dicts: {scan_indices: [...], labels: [(scan_idx, label), ...], sizes: [...]}
+        """
+        # Build adjacency information (direct consecutive matches)
+        adj = {}  # (scan, lesion_idx) -> (next_scan, next_lesion_idx)
+        for scan_idx, prev_idx, curr_idx in matches:
+            key = (scan_idx, prev_idx)
+            adj[key] = (scan_idx + 1, curr_idx)
+        
+        # Track which (scan, lesion_idx) have been assigned to trajectories
+        visited = set()
+        trajectories = []
+        
+        # Phase 1: Seed trajectories from lesions in scan 0
+        for lesion_idx in range(len(scan_lesions[0]['labels'])):
+            if (0, lesion_idx) in visited:
+                continue
+            
+            trajectory = self._build_single_trajectory(
+                scan_idx=0, lesion_idx=lesion_idx,
+                scan_lesions=scan_lesions, adj=adj, visited=visited,
+                num_scans=num_scans, max_gap=max_gap,
+                spatial_threshold=spatial_threshold,
+                size_ratio_threshold=size_ratio_threshold
+            )
+            trajectories.append(trajectory)
+        
+        # Phase 2: Seed NEW trajectories from unmatched lesions in subsequent scans
+        # This handles lesions that appear for the first time (new lesions)
+        for scan_idx in range(1, num_scans):
+            for lesion_idx in range(len(scan_lesions[scan_idx]['labels'])):
+                if (scan_idx, lesion_idx) in visited:
+                    continue
+                
+                # This lesion wasn't matched from previous scan - start a NEW trajectory
+                trajectory = self._build_single_trajectory(
+                    scan_idx=scan_idx, lesion_idx=lesion_idx,
+                    scan_lesions=scan_lesions, adj=adj, visited=visited,
+                    num_scans=num_scans, max_gap=max_gap,
+                    spatial_threshold=spatial_threshold,
+                    size_ratio_threshold=size_ratio_threshold
+                )
+                trajectories.append(trajectory)
+        
+        return trajectories
+
+    def _build_single_trajectory(self, scan_idx, lesion_idx, scan_lesions, adj, visited,
+                                num_scans, max_gap, spatial_threshold, size_ratio_threshold):
+        """
+        Build a single trajectory starting from (scan_idx, lesion_idx).
+        Follows matches forward and handles gaps.
+        
+        Args:
+            scan_idx: Starting scan index
+            lesion_idx: Starting lesion index
+            scan_lesions: All scan lesion data
+            adj: Adjacency dict from direct matches
+            visited: Set of visited (scan, lesion) pairs (will be updated)
+            num_scans: Total number of scans
+            max_gap, spatial_threshold, size_ratio_threshold: Gap-filling parameters
+        
+        Returns:
+            Trajectory dict
+        """
+        # Initialize trajectory
+        trajectory = {
+            'scan_indices': [scan_idx],
+            'labels': [(scan_idx, scan_lesions[scan_idx]['labels'][lesion_idx])],
+            'sizes': [scan_lesions[scan_idx]['sizes'][lesion_idx]],
+            'centroids': [scan_lesions[scan_idx]['centroids'][lesion_idx]]
+        }
+        visited.add((scan_idx, lesion_idx))
+        
+        current_scan = scan_idx
+        current_lesion_idx = lesion_idx
+        current_centroid = scan_lesions[scan_idx]['centroids'][lesion_idx]
+        current_size = scan_lesions[scan_idx]['sizes'][lesion_idx]
+        
+        # Follow the chain forward
+        while current_scan < num_scans - 1:
+            # Try direct consecutive match first
+            if (current_scan, current_lesion_idx) in adj:
+                next_scan, next_lesion_idx = adj[(current_scan, current_lesion_idx)]
+                
+                trajectory['scan_indices'].append(next_scan)
+                trajectory['labels'].append((next_scan, scan_lesions[next_scan]['labels'][next_lesion_idx]))
+                trajectory['sizes'].append(scan_lesions[next_scan]['sizes'][next_lesion_idx])
+                trajectory['centroids'].append(scan_lesions[next_scan]['centroids'][next_lesion_idx])
+                
+                visited.add((next_scan, next_lesion_idx))
+                current_scan = next_scan
+                current_lesion_idx = next_lesion_idx
+                current_centroid = scan_lesions[next_scan]['centroids'][next_lesion_idx]
+                current_size = scan_lesions[next_scan]['sizes'][next_lesion_idx]
+            else:
+                # No direct match - look ahead allowing gaps
+                next_scan, next_lesion_idx = self._find_continuation(
+                    current_scan, current_centroid, current_size, 
+                    scan_lesions, visited, max_gap=max_gap, 
+                    spatial_threshold=spatial_threshold,
+                    allow_size_change=size_ratio_threshold
+                )
+                
+                if next_scan is not None:
+                    trajectory['scan_indices'].append(next_scan)
+                    trajectory['labels'].append((next_scan, scan_lesions[next_scan]['labels'][next_lesion_idx]))
+                    trajectory['sizes'].append(scan_lesions[next_scan]['sizes'][next_lesion_idx])
+                    trajectory['centroids'].append(scan_lesions[next_scan]['centroids'][next_lesion_idx])
+                    
+                    visited.add((next_scan, next_lesion_idx))
+                    current_scan = next_scan
+                    current_lesion_idx = next_lesion_idx
+                    current_centroid = scan_lesions[next_scan]['centroids'][next_lesion_idx]
+                    current_size = scan_lesions[next_scan]['sizes'][next_lesion_idx]
+                else:
+                    # No continuation found - trajectory ends
+                    break
+        
+        return trajectory
+
+    def merge_lesion_to_trajectory(self, max_gap=7, spatial_threshold=40, 
+                                   size_ratio_threshold=12.0, distance_threshold=40):
+        """
+        Match lesions across scans using lenient spatial matching.
+        Uses Hungarian algorithm for optimal 1-to-1 correspondence between consecutive scans.
+        
+        **Approach**: Direct spatial matching without registration transforms.
+        - Matches based on centroid proximity (brain position relatively stable across consecutive scans)
+        - Allows generous spatial thresholds
+        - Implements smart gap-filling for missing lesions at timepoints
+        
+        Handles realistic scenario where:
+        - Some lesions disappear (merge, resolve, or labeling errors)
+        - New lesions appear
+        - Variable number of lesions per timepoint
+        
+        Args:
+            max_gap: Max scans to skip when looking for lesion continuation (default 2)
+            spatial_threshold: Max pixel distance for gap-filling matches (default 150)
+            size_ratio_threshold: Allow size changes up to this factor (default 3.0 = 3x)
+            distance_threshold: Max distance for consecutive scan matches (default 100)
+        """
         vol_shape = (500, 500, 50)
         volume, affine = self.samples[0].load_mri(zoomed=True, affine=True)
         volume = np.sum(volume[volume > 0])
 
-        labeled_mask_cache = []
-        sum_mask = np.zeros(vol_shape, dtype=np.uint8)
-
+        # Step 1: Extract lesion data for each scan
+        print(f"Extracting lesion data from {len(self.samples)} scans...")
+        scan_lesions = []
+        lesion_counts = []
         for i, sample in enumerate(self.samples):
             labeled_mask = sample.load_mri_segmentation(zoomed=True)
-            labeled_mask_cache.append(labeled_mask)
-            sum_mask = sum_mask + labeled_mask
-
-        sum_mask = (sum_mask > 0).astype(np.uint8)            
-        # we introduce a little bit of bleeding, to connect nearby lesions
-        sum_mask_dialated = ndimage.binary_dilation(sum_mask, iterations=1).astype(np.uint8)
-        sum_mask_dialated = ndimage.binary_dilation(sum_mask_dialated, iterations=3, axes=(0,1)).astype(np.uint8)
-        labeled_lesion_mask, num_features = ndimage.label(sum_mask_dialated)
-        labeled_lesion_mask = sum_mask * labeled_lesion_mask
-
-        sizes = np.zeros((len(self.samples), num_features), dtype=np.uint32)
-        # for every lesion trajectory
-        for i in range(1, num_features + 1):
-            lesion_mask = (labeled_lesion_mask == i).astype(np.uint8)
-
-            sample_ids = []
-            # we check if the lesion is present in each sample
-            for j in range(len(self.samples)):
-                lesion_mask_sample = lesion_mask * labeled_mask_cache[j]
-                if np.sum(lesion_mask_sample) > 0:
-                    sample_ids.append(j)
-                    sizes[j][i-1] = np.sum(lesion_mask_sample)
-                    labeled_mask_cache[j][lesion_mask_sample > 0] = i
+            num_lesions = int(labeled_mask.max())
+            lesion_counts.append(num_lesions)
             
+            if num_lesions > 0:
+                centroids = ndimage.center_of_mass(
+                    labeled_mask,
+                    labeled_mask,
+                    range(1, num_lesions + 1)
+                )
+                centroids = np.array(centroids)
+                
+                # Get sizes for each lesion
+                sizes = ndimage.sum(
+                    np.ones_like(labeled_mask),
+                    labeled_mask,
+                    range(1, num_lesions + 1)
+                )
+            else:
+                centroids = np.empty((0, 3))
+                sizes = np.array([])
+            
+            scan_lesions.append({
+                'centroids': centroids,
+                'sizes': sizes,
+                'labels': np.arange(1, num_lesions + 1),
+                'labeled_mask': labeled_mask
+            })
+            print(f"  Scan {i} ({self.samples[i].date}): {num_lesions} lesions")
+        
+        print(f"\nLesion counts per scan: {lesion_counts}")
 
-            trajectory = Lesion_Trajectory(patient_id=self.patient_id, label_id=i, sample_ids=sample_ids, sizes=np.log(sizes[:,i-1][sizes[:,i-1] != 0] / volume))
-            trajectory.save_lesion_trajectory()
+        # Step 2: Match lesions between consecutive scans
+        print("\nMatching lesions between consecutive scans...")
+        matches = []  # List of (scan_idx, prev_idx, curr_idx)
+        unmatched_by_scan = []  # Track unmatched lesions
+        
+        for i in range(1, len(self.samples)):
+            prev_centroids = scan_lesions[i-1]['centroids']
+            prev_sizes = scan_lesions[i-1]['sizes']
+            curr_centroids = scan_lesions[i]['centroids']
+            curr_sizes = scan_lesions[i]['sizes']
+            
+            # Enable debug for first 3 transitions
+            debug = (i <= 3)
+            
+            # Find optimal matches (lenient spatial matching, no transforms)
+            scan_matches = self._match_lesions_between_scans(
+                i, prev_centroids, prev_sizes, curr_centroids, curr_sizes,
+                distance_threshold=distance_threshold, debug=debug
+            )
+            
+            # Track which lesions got matched
+            matched_prev = set(m[0] for m in scan_matches)
+            unmatched_count = len(prev_centroids) - len(matched_prev)
+            
+            for prev_idx, curr_idx in scan_matches:
+                matches.append((i-1, prev_idx, curr_idx))
+            
+            print(f"  Scan {i-1} -> {i}: {len(scan_matches)}/{len(prev_centroids)} matches " +
+                  f"({unmatched_count} unmatched from previous)")
+            
+            unmatched_by_scan.append((i, unmatched_count))
 
+        # Step 3: Build trajectories from match chains
+        print("\nBuilding trajectories from match chains...")
+        trajectories = self._build_trajectories_from_matches(
+            scan_lesions, matches, len(self.samples), 
+            max_gap=max_gap, spatial_threshold=spatial_threshold,
+            size_ratio_threshold=size_ratio_threshold
+        )
+        
+        trajectories_with_gaps = sum(1 for t in trajectories if len(t['scan_indices']) < len(self.samples))
+        print(f"Found {len(trajectories)} lesion trajectories")
+        print(f"  - {trajectories_with_gaps} trajectories have gaps (missing timepoints)")
+        print(f"  - {len(trajectories) - trajectories_with_gaps} trajectories span all timepoints")
+        
+        # Filter trajectories: only keep those with more than 2 entries
+        trajectories_filtered = [t for t in trajectories if len(t['scan_indices']) > 2]
+        trajectories_short = len(trajectories) - len(trajectories_filtered)
+        
+        if trajectories_short > 0:
+            print(f"\nFiltering: Removing {trajectories_short} trajectories with ≤2 entries")
+            print(f"Keeping {len(trajectories_filtered)} trajectories with >2 entries")
+        
+        trajectories = trajectories_filtered
+
+        # Step 4: Create relabeled masks and save trajectories
+        labeled_mask_cache = [np.zeros(vol_shape, dtype=np.uint8) for _ in range(len(self.samples))]
+        trajectory_sizes = np.zeros((len(self.samples), len(trajectories)), dtype=np.uint32)
+        
+        for traj_id, trajectory in enumerate(trajectories):
+            sample_ids = trajectory['scan_indices']
+            
+            # CRITICAL: Filter out empty frames BEFORE saving
+            # Only keep timepoints where the lesion actually exists 
+            valid_frames = []
+            removed_frames = []
+            
+            for frame_idx, scan_idx in enumerate(sample_ids):
+                orig_mask = scan_lesions[scan_idx]['labeled_mask']
+                orig_label = trajectory['labels'][frame_idx][1]
+                lesion_mask = (orig_mask == orig_label).astype(np.uint8)
+                voxel_count = np.sum(lesion_mask)
+                
+                if voxel_count > 0:  # Frame has actual lesion data
+                    valid_frames.append(frame_idx)
+                else:
+                    removed_frames.append((scan_idx, self.samples[scan_idx].date, voxel_count))
+            
+            # Print summary of removed frames
+            if removed_frames:
+                print(f"  Trajectory {traj_id+1}: Removing {len(removed_frames)} empty frames")
+                for scan_idx, date, voxels in removed_frames[:3]:  # Show first 3
+                    print(f"    - Scan {scan_idx} ({date}): {voxels} voxels")
+                if len(removed_frames) > 3:
+                    print(f"    ... and {len(removed_frames)-3} more")
+            
+            # If all frames are empty, skip this trajectory entirely
+            if len(valid_frames) == 0:
+                print(f"  Trajectory {traj_id+1}: SKIPPED - all {len(sample_ids)} frames are empty!")
+                continue
+            
+            # Create clean trajectory with only valid frames
+            if len(valid_frames) < len(sample_ids):
+                cleaned_trajectory = {
+                    'scan_indices': [sample_ids[i] for i in valid_frames],
+                    'labels': [trajectory['labels'][i] for i in valid_frames],
+                    'sizes': [trajectory['sizes'][i] for i in valid_frames],
+                    'centroids': [trajectory['centroids'][i] for i in valid_frames]
+                }
+                sample_ids_to_save = cleaned_trajectory['scan_indices']
+                print(f"    Final: {len(valid_frames)}/{len(trajectory['scan_indices'])} valid frames")
+            else:
+                cleaned_trajectory = trajectory
+                sample_ids_to_save = sample_ids
+            
+            # For each scan in this trajectory, mark the lesion with the trajectory ID
+            for scan_idx in sample_ids_to_save:
+                # Find the original label for this scan in this trajectory
+                for scan_in_traj, label in cleaned_trajectory['labels']:
+                    if scan_in_traj == scan_idx:
+                        orig_label = label
+                        break
+                
+                # Copy the lesion to the new mask
+                orig_mask = scan_lesions[scan_idx]['labeled_mask']
+                lesion_mask = (orig_mask == orig_label).astype(np.uint8)
+                labeled_mask_cache[scan_idx][lesion_mask > 0] = traj_id + 1
+                trajectory_sizes[scan_idx, traj_id] = np.sum(lesion_mask)
+            
+            # Save trajectory (with cleaned frames only!)
+            log_sizes = np.log(cleaned_trajectory['sizes'] / (volume + 1e-7) + 1e-7)
+            trajectory_obj = Lesion_Trajectory(
+                patient_id=self.patient_id,
+                label_id=traj_id + 1,
+                sample_ids=sample_ids_to_save,  # Use cleaned sample_ids
+                sizes=log_sizes
+            )
+            trajectory_obj.save_lesion_trajectory()
+
+        # Step 5: Save relabeled masks
+        print("\nSaving relabeled masks...")
         for i, sample in enumerate(self.samples):
             img = nib.Nifti1Image(labeled_mask_cache[i], affine)
             metadata = {
-                "num_features": num_features,
-                "sizes": np.log(sizes[i]/volume + 1e-7).tolist()
+                "num_features": len(trajectories),
+                "sizes": np.log(trajectory_sizes[i] / (volume + 1e-7) + 1e-7).tolist()
             }
-
+            
             json_str = json.dumps(metadata)
             extension = nib.nifti1.Nifti1Extension(44, json_str.encode('utf-8'))
             img.header.extensions.append(extension)
             nib.save(img, sample.lesion_trajectory_path)
+        
+        print("Trajectory building complete!")
+
+    def diagnose_trajectory_empty_frames(self, trajectory_idx=1):
+        """
+        Diagnose if a trajectory has empty frames (no actual lesion data at some timepoints).
+        Helpful for debugging gap-filled trajectories.
+        
+        Args:
+            trajectory_idx: Which trajectory to examine (1-indexed from saved trajectories)
+        """
+        trajectories = self.load_lesion_trajectories()
+        if trajectory_idx < 1 or trajectory_idx > len(trajectories):
+            print(f"Invalid trajectory index. Available: 1-{len(trajectories)}")
+            return
+        
+        trj = trajectories[trajectory_idx - 1]
+        print(f"\n=== Diagnosing Trajectory {trajectory_idx} (Label {trj.label_id}) ===")
+        print(f"Patient: {trj.patient_id}")
+        print(f"Number of scans in trajectory: {len(trj.dates)}")
+        print(f"Dates: {trj.dates}")
+        print(f"Sizes (log): {trj.sizes}")
+        
+        # Load all data for this trajectory
+        print("\nLoading trajectory data for all dates:")
+        data_all = trj.load_labels_for_inr()
+        
+        for i, (data_seg, time_point) in enumerate(data_all):
+            non_zero_voxels = np.count_nonzero(data_seg)
+            print(f"  {trj.dates[i]}: {non_zero_voxels} voxels (time_point={time_point:.3f})")
+            
+            if non_zero_voxels == 0:
+                print(f"    ^ WARNING: Frame is EMPTY!")
+        
+        return data_all
 
     
     def load_lesion_trajectories(self):
