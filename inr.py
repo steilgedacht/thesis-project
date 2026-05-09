@@ -529,7 +529,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 with mlflow.start_run():
     mri_dataloader = MRI_Dataloader()
     mri_dataloader.cache_lesion_trajectories_from_n_scans(n_scans=6, only_growing=True)
-    trajectories = mri_dataloader.cache_lesion_trajectories * 10
+    trajectories = mri_dataloader.cache_lesion_trajectories * 20
 
     batchsize = 100
     epochs = 200

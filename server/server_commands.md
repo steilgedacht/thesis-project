@@ -1,6 +1,6 @@
 Sync the local folder up
 ```bash
-rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='venv/' --exclude='data' --exclude='mlruns'  . node:~/projects/thesis
+rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='venv/' --exclude='data' --exclude='mlruns' --exclude='mlflow.db' . node:~/projects/thesis
 ```
 
 Get some memory
@@ -21,9 +21,20 @@ singularity instance start --nv thesis.sif my_dev_env
 Connect to the singularity
 ```bash
 singularity shell --nv instance://my_dev_env
+singularity exec instance://my_dev_env mlflow server --host 127.0.0.1 --port 5124 --disable-security-middleware
 ```
 
 Start the python script
 ```bash
 python3.11 inr.py
+```
+
+SSH Port forwarding
+```bash
+ssh -L 5124:localhost:5124 node
+ssh -L 5000:localhost:5000 node
+```
+
+```bash
+mlflow server --host 0.0.0.0 --port 5124 --backend-store-uri ./mlruns --default-artifact-root ./artifacts --allowed-hosts "*" --disable-security-middleware
 ```
