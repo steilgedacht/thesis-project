@@ -1,0 +1,98 @@
+
+Bootstrap: docker
+From: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=Europe/Vienna
+
+    # 1. System Updates & Core Tools
+    apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        build-essential \
+        curl \
+        wget \
+        git \
+        tmux \
+        zsh \
+        sudo \
+        htop \
+        nvtop \
+        ffmpeg \
+        libsm6 \
+        libxext6 \
+        liblzo2-dev \
+        zlib1g-dev \
+        pkg-config \
+        ca-certificates \
+        python3.11 \
+        python3.11-dev \
+        python3.11-distutils \
+        unzip
+
+    # 2. Install Oh My Zsh
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+
+    # 3. Install Neovim and Yazi
+    add-apt-repository ppa:neovim-ppa/unstable -y
+    apt-get update && apt-get install -y neovim
+    
+    curl -L https://github.com/sxyazi/yazi/releases/latest/download/yazi-x86_64-unknown-linux-gnu.zip -o yazi.zip
+    unzip yazi.zip -d /usr/local/bin/ && rm yazi.zip
+
+    # 4. Setup Python 3.11, Pip, and uv
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+    python3.11 -m pip install --upgrade pip setuptools wheel
+
+    curl -LsSf https://astral.sh/uv/install.sh | INSTALLER_NO_MODIFY_PATH=1 sh
+    mv $HOME/.local/bin/uv /usr/local/bin/uv
+    mv $HOME/.local/bin/uvx /usr/local/bin/uvx
+
+    # 5. Build Environment Variables
+    export PATH="/usr/local/cuda/bin:/usr/bin:$PATH"
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+    export CUDA_HOME=/usr/local/cuda
+    export FORCE_CUDA=1
+    export TORCH_CUDA_ARCH_LIST="8.6 8.9"
+    
+    # CRITICAL: Force UV and the C-Compiler to use Python 3.11
+    export UV_PYTHON=/usr/bin/python3.11
+    export C_INCLUDE_PATH=/usr/include/python3.11
+    export CPLUS_INCLUDE_PATH=/usr/include/python3.11
+
+    # 6. Install Torch suite
+    uv pip install --system --no-cache \
+        torch==2.5.1 torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/cu124
+
+    # 7. Build Geometric stack from source
+    # This fixes the Segmentation Fault by matching your local ABI
+    uv pip install --system --no-cache \
+        --no-build-isolation \
+        --no-binary torch-scatter,torch-sparse,torch-cluster,torch-spline-conv \
+        torch-scatter \
+        torch-sparse \
+        torch-cluster \
+        torch-spline-conv \
+        torch-geometric        
+
+    # 8. Install the rest of the stack
+    uv pip install --system --no-cache \
+        pandas numpy scipy scikit-image scikit-learn matplotlib \
+        nibabel plotly tqdm mlflow ipython notebook \
+        opencv-python-headless pillow pydicom natsort sqlalchemy h5py \
+        monai pytorch-lightning pycm joblib \
+        tables xlrd openpyxl concurrent-log-handler
+
+%startscript
+    tmux new-session -d -s mlflow_server 'mlflow server --host 0.0.0.0 --port 5000'
+    # Note: ensure code-server is installed if you want to use this
+    # tmux new-session -d -s code_server 'code-server --bind-addr 0.0.0.0:8080 --auth none'
+
+%runscript
+    # If a command is passed, run it. Otherwise, start zsh.
+    if [ $# -eq 0 ]; then
+        exec /bin/zsh
+    else
+        exec "$@"
+    fi

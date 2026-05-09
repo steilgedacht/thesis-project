@@ -178,7 +178,6 @@ class LesionDataset(Dataset):
                 dates_list = trj.dates[:-1]
             if hasattr(trj, 'allowed_dates'):
                 dates_list = trj.allowed_dates
-                print("Here!!")
             random_time_point = str(np.random.choice(dates_list))
         else:
             if self.mode == 'valid_extrapolation':
