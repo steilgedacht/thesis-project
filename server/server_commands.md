@@ -1,3 +1,12 @@
+## Connect to server
+
+```bash
+vpn-med
+ssh node
+```
+
+## Start the instance at the server
+
 Sync the local folder up
 ```bash
 rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='venv/' --exclude='data' --exclude='mlruns' --exclude='mlflow.db' . node:~/projects/thesis
@@ -10,22 +19,24 @@ salloc -n8 --gres=gpu:1 -J singularity_bash --partition=full_optima --mem=64G --
 
 Stop the existing singularity
 ```bash
-singularity instance stop my_dev_env
+singularity instance stop thesis_env
+sudo singularity build thesis.sif container.def
 ```
 
 Start the singularity
 ```bash
-singularity instance start --nv thesis.sif my_dev_env
+singularity instance start --nv thesis.sif thesis_env
 ```
 
 Connect to the singularity
 ```bash
-singularity shell --nv instance://my_dev_env
-singularity exec instance://my_dev_env mlflow server --host 127.0.0.1 --port 5124 --disable-security-middleware
+singularity shell --nv instance://thesis_env
+singularity exec instance://thesis_env mlflow server --host 127.0.0.1 --port 5124 --disable-security-middleware
 ```
 
 Start the python script
 ```bash
+cd projects/thesis && python3.11 inr.py
 python3.11 inr.py
 ```
 
