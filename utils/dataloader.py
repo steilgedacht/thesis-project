@@ -6,8 +6,7 @@ class LesionDataset(Dataset):
     def __init__(self, 
                  trajectories, 
                  device='cuda', 
-                 context_radius=5, 
-                 background_samples_proportion=1, 
+                 dialation_iterations=5, 
                  mode='train', 
                  val_date_idx=None, 
                  val_end_date_idx=None, 
@@ -19,8 +18,7 @@ class LesionDataset(Dataset):
                               np.linspace(0, 1, self.shape[1]),
                               np.linspace(0, 1, self.shape[2]),
                               indexing='ij')
-        self.context_radius = context_radius
-        self.background_samples_proportion = background_samples_proportion
+        self.dialation_iterations = dialation_iterations
         self.patient_to_idx = {p.patient_id: i for i, p in enumerate(trajectories)}
         self.mode = mode
         self.max_samples = background_samples
@@ -63,7 +61,7 @@ class LesionDataset(Dataset):
         lesion_mask = labels > 0.5        
         pos_coords = np.argwhere(lesion_mask)
 
-        border_samples = binary_dilation(labels) - labels
+        border_samples = binary_dilation(labels, iterations=self.dialation_iterations) - labels
         border_samples_coords = np.argwhere(border_samples)
 
         num_neg_needed = self.max_samples // 2

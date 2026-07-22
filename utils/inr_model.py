@@ -4,7 +4,10 @@ import numpy as np
 
 
 class TimeEncoder(nn.Module):
-    def __init__(self, max_t, num_frequencies=6):
+    def __init__(self, 
+                 max_t, 
+                 num_frequencies=6
+            ):
         super().__init__()
         self.max_t = max_t
         # This creates a set of frequencies to expand the single time scalar
@@ -23,7 +26,13 @@ class TimeEncoder(nn.Module):
         return embeddings
     
 class SirenLayer(nn.Module):
-    def __init__(self, in_features, out_features, latent_dim, is_first=False, omega_0=30.0):
+    def __init__(self, 
+                 in_features, 
+                 out_features, 
+                 latent_dim, 
+                 is_first=False, 
+                 omega_0=30.0
+            ):
         super().__init__()
         self.omega_0 = omega_0
         self.is_first = is_first
@@ -53,12 +62,26 @@ class SirenLayer(nn.Module):
         return torch.sin(self.omega_0 * (gamma * self.linear(x) + beta))
 
 class LesionINR(nn.Module):
-    def __init__(self, numpatients, latent_dim=128, input_dim=4, hidden_dim=512, output_dim=1, omega_0=30.0, n_layers=8):
+    def __init__(self, 
+                 num_patients, 
+                 latent_dim=128, 
+                 input_dim=4, 
+                 hidden_dim=512, 
+                 output_dim=1, 
+                 omega_0=30.0, 
+                 n_layers=8,
+                 time_freqs=6,
+                 max_t=3650.0
+
+            ):
         super().__init__()
-        self.latent_vectors = nn.Embedding(numpatients, latent_dim)
+        self.latent_vectors = nn.Embedding(num_patients, latent_dim)
         
-        self.time_freqs = 6
-        self.time_encoder = TimeEncoder(max_t=3650.0, num_frequencies=self.time_freqs)
+        self.time_freqs = time_freqs
+        self.time_encoder = TimeEncoder(
+            max_t=max_t, 
+            num_frequencies=self.time_freqs
+        )
         
         # input_dim for latent_adapt is now latent_dim + 1 (for the single normalized time scalar)
         self.latent_adapt = nn.Sequential(

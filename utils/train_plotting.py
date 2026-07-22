@@ -36,7 +36,7 @@ def plot_predictions(v_preds, v_labels, v_coords, epoch, title=""):
     mlflow.log_figure(fig, f"{epoch:04d}_epoch_predictions_{title}.png")
     plt.close(fig)
 
-def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, time_point=None):
+def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, config, time_point=None):
     # get the height where the lesion is located
     center_of_mass = torch.mean(coords.squeeze()[:len(labels.squeeze())//2,:3], axis=0).detach().cpu().numpy()
     lesion_z = center_of_mass[2]
@@ -44,7 +44,7 @@ def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, time_poin
     if time_point is not None:
         sample_id = str(sample_id) + "_time_point_" + str(time_point)
     
-    meshgrid = np.meshgrid(np.linspace(0, 1, 500), np.linspace(0, 1, 500), indexing='ij')
+    meshgrid = np.meshgrid(np.linspace(0, 1, config.full_size_side_length), np.linspace(0, 1, config.full_size_side_length), indexing='ij')
     x = meshgrid[0].flatten() * 2 - 1
     y = meshgrid[1].flatten() * 2 - 1
     
@@ -66,7 +66,7 @@ def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, time_poin
             else:
                 heatmap_preds = np.concatenate([heatmap_preds, slice_preds.cpu().numpy()], axis=1)
 
-    heatmap_preds = heatmap_preds.reshape(500, 500)
+    heatmap_preds = heatmap_preds.reshape(config.full_size_side_length, config.full_size_side_length)
 
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.imshow(heatmap_preds, cmap='copper', vmin=0, vmax=1)
@@ -75,21 +75,22 @@ def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, time_poin
     mlflow.log_figure(fig, f"{epoch:04d}_epoch_lesion_heatmap_patient_{patient_idx.item()}_sample_{sample_id}.png")
     plt.close(fig)
     
-def visualize_samples(model, epoch, monitoring_samples, data_loader, text):
+def visualize_samples(model, epoch, monitoring_samples, data_loader, text, config):
     for sample_idx in monitoring_samples:
         coords, labels, patient_idx = data_loader.dataset[sample_idx]
-        coords = torch.from_numpy(coords).float().unsqueeze(0).to(device)
-        labels = torch.from_numpy(labels).float().unsqueeze(0).unsqueeze(-1).to(device)
-        patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
+        coords = torch.from_numpy(coords).float().unsqueeze(0).to(config.device)
+        labels = torch.from_numpy(labels).float().unsqueeze(0).unsqueeze(-1).to(config.device)
+        patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(config.device)
         predictions = model(coords, patient_idx)
         plot_predictions(predictions, labels, coords, epoch, f"{text}_patient_{patient_idx.item()}_sample_{sample_idx}")
 
 
-def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=100, side_length=50):
+def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, config, final_side_length=False):
+    side_length = config.time_evolution_side_length if not final_side_length else config.full_size_side_length
     coords, labels, patient_idx = data_loader.dataset[sample_idx]
-    coords = torch.from_numpy(coords).unsqueeze(0).float().to(device)
-    labels = torch.from_numpy(labels).unsqueeze(0).float().unsqueeze(-1).to(device)
-    patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(device)
+    coords = torch.from_numpy(coords).unsqueeze(0).float().to(config.device)
+    labels = torch.from_numpy(labels).unsqueeze(0).float().unsqueeze(-1).to(config.device)
+    patient_idx = torch.tensor(patient_idx).unsqueeze(0).to(config.device)
     
     full_matrix_labels = data_loader.dataset.trajectories[sample_idx].load_labels_for_inr(absolute_day_number=True)
 
@@ -108,7 +109,7 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=100,
         y = meshgrid[1].flatten() * 2 - 1
         z = np.full_like(x, lesion_z)
 
-        for t in np.linspace(0, 3650, steps):
+        for t in np.linspace(0, int(config.max_t), config.time_evolution_steps):
 
             time_point = np.full_like(x, t) 
 
@@ -154,18 +155,18 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=100,
     xs, ys, zs = np.where(list_3d[0]==1)
     scatter = ax3.scatter(xs, ys, zs=zs)
     ax3.set_title("Ground Truth in 3D space")
-    ax3.set_xlim3d(0, 500)
-    ax3.set_ylim3d(0, 500)
+    ax3.set_xlim3d(0, config.full_size_side_length)
+    ax3.set_ylim3d(0, config.full_size_side_length)
     ax3.set_zlim3d(0, 50)
 
-    x_plane = np.linspace(0, 500, 10)
-    y_plane = np.linspace(0, 500, 10)
+    x_plane = np.linspace(0, config.full_size_side_length, 10)
+    y_plane = np.linspace(0, config.full_size_side_length, 10)
     X_p, Y_p = np.meshgrid(x_plane, y_plane)
     Z_p = np.full_like(X_p, int(((lesion_z + 1) / 2) * 50)) 
     ax3.plot_surface(X_p, Y_p, Z_p, alpha=0.3, color='lightblue', antialiased=False, label="slice_of_heatmap")
 
     ax4 = fig.add_subplot(2, 2, 4)
-    im_label_4 = ax4.imshow(heatmaps[0].repeat(500//side_length,axis=0).repeat(500//side_length,axis=1), cmap='copper', vmin=0, vmax=1, animated=True)
+    im_label_4 = ax4.imshow(heatmaps[0].repeat(config.full_size_side_length//side_length,axis=0).repeat(config.full_size_side_length//side_length,axis=1), cmap='copper', vmin=0, vmax=1, animated=True)
     im_seg_4 = ax4.imshow(label_grid[0], cmap='Reds', vmin=0, vmax=1, alpha=0.5)
     ax4.set_title("Ground Truth")
     ax4.axis('off')
@@ -186,7 +187,7 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=100,
         else:
             im.set_array(heatmaps[i])
             im_label.set_array(label_grid[i])
-            im_label_4.set_array(heatmaps[i].repeat(500//side_length,axis=0).repeat(500//side_length,axis=1))
+            im_label_4.set_array(heatmaps[i].repeat(config.full_size_side_length//side_length,axis=0).repeat(config.full_size_side_length//side_length,axis=1))
             im_seg_4.set_array(label_grid[i])
             xs, ys, zs = np.where(list_3d[i]==1)
             scatter._offsets3d = (xs, ys, zs)
