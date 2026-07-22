@@ -9,7 +9,7 @@ ssh node
 
 Sync the local folder up
 ```bash
-rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='venv/' --exclude='data' --exclude='mlruns' --exclude='mlflow.db' . node:~/projects/thesis
+rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='venv/' --exclude='data' --exclude='server/mlartifacts' --exclude='mlruns' --exclude='mlflow.db' . node:~/projects/thesis
 ```
 
 Get some memory

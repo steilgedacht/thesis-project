@@ -682,7 +682,7 @@ class MRI_Dataloader:
         for trajectory_path in self.lesion_trajectory_paths:
             yield Lesion_Trajectory(load_from_trajectory_path=trajectory_path)
     
-    def cache_lesion_trajectories_from_n_scans(self, n_scans=8, only_growing=False):
+    def cache_lesion_trajectories_from_n_scans(self, n_scans:int = 8, only_growing:bool = False):
         trajectories = []
         for trj in self.iterate_trajectories():
             sizes = len(trj.dates)
