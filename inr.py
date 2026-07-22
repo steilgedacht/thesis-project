@@ -194,7 +194,7 @@ with mlflow.start_run(run_name=config.mlflow_run_name):
     )
     mlflow.log_params({
         "dataset_size": len(train_dataset),
-        **vars(config)
+        **{key: getattr(config, key) for key in dir(config) if not key.startswith("_")}
     })
     mlflow.log_artifact("config.py")
     mlflow.log_artifact("inr.py")
