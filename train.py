@@ -60,7 +60,7 @@ def train_inr(
 
         # ==== Training Loop ====
         model.train()
-        for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{config.epochs}"):
+        for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}/{config.epochs}"):
 
             coords = coords.to(config.device)
             labels = labels.to(config.device).unsqueeze(-1)
@@ -72,10 +72,12 @@ def train_inr(
             predictions = model(coords, patient_idx)
 
             loss = criterion(predictions, labels)
-            loss.backward()
+
+            if loss.requires_grad: # only used for baseline models with no parameters
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm_clip) 
+                optimizer.step()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm_clip) 
-            optimizer.step()
             total_loss += loss.item()
 
             if i % config.train_log_interval == 0:
@@ -84,8 +86,8 @@ def train_inr(
                         "training_loss" : loss.item(),
                         "training_loss_bce" : criterion.loss_bce.item(),
                         "training_loss_dice" : criterion.loss_dice.item(),
-                        "number_of_correctly_predicted_1_labels" : (predictions>0.5).sum().item() / (labels > 0.5).sum().item(),
-                        "number_of_correctly_predicted_0_labels" : (predictions<=0.5).sum().item() / (labels <= 0.5).sum().item()
+                        "number_of_correctly_predicted_1_labels" : (predictions > 0.5).sum().item() / (labels > 0.5).sum().item() if (labels > 0.5).sum().item() != 0 else 0,
+                        "number_of_correctly_predicted_0_labels" : (predictions <= 0.5).sum().item() / (labels <= 0.5).sum().item() if (labels <= 0.5).sum().item() != 0 else 0
                     },
                     step=global_step
                 )
@@ -136,8 +138,9 @@ if __name__ == "__main__":
 
     argument_parser = argparse.ArgumentParser(description="Train a Lesion Trajectory model.")
     argument_parser.add_argument("--config", type=str, default="configs/00_default/config.py", help="Path to the configuration file.")
-    args = argument_parser.parse_args().config
-    config = load_config(args)
+    args = argument_parser.parse_args()
+    config = load_config(args.config)
+    print(f"Using configuration from: {args.config}")
 
     mlflow.set_tracking_uri(config.mlflow_tracking_uri)
     mlflow.set_experiment(config.mlflow_experiment_name)
@@ -199,7 +202,7 @@ if __name__ == "__main__":
         )
 
         model = config.model(
-            num_patients=len(trajectories), 
+            trajectories=trajectories, 
             **config.model_params
         )
         

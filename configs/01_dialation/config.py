@@ -3,13 +3,13 @@ import torch
 class Config:
     """ Tracking parameters """
     mlflow_tracking_uri = "http://127.0.0.1:5000"
-    mlflow_experiment_name = "Lesion_INR_Training"
-    mlflow_run_name = "Runname" 
+    mlflow_experiment_name = "Lesion_Dialation"
+    mlflow_run_name = "Naive_Dialation_Model" 
 
 
     """ Dataloading parameters """
-    batchsize = 10
-    num_workers = 7
+    batchsize = 1
+    num_workers = 6
     prefetch_factor = 2
     pin_memory = True
     persistent_workers = True
@@ -18,16 +18,18 @@ class Config:
     use_only_growing_lesions = True
 
     # with that the same lesions can be in the same training batch
-    training_dataset_samples_duplication_factor = 20 
+    training_dataset_samples_duplication_factor = 1
 
     dialation_iterations = 1
     background_samples_proportion = 1
 
+    max_t = 3650.0
+
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 2
-    background_samples = 300
+    epochs = 1
+    background_samples = 1000
     lr = 1e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.0001
@@ -39,18 +41,10 @@ class Config:
 
 
     """ Model parameters """
-    from utils.model_inr import LesionINR
-    model = LesionINR
-    model_params = {
-        "latent_dim" : 128,
-        "input_dim" : 4,
-        "hidden_dim" : 512,
-        "output_dim" : 1,
-        "omega_0" : 30.0,
-        "n_layers" : 8,
-        "time_freqs" : 6,
-        "max_t" : 3650.0,
-    }
+    from utils.model_dialation import Dilation_Model
+    model = Dilation_Model
+    model_params = {}
+    model_save_name = "lesion_dialation_model"
 
 
     """ Logging parameters """

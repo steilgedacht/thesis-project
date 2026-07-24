@@ -63,7 +63,7 @@ class SirenLayer(nn.Module):
 
 class LesionINR(nn.Module):
     def __init__(self, 
-                 num_patients, 
+                 trajectories, 
                  latent_dim=128, 
                  input_dim=4, 
                  hidden_dim=512, 
@@ -75,6 +75,7 @@ class LesionINR(nn.Module):
 
             ):
         super().__init__()
+        num_patients = len(trajectories)
         self.latent_vectors = nn.Embedding(num_patients, latent_dim)
         
         self.time_freqs = time_freqs

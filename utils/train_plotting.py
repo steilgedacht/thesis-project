@@ -197,10 +197,17 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, config, fi
     
     ani = FuncAnimation(fig, update, frames=len(heatmaps), interval=50)
 
-    plt.rcParams['animation.convert_path'] = 'convert'
-    writer = ImageMagickWriter(fps=10, extra_args=['-layers', 'Optimize'])
-    file_name = f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_{patient_idx.item()}_sample_{sample_idx}.gif"
-    ani.save(file_name, writer=writer, dpi=50)
+    # because in older versions of magick, the convert command is used instead of magick, we try both
+    try:
+        plt.rcParams['animation.convert_path'] = 'convert'
+        writer = ImageMagickWriter(fps=10, extra_args=['-layers', 'Optimize'])
+        file_name = f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_{patient_idx.item()}_sample_{sample_idx}.gif"
+        ani.save(file_name, writer=writer, dpi=50)
+    except:
+        plt.rcParams['animation.convert_path'] = 'magick'
+        writer = ImageMagickWriter(fps=10, extra_args=['-layers', 'Optimize'])
+        file_name = f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_{patient_idx.item()}_sample_{sample_idx}.gif"
+        ani.save(file_name, writer=writer, dpi=50)
 
     mlflow.log_artifact(file_name)
     
