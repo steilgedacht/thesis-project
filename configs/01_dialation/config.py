@@ -8,7 +8,7 @@ class Config:
 
 
     """ Dataloading parameters """
-    batchsize = 100
+    batchsize = 10
     num_workers = 7
     prefetch_factor = 2
     pin_memory = True
@@ -27,7 +27,7 @@ class Config:
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     epochs = 2
-    background_samples = 3000
+    background_samples = 300
     lr = 1e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.0001

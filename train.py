@@ -136,7 +136,8 @@ if __name__ == "__main__":
 
     argument_parser = argparse.ArgumentParser(description="Train a Lesion Trajectory model.")
     argument_parser.add_argument("--config", type=str, default="configs/00_default/config.py", help="Path to the configuration file.")
-    config = load_config(argument_parser.parse_args().config)
+    args = argument_parser.parse_args().config
+    config = load_config(args)
 
     mlflow.set_tracking_uri(config.mlflow_tracking_uri)
     mlflow.set_experiment(config.mlflow_experiment_name)
@@ -207,7 +208,7 @@ if __name__ == "__main__":
             "loss_function": type(config.loss_fn).__name__,
             **{key: getattr(config, key) for key in dir(config) if not key.startswith("_")}
         })
-        mlflow.log_artifact("config.py")
+        mlflow.log_artifact(args.config)
         mlflow.log_artifact("train.py")
 
         losses = train_inr(
