@@ -1,3 +1,5 @@
+import importlib.util
+from pathlib import Path
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -8,12 +10,15 @@ from tqdm import tqdm
 from utils.mri_dataloader import MRI_Dataloader
 from utils.dataloader import LesionDataset
 from utils.train_plotting import *
-from config import Config
+import argparse
 
-config = Config()
 
-mlflow.set_tracking_uri(config.mlflow_tracking_uri)
-mlflow.set_experiment(config.mlflow_experiment_name)
+def load_config(config_path: str):
+    config_file = Path(config_path)
+    spec = importlib.util.spec_from_file_location(config_file.stem, config_file)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    return config_module.Config()
 
 
 def validate_polation(data_loader, text, global_step, criterion):
@@ -118,7 +123,7 @@ def train_inr(
     
     mlflow.pytorch.log_model(
         model, 
-        name="lesion_inr_model", 
+        name=config.model_save_name, 
         serialization_format="pickle"
     )
         
@@ -127,82 +132,90 @@ def train_inr(
 
     return losses
 
+if __name__ == "__main__":
 
-with mlflow.start_run(run_name=config.mlflow_run_name):
-    mri_dataloader = MRI_Dataloader()
-    mri_dataloader.cache_lesion_trajectories_from_n_scans(
-        n_scans=config.lesion_trajectories_with_more_than_n_scans, 
-        only_growing=config.use_only_growing_lesions
-    )
-    if mri_dataloader.cache_lesion_trajectories is not None:
-        trajectories = mri_dataloader.cache_lesion_trajectories * config.training_dataset_samples_duplication_factor
-    
-    train_dataset = LesionDataset(
-        trajectories, 
-        dialation_iterations=config.dialation_iterations, 
-        device=config.device, 
-        mode='train', 
-        background_samples=config.background_samples
-    )
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config.batchsize, 
-        shuffle=True, 
-        num_workers=config.num_workers, 
-        prefetch_factor=config.prefetch_factor, 
-        pin_memory=config.pin_memory, 
-        persistent_workers=config.persistent_workers
-    )
-    
-    valid_interpolation_dataset = LesionDataset(
-        trajectories, 
-        dialation_iterations=config.dialation_iterations, 
-        device=config.device, 
-        mode='valid_interpolation', 
-        val_date_idx=train_dataset.val_date_idx, 
-        val_end_date_idx=train_dataset.val_end_date_idx, 
-        background_samples=config.background_samples
-    )
-    valid_interpolation_loader = DataLoader(
-        valid_interpolation_dataset, 
-        batch_size=config.batchsize, 
-        shuffle=False
-    )
+    argument_parser = argparse.ArgumentParser(description="Train a Lesion Trajectory model.")
+    argument_parser.add_argument("--config", type=str, default="configs/00_default/config.py", help="Path to the configuration file.")
+    config = load_config(argument_parser.parse_args().config)
 
-    valid_extrapolation_dataset = LesionDataset(
-        trajectories, 
-        dialation_iterations=config.dialation_iterations, 
-        device=config.device, 
-        mode='valid_extrapolation', 
-        val_date_idx=train_dataset.val_date_idx, 
-        val_end_date_idx=train_dataset.val_end_date_idx, 
-        background_samples=config.background_samples
-    )
-    valid_extrapolation_loader = DataLoader(
-        valid_extrapolation_dataset, 
-        batch_size=config.batchsize, 
-        shuffle=False
-    )
+    mlflow.set_tracking_uri(config.mlflow_tracking_uri)
+    mlflow.set_experiment(config.mlflow_experiment_name)
 
-    model = config.model(
-        num_patients=len(trajectories), 
-        **config.model_params
-    )
-    
-    mlflow.log_params({
-        "dataset_size": len(train_dataset),
-        "loss_function": type(config.loss_fn).__name__,
-        **{key: getattr(config, key) for key in dir(config) if not key.startswith("_")}
-    })
-    mlflow.log_artifact("config.py")
-    mlflow.log_artifact("train.py")
+    with mlflow.start_run(run_name=config.mlflow_run_name):
+        mri_dataloader = MRI_Dataloader()
+        mri_dataloader.cache_lesion_trajectories_from_n_scans(
+            n_scans=config.lesion_trajectories_with_more_than_n_scans, 
+            only_growing=config.use_only_growing_lesions
+        )
+        if mri_dataloader.cache_lesion_trajectories is not None:
+            trajectories = mri_dataloader.cache_lesion_trajectories * config.training_dataset_samples_duplication_factor
+        
+        train_dataset = LesionDataset(
+            trajectories, 
+            dialation_iterations=config.dialation_iterations, 
+            device=config.device, 
+            mode='train', 
+            background_samples=config.background_samples
+        )
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=config.batchsize, 
+            shuffle=True, 
+            num_workers=config.num_workers, 
+            prefetch_factor=config.prefetch_factor, 
+            pin_memory=config.pin_memory, 
+            persistent_workers=config.persistent_workers
+        )
+        
+        valid_interpolation_dataset = LesionDataset(
+            trajectories, 
+            dialation_iterations=config.dialation_iterations, 
+            device=config.device, 
+            mode='valid_interpolation', 
+            val_date_idx=train_dataset.val_date_idx, 
+            val_end_date_idx=train_dataset.val_end_date_idx, 
+            background_samples=config.background_samples
+        )
+        valid_interpolation_loader = DataLoader(
+            valid_interpolation_dataset, 
+            batch_size=config.batchsize, 
+            shuffle=False
+        )
 
-    losses = train_inr(
-        model, 
-        train_loader, 
-        valid_interpolation_loader, 
-        valid_extrapolation_loader, 
-        config
-    )
-    
-    mlflow.log_metric("final_train_loss", losses[-1])
+        valid_extrapolation_dataset = LesionDataset(
+            trajectories, 
+            dialation_iterations=config.dialation_iterations, 
+            device=config.device, 
+            mode='valid_extrapolation', 
+            val_date_idx=train_dataset.val_date_idx, 
+            val_end_date_idx=train_dataset.val_end_date_idx, 
+            background_samples=config.background_samples
+        )
+        valid_extrapolation_loader = DataLoader(
+            valid_extrapolation_dataset, 
+            batch_size=config.batchsize, 
+            shuffle=False
+        )
+
+        model = config.model(
+            num_patients=len(trajectories), 
+            **config.model_params
+        )
+        
+        mlflow.log_params({
+            "dataset_size": len(train_dataset),
+            "loss_function": type(config.loss_fn).__name__,
+            **{key: getattr(config, key) for key in dir(config) if not key.startswith("_")}
+        })
+        mlflow.log_artifact("config.py")
+        mlflow.log_artifact("train.py")
+
+        losses = train_inr(
+            model, 
+            train_loader, 
+            valid_interpolation_loader, 
+            valid_extrapolation_loader, 
+            config
+        )
+        
+        mlflow.log_metric("final_train_loss", losses[-1])
