@@ -3,7 +3,7 @@ from mlflow.tracking import MlflowClient
 from mlflow.entities import ViewType, Metric
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-import tempfile, os, time
+import tempfile, os
 
 SOURCE_URI = "http://127.0.0.1:5001"
 TARGET_URI = "sqlite:///mlflow.db"

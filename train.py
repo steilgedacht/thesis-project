@@ -4,10 +4,8 @@ from torch.utils.data import DataLoader
 import numpy as np
 import mlflow
 import mlflow.pytorch
-from mri_dataloader import MRI_Dataloader
 from tqdm import tqdm
-from utils.inr_model import LesionINR
-from utils.loss_bce_dice import Loss_BCE_Dice
+from utils.mri_dataloader import MRI_Dataloader
 from utils.dataloader import LesionDataset
 from utils.train_plotting import *
 from config import Config
@@ -44,7 +42,7 @@ def train_inr(
         T_max=config.epochs, 
         eta_min=config.scheduler_eta_min
     )
-    criterion = Loss_BCE_Dice()
+    criterion = config.loss_fn
 
     model.to(config.device)
     losses = []
@@ -115,6 +113,8 @@ def train_inr(
         
         if (epoch + 1) % config.print_loss_interval == 0:
             print(f"Epoch {epoch+1}/{config.epochs}, Loss: {avg_loss:.6f}")
+
+    # ==== Final Logging and Visualization ====
     
     mlflow.pytorch.log_model(
         model, 
@@ -184,20 +184,18 @@ with mlflow.start_run(run_name=config.mlflow_run_name):
         shuffle=False
     )
 
-    model = LesionINR(
+    model = config.model(
         num_patients=len(trajectories), 
-        latent_dim=config.latent_dim, 
-        input_dim=config.input_dim, 
-        hidden_dim=config.hidden_dim, 
-        output_dim=config.output_dim, 
-        n_layers=config.n_layers,
+        **config.model_params
     )
+    
     mlflow.log_params({
         "dataset_size": len(train_dataset),
+        "loss_function": type(config.loss_fn).__name__,
         **{key: getattr(config, key) for key in dir(config) if not key.startswith("_")}
     })
     mlflow.log_artifact("config.py")
-    mlflow.log_artifact("inr.py")
+    mlflow.log_artifact("train.py")
 
     losses = train_inr(
         model, 

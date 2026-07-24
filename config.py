@@ -34,16 +34,23 @@ class Config:
     max_grad_norm_clip = 1.0
     only_train = False
 
+    from utils.loss_bce_dice import Loss_BCE_Dice
+    loss_fn = Loss_BCE_Dice()
+
 
     """ Model parameters """
-    latent_dim = 128
-    input_dim = 4
-    hidden_dim = 512
-    output_dim = 1
-    omega_0 = 30.0
-    n_layers = 8
-    time_freqs = 6
-    max_t = 3650.0
+    from utils.model_inr import LesionINR
+    model = LesionINR
+    model_params = {
+        "latent_dim" : 128,
+        "input_dim" : 4,
+        "hidden_dim" : 512,
+        "output_dim" : 1,
+        "omega_0" : 30.0,
+        "n_layers" : 8,
+        "time_freqs" : 6,
+        "max_t" : 3650.0,
+    }
 
 
     """ Logging parameters """

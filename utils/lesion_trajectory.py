@@ -21,7 +21,7 @@ from IPython.display import HTML
 from scipy.signal import savgol_filter
 from datetime import datetime
 
-from paths import DatasetPaths, DEFAULT_DATA_PATH
+from .paths import DatasetPaths, DEFAULT_DATA_PATH
 
 
 class Lesion_Trajectory:

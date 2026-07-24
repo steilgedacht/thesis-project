@@ -23,7 +23,7 @@ from matplotlib.colors import ListedColormap
 import matplotlib.cm as cm
 from IPython.display import HTML
 
-from paths import DatasetPaths, DEFAULT_DATA_PATH
+from .paths import DatasetPaths
 
 
 class DataSample:
