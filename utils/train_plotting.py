@@ -38,7 +38,7 @@ def plot_predictions(v_preds, v_labels, v_coords, epoch, title=""):
 
 def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, config, time_point=None):
     # get the height where the lesion is located
-    center_of_mass = torch.mean(coords.squeeze()[:len(labels.squeeze())//2,:3], axis=0).detach().cpu().numpy()
+    center_of_mass = torch.mean(coords.squeeze()[:len(labels.squeeze())//2,:3], dim=0).detach().cpu().numpy()
     lesion_z = center_of_mass[2]
 
     if time_point is not None:
@@ -97,11 +97,12 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, config, fi
     heatmaps = []
     labels_list = []
     list_3d = []
+    lesion_sizes = []
     
     with torch.no_grad():
 
         # get the height where the lesion is located
-        center_of_mass = torch.mean(coords.squeeze()[:len(labels.squeeze())//2,:3], axis=0).detach().cpu().numpy()
+        center_of_mass = torch.mean(coords.squeeze()[:len(labels.squeeze())//2,:3], dim=0).detach().cpu().numpy()
         lesion_z = center_of_mass[2]
         
         meshgrid = np.meshgrid(np.linspace(0, 1, side_length), np.linspace(0, 1, side_length), indexing='ij')
@@ -109,8 +110,9 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, config, fi
         y = meshgrid[1].flatten() * 2 - 1
         z = np.full_like(x, lesion_z)
 
-        for t in np.linspace(0, int(config.max_t), config.time_evolution_steps):
+        time_points = np.linspace(0, full_matrix_labels[-1][1] + 365, config.time_evolution_steps)
 
+        for t in time_points:
             time_point = np.full_like(x, t) 
 
             hm_coords = np.stack([x, y, z, time_point], axis=1)
@@ -128,31 +130,51 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, config, fi
             heatmap_preds = heatmap_preds.reshape(side_length, side_length)
             heatmaps.append(heatmap_preds)
 
-
             for element in reversed(full_matrix_labels):
                 if element[1] <= t:
                     labels_list.append(element[0][:,:,int(((lesion_z + 1) / 2) * 50)])
                     list_3d.append(element[0])
+                    lesion_sizes.append(float(element[0].sum()))
                     break
 
     heatmaps = np.array(heatmaps)
     label_grid = np.array(labels_list)
     list_3d = np.array(list_3d)
+    lesion_sizes = np.array(lesion_sizes, dtype=float)
+    if lesion_sizes.size > 0:
+        lesion_sizes = lesion_sizes / max(lesion_sizes.max(), 1.0)
 
-    fig = plt.figure(figsize=(12, 12))
+    def build_topdown_height(volume):
+        height_map = np.full(volume.shape[:2], np.nan, dtype=float)
+        for x_idx in range(volume.shape[0]):
+            for y_idx in range(volume.shape[1]):
+                z_coords = np.where(volume[x_idx, y_idx, :] == 1)[0]
+                if z_coords.size > 0:
+                    height_map[x_idx, y_idx] = z_coords.max()
+        if np.isnan(height_map).all():
+            return np.zeros(volume.shape[:2], dtype=float)
+        return height_map
 
-    ax1 = fig.add_subplot(2, 2, 1)
+    topdown_maps = [build_topdown_height(volume) for volume in list_3d]
+    change_points = np.zeros(len(time_points), dtype=bool)
+    for idx in range(1, len(label_grid)):
+        change_points[idx] = not np.array_equal(label_grid[idx], label_grid[idx - 1])
+
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(2, 3, width_ratios=[1, 1, 1], height_ratios=[1, 1])
+
+    ax1 = fig.add_subplot(gs[0, 0])
     im = ax1.imshow(heatmaps[0], cmap='copper', vmin=0, vmax=1, animated=True)
     ax1.set_title(f"Predicted Lesion Heatmap {patient_idx.item()} frame 0/{len(heatmaps)}")
     ax1.axis('off')
     
-    ax2 = fig.add_subplot(2, 2, 2)
+    ax2 = fig.add_subplot(gs[0, 1])
     im_label = ax2.imshow(label_grid[0], cmap='copper', vmin=0, vmax=1)
     ax2.set_title("Ground Truth")
     ax2.axis('off')
 
-    ax3 = fig.add_subplot(2, 2, 3, projection='3d')
-    xs, ys, zs = np.where(list_3d[0]==1)
+    ax3 = fig.add_subplot(gs[1, 0], projection='3d')
+    xs, ys, zs = np.where(list_3d[0] == 1)
     scatter = ax3.scatter(xs, ys, zs=zs)
     ax3.set_title("Ground Truth in 3D space")
     ax3.set_xlim3d(0, config.full_size_side_length)
@@ -165,14 +187,34 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, config, fi
     Z_p = np.full_like(X_p, int(((lesion_z + 1) / 2) * 50)) 
     ax3.plot_surface(X_p, Y_p, Z_p, alpha=0.3, color='lightblue', antialiased=False, label="slice_of_heatmap")
 
-    ax4 = fig.add_subplot(2, 2, 4)
-    im_label_4 = ax4.imshow(heatmaps[0].repeat(config.full_size_side_length//side_length,axis=0).repeat(config.full_size_side_length//side_length,axis=1), cmap='copper', vmin=0, vmax=1, animated=True)
+    ax4 = fig.add_subplot(gs[1, 1])
+    im_label_4 = ax4.imshow(heatmaps[0].repeat(config.full_size_side_length // side_length, axis=0).repeat(config.full_size_side_length // side_length, axis=1), cmap='copper', vmin=0, vmax=1, animated=True)
     im_seg_4 = ax4.imshow(label_grid[0], cmap='Reds', vmin=0, vmax=1, alpha=0.5)
     ax4.set_title("Ground Truth")
     ax4.axis('off')
 
+    ax_timeline = fig.add_subplot(gs[0, 2])
+    ax_timeline.fill_between(time_points, 0, lesion_sizes, color='skyblue', alpha=0.25)
+    ax_timeline.plot(time_points, lesion_sizes, color='steelblue', lw=1.5)
+    ax_timeline.plot(time_points, np.full_like(time_points, 0.5), color='lightgray', lw=1)
+    ax_timeline.scatter(time_points[change_points], np.full(change_points.sum(), 0.5), marker='|', color='red', s=120)
+    progress_line, = ax_timeline.plot([time_points[0], time_points[0]], [0.25, 0.75], color='royalblue', lw=3)
+    current_marker, = ax_timeline.plot([time_points[0]], [0.5], marker='o', color='royalblue', markersize=8)
+    ax_timeline.set_xlim(time_points[0], time_points[-1])
+    ax_timeline.set_ylim(0, 1)
+    ax_timeline.set_yticks([])
+    ax_timeline.set_xlabel('Time')
+    ax_timeline.set_ylabel('Progress')
+    ax_timeline.set_title('Time Evolution Timeline')
+    ax_timeline.set_xticks(np.linspace(time_points[0], time_points[-1], 5))
 
-    fig.legend()
+    ax_topdown = fig.add_subplot(gs[1, 2])
+    topdown_max = max(1, list_3d[0].shape[2] - 1)
+    topdown_im = ax_topdown.imshow(topdown_maps[0], cmap='terrain', vmin=0, vmax=topdown_max)
+    ax_topdown.set_title('Top-down lesion height')
+    ax_topdown.axis('off')
+
+    fig.tight_layout()
 
     def update(i):
         if i == len(heatmaps) - 1:
@@ -180,20 +222,25 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, config, fi
             im_label.set_array(np.ones_like(label_grid[0]))
             im_label_4.set_array(np.ones_like(heatmaps[0]))
             im_seg_4.set_array(np.ones_like(label_grid[0]))
-            
             scatter._offsets3d = ([], [], [])
-            
             ax1.set_title("--- End of Sequence ---")
+            progress_line.set_data([time_points[0], time_points[-1]], [0.5, 0.5])
+            current_marker.set_data([time_points[-1]], [0.5])
+            topdown_im.set_array(topdown_maps[-1])
+            topdown_im.set_clim(0, topdown_max)
         else:
             im.set_array(heatmaps[i])
             im_label.set_array(label_grid[i])
-            im_label_4.set_array(heatmaps[i].repeat(config.full_size_side_length//side_length,axis=0).repeat(config.full_size_side_length//side_length,axis=1))
+            im_label_4.set_array(heatmaps[i].repeat(config.full_size_side_length // side_length, axis=0).repeat(config.full_size_side_length // side_length, axis=1))
             im_seg_4.set_array(label_grid[i])
-            xs, ys, zs = np.where(list_3d[i]==1)
+            xs, ys, zs = np.where(list_3d[i] == 1)
             scatter._offsets3d = (xs, ys, zs)
-
             ax1.set_title(f'Predicted Lesion Heatmap {patient_idx.item()} frame {i:03d}/{len(heatmaps)}')
-        return [im, im_label, im_label_4, im_seg_4, ax1.title]
+            progress_line.set_data([time_points[0], time_points[i]], [0.5, 0.5])
+            current_marker.set_data([time_points[i]], [0.5])
+            topdown_im.set_array(topdown_maps[i])
+            topdown_im.set_clim(0, topdown_max)
+        return [im, im_label, im_label_4, im_seg_4, scatter, progress_line, current_marker, topdown_im, ax1.title]
     
     ani = FuncAnimation(fig, update, frames=len(heatmaps), interval=50)
 

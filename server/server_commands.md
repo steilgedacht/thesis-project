@@ -9,7 +9,7 @@ ssh node
 
 Sync the local folder up
 ```bash
-rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='venv/' --exclude='data' --exclude='server/mlartifacts' --exclude='mlruns' --exclude='mlflow.db' . node:~/projects/thesis
+rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='venv/' --exclude='data' --exclude='server/mlartifacts' --exclude='mlruns' --exclude='mlflow.db' --exclude='.archive' . node:~/projects/thesis
 ```
 
 Get some memory
@@ -48,4 +48,11 @@ ssh -L 5000:localhost:5000 node
 
 ```bash
 mlflow server --host 0.0.0.0 --port 5124 --backend-store-uri ./mlruns --default-artifact-root ./artifacts --allowed-hosts "*" --disable-security-middleware
+```
+
+## Submitting a sbatch
+
+```bash
+cp projects/thesis/train.sbatch . && sbatch train.sbatch
+TERM=xterm-256color watch squeue -u $USER
 ```

@@ -75,7 +75,7 @@ class LesionINR(nn.Module):
 
             ):
         super().__init__()
-        num_patients = len(trajectories)
+        num_patients = len(trajectories) * 100 # otherwise we get a lot of collisions in the embedding space for different lesions of the same patient
         self.latent_vectors = nn.Embedding(num_patients, latent_dim)
         
         self.time_freqs = time_freqs

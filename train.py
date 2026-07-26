@@ -62,7 +62,7 @@ def train_inr(
         model.train()
         for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}/{config.epochs}"):
 
-            coords = coords.to(config.device)
+            coords = coords.to(config.device).requires_grad_(True)
             labels = labels.to(config.device).unsqueeze(-1)
             patient_idx = patient_idx.to(config.device)
             if coords.shape[1] == 0: continue
@@ -71,7 +71,7 @@ def train_inr(
 
             predictions = model(coords, patient_idx)
 
-            loss = criterion(predictions, labels)
+            loss = criterion(predictions, labels, coords=coords if config.use_total_variation_loss else None)
 
             if loss.requires_grad: # only used for baseline models with no parameters
                 loss.backward()
@@ -84,8 +84,7 @@ def train_inr(
                 mlflow.log_metrics(
                     {
                         "training_loss" : loss.item(),
-                        "training_loss_bce" : criterion.loss_bce.item(),
-                        "training_loss_dice" : criterion.loss_dice.item(),
+                        **criterion.loss_to_report,
                         "number_of_correctly_predicted_1_labels" : (predictions > 0.5).sum().item() / (labels > 0.5).sum().item() if (labels > 0.5).sum().item() != 0 else 0,
                         "number_of_correctly_predicted_0_labels" : (predictions <= 0.5).sum().item() / (labels <= 0.5).sum().item() if (labels <= 0.5).sum().item() != 0 else 0
                     },
@@ -134,12 +133,18 @@ def train_inr(
 
     return losses
 
+def add_downstream_configurations(config):
+    if not hasattr(config, "use_total_variation_loss"):
+        config.use_total_variation_loss = False
+    return config
+
 if __name__ == "__main__":
 
     argument_parser = argparse.ArgumentParser(description="Train a Lesion Trajectory model.")
     argument_parser.add_argument("--config", type=str, default="configs/00_default/config.py", help="Path to the configuration file.")
     args = argument_parser.parse_args()
     config = load_config(args.config)
+    config = add_downstream_configurations(config)
     print(f"Using configuration from: {args.config}")
 
     mlflow.set_tracking_uri(config.mlflow_tracking_uri)

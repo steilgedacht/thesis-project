@@ -99,7 +99,10 @@ class Lesion_Trajectory:
             absolute_day_number: Use absolute days or normalized time
             skip_empty: If True, skip frames with no voxels (helpful for trajectories with gaps)
         """
-        dates = [datetime.strptime(d, "%Y-%m-%d") for d in self.dates]
+        dates_allowed = self.allowed_dates if hasattr(self, 'allowed_dates') else self.dates
+
+
+        dates = [datetime.strptime(d, "%Y-%m-%d") for d in dates_allowed]
         first_date = dates[0]
         total_days = (dates[-1] - first_date).days if not absolute_day_number else 1
         days_since_first = [((d - first_date).days / total_days) for d in dates]
@@ -109,10 +112,10 @@ class Lesion_Trajectory:
         data = []
         skipped_count = 0
 
-        for i, date in enumerate(self.dates):
+        for i, date in enumerate(dates_allowed):
             if selected_date is not None:
                 date = selected_date
-                i = self.dates.index(selected_date)
+                i = dates_allowed.index(selected_date)
 
             path = os.path.join(*self.path.split(os.path.sep)[:-1] + [date] + ["trajectory.nii.gz"])
             if os.path.exists(path):
