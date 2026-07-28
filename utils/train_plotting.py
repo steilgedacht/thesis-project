@@ -201,10 +201,10 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, config, fi
     progress_line, = ax_timeline.plot([time_points[0], time_points[0]], [0.25, 0.75], color='royalblue', lw=3)
     current_marker, = ax_timeline.plot([time_points[0]], [0.5], marker='o', color='royalblue', markersize=8)
     ax_timeline.set_xlim(time_points[0], time_points[-1])
-    ax_timeline.set_ylim(0, 1)
-    ax_timeline.set_yticks([])
+    ax_timeline.set_ylim(-1, 2)
+    ax_timeline.set_yticks([0, 0.5, 1])
     ax_timeline.set_xlabel('Time')
-    ax_timeline.set_ylabel('Progress')
+    ax_timeline.set_ylabel('Lesion Size')
     ax_timeline.set_title('Time Evolution Timeline')
     ax_timeline.set_xticks(np.linspace(time_points[0], time_points[-1], 5))
 

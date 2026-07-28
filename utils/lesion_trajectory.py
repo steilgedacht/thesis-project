@@ -42,7 +42,7 @@ class Lesion_Trajectory:
             self.label_id = label_id
             self.dates = []
 
-            from patient import Patient  # lazy: genuine mutual dependency, see module docstring
+            from .patient import Patient  # lazy: genuine mutual dependency, see module docstring
             patient = Patient(patient_id)
             for i, sample in enumerate(patient.samples):
                 if i not in sample_ids:
@@ -77,7 +77,7 @@ class Lesion_Trajectory:
     def load_sizes(self):
         sizes = []
 
-        from patient import Patient  # lazy: see module docstring
+        from .patient import Patient  # lazy: see module docstring
         patient = Patient(self.patient_id)
         for i, date in enumerate(patient.dates):
             if date not in self.dates:
@@ -120,7 +120,7 @@ class Lesion_Trajectory:
             path = os.path.join(*self.path.split(os.path.sep)[:-1] + [date] + ["trajectory.nii.gz"])
             if os.path.exists(path):
                 data_segmentation = nib.load(path).get_fdata()
-                data_segmentation = np.where(data_segmentation == self.label_id, 1, 0).astype(np.uint8)
+                data_segmentation = np.where(np.isin(data_segmentation, [self.label_id]), 1, 0).astype(np.uint8)
 
                 voxel_count = np.count_nonzero(data_segmentation)
 
@@ -143,7 +143,7 @@ class Lesion_Trajectory:
         if selected_date is None and skipped_count > 0:
             print(f"Note: Skipped {skipped_count} empty frames from trajectory")
 
-        return data
+        return data, skipped_count
 
     def plot_trajectory_sizes(self):
         fig, ax = plt.subplots()
