@@ -11,6 +11,7 @@ from utils.mri_dataloader import MRI_Dataloader
 from utils.dataloader import LesionDataset
 from utils.train_plotting import *
 import argparse
+import json
 
 
 def load_config(config_path: str):
@@ -85,8 +86,7 @@ def train_inr(
                     {
                         "training_loss" : loss.item(),
                         **criterion.loss_to_report,
-                        "number_of_correctly_predicted_1_labels" : (predictions > 0.5).sum().item() / (labels > 0.5).sum().item() if (labels > 0.5).sum().item() != 0 else 0,
-                        "number_of_correctly_predicted_0_labels" : (predictions <= 0.5).sum().item() / (labels <= 0.5).sum().item() if (labels <= 0.5).sum().item() != 0 else 0
+                        "wrongly_predicted_total_volume" : (predictions > 0.5).sum().item() - (labels > 0.5).sum().item(),
                     },
                     step=global_step
                 )
@@ -133,9 +133,12 @@ def train_inr(
 
     return losses
 
-def add_downstream_configurations(config):
-    if not hasattr(config, "use_total_variation_loss"):
-        config.use_total_variation_loss = False
+def add_base_configurations(config):
+    with open("configs/base_config.json", "r") as f:
+        base_config = json.load(f)
+    for key, value in base_config.items():
+        if not hasattr(config, key):
+            setattr(config, key, value)
     return config
 
 if __name__ == "__main__":
@@ -144,7 +147,7 @@ if __name__ == "__main__":
     argument_parser.add_argument("--config", type=str, default="configs/00_default/config.py", help="Path to the configuration file.")
     args = argument_parser.parse_args()
     config = load_config(args.config)
-    config = add_downstream_configurations(config)
+    config = add_base_configurations(config)
     print(f"Using configuration from: {args.config}")
 
     mlflow.set_tracking_uri(config.mlflow_tracking_uri)

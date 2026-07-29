@@ -1,7 +1,11 @@
-import glob
 import tqdm as tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from mri_dataloader import Patient, MRI_Dataloader
+import sys
+sys.path.insert(1, '.')
+
+from utils.mri_dataloader import MRI_Dataloader
+from utils.patient import Patient
+
 
 def process_and_save(input_path):
     patient = Patient(input_path)

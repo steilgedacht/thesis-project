@@ -1,10 +1,14 @@
-from mri_dataloader import *
 import os
 import tqdm as tqdm
+import sys
+sys.path.insert(1, '.')
+
+from utils.mri_dataloader import MRI_Dataloader
+import concurrent.futures
+
 
 dataloader = MRI_Dataloader()
 
-import concurrent.futures
 
 def _process_sample(sample):
     sample.zoom()
