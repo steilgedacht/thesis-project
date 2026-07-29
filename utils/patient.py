@@ -22,7 +22,6 @@ module split:
 import glob
 import json
 import itertools
-import os
 
 import numpy as np
 import pandas as pd

@@ -18,7 +18,6 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.ticker import FuncFormatter
 from IPython.display import HTML
-from scipy.signal import savgol_filter
 from datetime import datetime
 
 from .paths import DatasetPaths, DEFAULT_DATA_PATH
@@ -172,88 +171,123 @@ class Lesion_Trajectory:
         plt.close()
         return HTML(ani.to_jshtml())
 
-    def extract_growth_phase(self, sizes, smoothing_window=5, min_start_idx=1):
+    def extract_growth_phase(self, sizes=None, tolerance=0.15, max_skip=6, log_scale=False):
         """
-        Extract the main growth phase of a lesion trajectory, ignoring early peaks.
+        Extract the main growth phase of a lesion trajectory using a walker-based
+        approach: for every candidate starting index, spawn a backward walker
+        (checks the lesion got smaller going into the past) and a forward walker
+        (checks the lesion got bigger going into the future). Each walker tolerates
+        up to `tolerance` fractional violation of the trend, and if it gets stuck,
+        tries skipping ahead up to `max_skip` scans to find a continuation.
+
+        The longest resulting trajectory (by number of accepted sample indices,
+        across all starting points) is returned.
 
         Args:
-            sizes: array of lesion sizes (can be log-scale)
-            smoothing_window: window size for Savitzky-Golay filter
-            min_start_idx: minimum index to consider as peak (avoids very early spikes)
+            sizes: array of lesion sizes (linear scale by default; see log_scale)
+            tolerance: fractional tolerance (e.g. 0.15 = 15%) for a step to still
+                count as "still growing" / "still shrinking"
+            max_skip: max number of scans a walker may skip over when stuck,
+                before trying to look further, to find a valid continuation
+            log_scale: if True, sizes are assumed to already be log-transformed,
+                and the tolerance is applied additively as log(1 + tolerance)
+                instead of multiplicatively
 
         Returns:
             start_idx, end_idx, plot_data
         """
-        sizes_array = np.array(sizes)
+        if sizes is None:
+            sizes = self.sizes
+
+        sizes_array = np.array(sizes, dtype=float)
         n = len(sizes_array)
 
-        if n > smoothing_window:
-            smoothed = savgol_filter(sizes_array, smoothing_window, 2)
+        if n == 0:
+            return 0, 0, {'segments': [], 'best_segment': None}
+
+        if log_scale:
+            tol_up = np.log1p(tolerance)     # additive tolerance in log-space
+            tol_down = np.log1p(tolerance)
         else:
-            smoothed = sizes_array
+            tol_up = tolerance
+            tol_down = tolerance
 
-        derivative = np.gradient(smoothed)
-
-        valid_range_start = min(min_start_idx, n - 2)
-        peak_idx = valid_range_start + np.argmax(smoothed[valid_range_start:])
-
-        threshold = np.std(derivative) * 0.5
-
-        growth_start_candidates = np.where(derivative[:peak_idx] > threshold)[0]
-        if len(growth_start_candidates) > 0:
-            start_idx = growth_start_candidates[0]
-        else:
-            start_idx = max(0, peak_idx - 3)
-
-        growth_end_candidates = np.where(derivative[peak_idx:] < -threshold)[0]
-        if len(growth_end_candidates) > 0:
-            end_idx = peak_idx + growth_end_candidates[0]
-        else:
-            end_idx = min(n - 1, peak_idx + 1)
-
-        start_idx = max(0, min(start_idx, n - 1))
-        search_start_left = max(0, start_idx - 5)
-        search_start_right = min(n - 1, start_idx + 5)
-
-        best_start = start_idx
-        best_start_value = sizes_array[start_idx]
-
-        for idx in range(search_start_left, search_start_right + 1):
-            if sizes_array[idx] < best_start_value:
-                best_start = idx
-                best_start_value = sizes_array[idx]
-
-        start_idx = best_start
-
-        end_idx = max(0, min(end_idx, n - 1))
-        search_end_left = max(0, end_idx - 5)
-        search_end_right = min(n - 1, end_idx + 5)
-
-        best_end = end_idx
-        best_end_value = sizes_array[end_idx]
-
-        for idx in range(search_end_left, search_end_right + 1):
-            if sizes_array[idx] > best_end_value:
-                best_end = idx
-                best_end_value = sizes_array[idx]
-
-        end_idx = best_end
-
-        if start_idx >= end_idx:
-            start_idx = max(0, end_idx - 1)
-
-        for idx in range(start_idx - 1, max(-1, start_idx - 10), -1):
-            if idx >= 0 and idx < end_idx:
-                if sizes_array[idx] <= sizes_array[start_idx] + np.log(1.05):
-                    start_idx = idx
+        def is_valid_step(extreme_value, candidate_value, direction):
+            if direction == -1:
+                # backward walker: candidate should be within tolerance of the lowest point seen so far
+                if log_scale:
+                    return candidate_value <= extreme_value + tol_down
                 else:
+                    return candidate_value <= extreme_value * (1 + tol_down)
+            else:
+                # forward walker: candidate should be within tolerance of the highest point seen so far
+                if log_scale:
+                    return candidate_value >= extreme_value - tol_up
+                else:
+                    return candidate_value >= extreme_value * (1 - tol_up)
+
+        def walk(start_idx, direction):
+            """Walks in one direction from start_idx, returning the list of
+            accepted indices (including start_idx), in the order visited.
+
+            Tolerance is measured against the running extremum encountered so far
+            along the walk (minimum for the backward walker, maximum for the
+            forward walker) rather than against the immediately preceding point.
+            """
+            trajectory = [start_idx]
+            idx = start_idx
+            extreme_value = sizes_array[start_idx]  # running min (direction=-1) or max (direction=+1)
+
+            while True:
+                found_continuation = False
+                for skip in range(0, max_skip + 1):
+                    candidate_idx = idx + direction * (1 + skip)
+                    if candidate_idx < 0 or candidate_idx >= n:
+                        break
+                    candidate_value = sizes_array[candidate_idx]
+                    if is_valid_step(extreme_value, candidate_value, direction):
+                        idx = candidate_idx
+                        trajectory.append(candidate_idx)
+                        found_continuation = True
+                        # update the running extremum
+                        if direction == -1:
+                            extreme_value = min(extreme_value, candidate_value)
+                        else:
+                            extreme_value = max(extreme_value, candidate_value)
+                        break
+                if not found_continuation:
                     break
 
-        for idx in range(end_idx + 1, min(n, end_idx + 10)):
-            if idx > start_idx:
-                if sizes_array[idx] >= sizes_array[end_idx] + np.log(0.95):
-                    end_idx = idx
-                else:
-                    break
+            return trajectory
 
-        return start_idx, end_idx, {'smoothed': smoothed, 'derivative': derivative, 'peak': peak_idx}
+        all_segments = []
+        for start in range(n):
+            back_traj = walk(start, direction=-1)
+            fwd_traj = walk(start, direction=+1)
+
+            full_indices = sorted(set(back_traj) | set(fwd_traj))
+            all_segments.append({
+                'origin': start,
+                'indices': full_indices,
+                'length': len(full_indices),
+            })
+
+        best_segment = max(all_segments, key=lambda s: s['length'])
+        start_idx = min(best_segment['indices'])
+        end_idx = max(best_segment['indices'])
+
+        return start_idx, end_idx, best_segment['indices']
+
+    def plot_growth_phase(self):
+        data = self.extract_growth_phase(log_scale=True, tolerance=0.15)
+        plt.figure(figsize=(12, 6))
+        plt.plot(self.sizes, label='Original Sizes')
+        plt.axvline(data[0], color='g', linestyle='--', label='Growth Start')
+        plt.axvline(data[1], color='r', linestyle='--', label='Growth End')
+        plt.scatter(data[2], self.sizes[data[2]], label='Final_samples')
+        plt.legend()
+        plt.title(f'Lesion Size Trajectory with Growth Phase of {self.patient_id} Lesion {self.label_id}')
+        plt.xlabel('Scan Index')
+        plt.ylabel('Lesion Size (log-scale)')
+        plt.tight_layout()
+        plt.show()

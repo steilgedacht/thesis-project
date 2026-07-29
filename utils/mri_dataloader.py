@@ -79,9 +79,9 @@ class MRI_Dataloader:
         for trj in self.iterate_trajectories():
             sizes = len(trj.dates)
             if only_growing:
-                start_idx, end_idx, _ = trj.extract_growth_phase(trj.sizes)
-                sizes = end_idx - start_idx
-                trj.allowed_dates = trj.dates[start_idx:end_idx + 1]
+                _, _, sample_ids = trj.extract_growth_phase(trj.sizes)
+                sizes = len(sample_ids)
+                trj.allowed_dates = [trj.dates[i] for i in sample_ids]
 
             if sizes < n_scans:
                 continue
