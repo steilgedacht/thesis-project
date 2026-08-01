@@ -14,7 +14,7 @@ class Config:
     pin_memory = True
     persistent_workers = True
 
-    lesion_trajectories_with_more_than_n_scans = 6
+    lesion_trajectories_with_more_than_n_scans = 2
     use_only_growing_lesions = True
 
     # with that the same lesions can be in the same training batch
@@ -63,7 +63,7 @@ class Config:
     train_log_interval = 10
     train_delete_cache_interval = 10
     n_monitoring_samples_to_visualize = 5
-    validation_interval = 20
+    validation_interval = 2
     print_loss_interval = 10
     
     time_evolution_steps = 100

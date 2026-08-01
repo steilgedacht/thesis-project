@@ -56,3 +56,9 @@ mlflow server --host 0.0.0.0 --port 5124 --backend-store-uri ./mlruns --default-
 cp projects/thesis/train.sbatch . && sbatch train.sbatch
 TERM=xterm-256color watch squeue -u $USER
 ```
+
+## When the predictions and labels where renewed:
+
+```sh
+rsync -avP ./data/entire_yale_dataset/predictions/ node:~/projects/entire_yale_dataset/predictions
+```

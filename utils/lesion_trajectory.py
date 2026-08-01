@@ -142,7 +142,7 @@ class Lesion_Trajectory:
         if selected_date is None and skipped_count > 0:
             print(f"Note: Skipped {skipped_count} empty frames from trajectory")
 
-        return data, skipped_count
+        return data
 
     def plot_trajectory_sizes(self):
         fig, ax = plt.subplots()
@@ -171,7 +171,7 @@ class Lesion_Trajectory:
         plt.close()
         return HTML(ani.to_jshtml())
 
-    def extract_growth_phase(self, sizes=None, tolerance=0.15, max_skip=6, log_scale=False):
+    def extract_growth_phase(self, sizes=None, tolerance=0.15, max_skip=6, log_scale=True):
         """
         Extract the main growth phase of a lesion trajectory using a walker-based
         approach: for every candidate starting index, spawn a backward walker

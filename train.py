@@ -11,8 +11,18 @@ from utils.mri_dataloader import MRI_Dataloader
 from utils.dataloader import LesionDataset
 from utils.train_plotting import *
 import argparse
+import requests
 import json
 
+def check_if_mlflow_is_running(config):
+    try:
+        requests.get(f"{config.mlflow_tracking_uri}/version")
+    except Exception as e:
+        import shutil
+        import time
+        shutil.os.system("tmux new-session -d -s mlflow_server 'mlflow server'")
+        print("Starting Mlflow in a new tmux session...")
+        time.sleep(5)
 
 def load_config(config_path: str):
     config_file = Path(config_path)
@@ -129,6 +139,7 @@ def train_inr(
     )
         
     for sample in monitoring_samples:
+        if config.epochs < 1: break
         plot_lesion_time_evolution(model, epoch, sample, train_loader, config, final_side_length=True)
 
     return losses
@@ -143,6 +154,7 @@ def add_base_configurations(config):
 
 if __name__ == "__main__":
 
+
     argument_parser = argparse.ArgumentParser(description="Train a Lesion Trajectory model.")
     argument_parser.add_argument("--config", type=str, default="configs/00_default/config.py", help="Path to the configuration file.")
     args = argument_parser.parse_args()
@@ -150,6 +162,7 @@ if __name__ == "__main__":
     config = add_base_configurations(config)
     print(f"Using configuration from: {args.config}")
 
+    check_if_mlflow_is_running(config)
     mlflow.set_tracking_uri(config.mlflow_tracking_uri)
     mlflow.set_experiment(config.mlflow_experiment_name)
 

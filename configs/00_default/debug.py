@@ -26,7 +26,7 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 0
+    epochs = 2
     background_samples = 300
     lr = 1e-4
     weight_decay = 1e-6
@@ -59,7 +59,7 @@ class Config:
     train_log_interval = 10
     train_delete_cache_interval = 10
     n_monitoring_samples_to_visualize = 5
-    validation_interval = 20
+    validation_interval = 1
     print_loss_interval = 10
     
     time_evolution_steps = 100

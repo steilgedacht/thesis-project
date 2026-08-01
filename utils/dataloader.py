@@ -24,7 +24,10 @@ class LesionDataset(Dataset):
         self.max_samples = background_samples
 
         if val_date_idx is None:
-            self.val_date_idx = [np.random.choice(trj.dates[1:-1]) for trj in trajectories]
+            self.val_date_idx = [
+                np.random.choice(trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates[1:-1]) 
+                for trj in trajectories
+            ]
         else:
             self.val_date_idx = val_date_idx
 
@@ -52,7 +55,7 @@ class LesionDataset(Dataset):
             random_time_point = str(np.random.choice(dates_list))
         else:
             if self.mode == 'valid_extrapolation':
-                random_time_point = str(trj.dates[-1])
+                random_time_point = str(trj.allowed_dates[-1] if hasattr(trj, 'allowed_dates') else trj.dates[-1])
             else: # self.mode == 'valid_interpolation':
                 random_time_point = str(self.val_date_idx[idx])
 
