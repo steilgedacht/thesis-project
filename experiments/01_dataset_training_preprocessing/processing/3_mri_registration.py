@@ -4,19 +4,21 @@ import sys
 sys.path.insert(1, '.')
 
 from utils.mri_dataloader import MRI_Dataloader
+from utils.patient import Patient
 import concurrent.futures
 
 
-dataloader = MRI_Dataloader()
+data_loader = MRI_Dataloader()
 
 
-def _process_sample(sample):
-    sample.zoom()
-    return True
+def register(patient_id):
+    patient = Patient(patient_id)
+    patient.register_all_to_first()
+    return patient_id
 
-max_workers = min(8, (os.cpu_count() or 1))
+max_workers = 4
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-    futures = {executor.submit(_process_sample, sample): sample for sample in dataloader}
+    futures = {executor.submit(register, patient): patient for patient in data_loader.patient_ids}
     for fut in tqdm.tqdm(concurrent.futures.as_completed(futures), total=len(data_loader)):
         print(fut.result())

@@ -19,11 +19,18 @@ module split:
    module level.
 """
 
+import io
+import ants
 import glob
 import json
-import itertools
-
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+from pathlib import Path
+import imageio.v2 as imageio
+from PIL import Image as PILImage
+from IPython.display import Image, display
+import matplotlib.pyplot as plt
 import pandas as pd
 import nibabel as nib
 from scipy import ndimage
@@ -31,7 +38,6 @@ from scipy.optimize import linear_sum_assignment
 from skimage.measure import find_contours, marching_cubes
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.colors import qualitative
 
 from .registrator import Registrator
 
@@ -54,27 +60,29 @@ class Patient:
         self.load_registered_transforms()
         self.patient_trajectory_paths = glob.glob(self.dataloader.paths.lesion_trajectory_glob(patient_id))
 
-    def register_all_to_first(self, registrator: Registrator = None):
+    def register_all_to_first(self):
         """Register all images to the first image using linear translation only."""
-        registrator = registrator or Registrator()
-        reference_image = self.samples[0].load_mri()
+        fixed_image = ants.image_read(self.samples[0].original_sample_path)
 
-        self.samples[0].registered_transform = np.array([0, 0, 0, 0, 0, 0, 1.0, 1.0, 1.0])
-        self.samples[0].save_registered_images()
+        for sample in self.samples:
+            moving_image = ants.image_read(sample.original_sample_path)
+            moving_label = ants.image_read(sample.lesion_segmentation_path)
 
-        registered_transforms = []
+            registration = ants.registration(
+                fixed=fixed_image, 
+                moving=moving_image, 
+                type_of_transform='Rigid'
+            )
 
-        for sample in self.samples[1:]:
-            moving_image = sample.load_mri()
+            registered_mask = ants.apply_transforms(
+                fixed=fixed_image,
+                moving=moving_label,
+                transformlist=registration["fwdtransforms"],
+                interpolator="nearestNeighbor"  # Keeps mask strictly binary (0 or 1)
+            )
 
-            transformation = registrator.register(reference_image, moving_image)
-            sample.registered_transform = transformation
-            sample.save_registered_images()
-
-            registered_transforms.append(transformation)
-            print(f"Registered {sample.date} to {self.samples[0].date} with transformation:\n{transformation}")
-
-        return registered_transforms
+            ants.image_write(registration['warpedmovout'], sample.zoomed_pre_post_path)
+            ants.image_write(registered_mask['warpedmovout'], sample.zoomed_segmentation_path)
 
     def plot_3d_lesion_position(self, log_size=True):
         from sklearn.cluster import KMeans
@@ -91,7 +99,7 @@ class Patient:
                 "lesion_coords": mri.lesion_coords,
             }
 
-            for n in range(mri.lesion_coords.shape[0]):
+            for n in range(len(mri.lesion_coords)):
                 D_point.append(mri.lesion_coords[n])
                 D_sizes.append(np.log(mri.lesion_sizes[n]))
                 D_time.append(i)
@@ -140,40 +148,36 @@ class Patient:
         for x, y, z in contours_3d:
             fig.add_trace(go.Scatter3d(x=x, y=y, z=z, mode="lines", line=dict(width=2, color=col), opacity=0.6))
 
-    def plot_image_registration(self, registered_parameters=None, registrator: Registrator = None):
-        registered_parameters = registered_parameters or []
-        registrator = registrator or Registrator()
+    def plot_image_registration(self):
+        out_path = Path(f"/tmp/registration_animation_{self.patient_id}.gif")
+        frames = []
 
-        colors = (qualitative.Dark24)
-        color_cycle = itertools.cycle(colors)
+        for sample in self.samples:
+            img = ants.image_read(sample.zoomed_pre_post_path)
+            arr = img.numpy()
 
-        fig = go.Figure()
+            if arr.ndim != 3:
+                raise ValueError(f"Expected a 3D image, got shape {arr.shape}")
 
-        for i, sample in enumerate(self.samples):
-            col = next(color_cycle)
+            z_slice = arr[:, :, arr.shape[2] // 2]
 
-            if hasattr(sample, "registered_transform") and sample.registered_transform is not None:
-                rp = sample.registered_transform
-            elif registered_parameters:
-                rp = registered_parameters[i]
-            else:
-                rp = np.array([0, 0, 0, 0, 0, 0, 1.0, 1.0, 1.0])
-                print(f"Sample {i} has no registered transform. Using no transformation.")
+            fig, ax = plt.subplots(figsize=(4, 4))
+            ax.imshow(z_slice, cmap="gray")
+            ax.set_title(f"Registered Image for {sample.patient_id}")
+            ax.axis("off")
+            fig.subplots_adjust(0, 0, 1, 1)
 
-            points_transformed = registrator.rigid_transform(
-                sample.load_mri(),
-                rp,
-                self.samples[0].load_mri().shape
-            )
+            fig.canvas.draw()
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=100)
+            buf.seek(0)
 
-            self.contur_plot(fig, points_transformed, col)
+            frame = np.array(PILImage.open(buf).convert("RGB"))
+            frames.append(frame)
+            plt.close(fig)
 
-        fig.update_layout(
-            height=800,
-            width=900
-        )
-
-        fig.show()
+        imageio.mimsave(out_path, frames, fps=2, loop=0)
+        display(Image(filename=str(out_path)))
 
     def plot_registered_3d_lesion_position(self, registered_parameters=None, log_size=True, relative_size=False):
         """
