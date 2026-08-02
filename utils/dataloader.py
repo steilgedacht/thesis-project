@@ -20,6 +20,7 @@ class LesionDataset(Dataset):
                               indexing='ij')
         self.dialation_iterations = dialation_iterations
         self.patient_to_idx = {p.patient_id: i for i, p in enumerate(trajectories)}
+        self.idx_to_patient = {i: p.patient_id for i, p in enumerate(trajectories)}
         self.mode = mode
         self.max_samples = background_samples
 

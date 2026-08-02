@@ -158,7 +158,7 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, config, fi
     topdown_maps = [build_topdown_height(volume) for volume in list_3d]
     change_points = np.zeros(len(time_points), dtype=bool)
     for idx in range(1, len(label_grid)):
-        change_points[idx] = not np.array_equal(label_grid[idx], label_grid[idx - 1])
+        change_points[idx] = not np.array_equal(lesion_sizes[idx], lesion_sizes[idx - 1])
 
     fig = plt.figure(figsize=(18, 12))
     gs = fig.add_gridspec(2, 3, width_ratios=[1, 1, 1], height_ratios=[1, 1])
