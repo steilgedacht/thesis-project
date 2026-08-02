@@ -10,11 +10,13 @@ import glob
 import os
 import json
 
+import cv2
 import numpy as np
 import pandas as pd
 import nibabel as nib
 from scipy import ndimage
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, label, binary_fill_holes
+from scipy.spatial.distance import cdist
 from skimage.morphology import convex_hull_image
 from skimage.measure import find_contours
 import matplotlib.pyplot as plt
@@ -162,25 +164,136 @@ class DataSample:
         glob_path = self.paths.other_timepoint_glob(self.patient_id, date)
         return DataSample(glob.glob(glob_path, recursive=True)[0])
 
+
+    def _fillup_lesion_segmentation(
+            self,
+            slice_2d: np.ndarray, 
+            max_cluster_dist: int = 30,
+            max_kernel: int = 25,
+            solidity_thresh: float = 0.8
+        ) -> np.ndarray:
+        """
+        Groups nearby arcs into lesion clusters, then applies morphological closing 
+        with increasing kernel sizes until the filled shape achieves a Solidity 
+        (Filled Area / Convex Hull Area) >= solidity_thresh.
+
+        Parameters
+        ----------
+        slice_2d : np.ndarray
+            Single 2D image slice of shape (H, W).
+        max_cluster_dist : int, optional
+            Arcs closer than this distance are grouped into the same lesion cluster. Default is 30.
+        max_kernel : int, optional
+            Maximum morphological kernel size to attempt. Default is 25.
+        solidity_thresh : float, optional
+            Target ratio of (Filled Area / Convex Hull Area). Default is 0.75.
+
+        Returns
+        -------
+        solid_slice : np.ndarray (bool)
+            Solid 2D mask of shape (H, W).
+        """
+        binary_slice = (slice_2d > 0).astype(np.uint8)
+        solid_slice = np.zeros_like(binary_slice, dtype=bool)
+
+        if not np.any(binary_slice):
+            return solid_slice
+
+        # 1. Label all individual arcs/components
+        labeled, num_features = label(binary_slice)
+        if num_features == 0:
+            return solid_slice
+
+        # 2. Extract pixel coordinates per component
+        comp_coords = [np.argwhere(labeled == i) for i in range(1, num_features + 1)]
+
+        # 3. Build adjacency matrix for proximity clustering
+        adj_matrix = np.zeros((num_features, num_features), dtype=bool)
+        for i in range(num_features):
+            adj_matrix[i, i] = True
+            for j in range(i + 1, num_features):
+                min_d = np.min(cdist(comp_coords[i], comp_coords[j]))
+                if min_d <= max_cluster_dist:
+                    adj_matrix[i, j] = True
+                    adj_matrix[j, i] = True
+
+        # 4. Group adjacent arcs into Lesion Clusters
+        visited = np.zeros(num_features, dtype=bool)
+        clusters = []
+        for i in range(num_features):
+            if not visited[i]:
+                cluster = []
+                queue = [i]
+                visited[i] = True
+                while queue:
+                    curr = queue.pop(0)
+                    cluster.append(curr + 1)
+                    neighbors = np.where(adj_matrix[curr] & ~visited)[0]
+                    for n in neighbors:
+                        visited[n] = True
+                        queue.append(n)
+                clusters.append(cluster)
+
+        # 5. Process each cluster using Convex Hull Ratio (Solidity)
+        for cluster in clusters:
+            cluster_mask = np.isin(labeled, cluster).astype(np.uint8)
+
+            # Find boundary points to compute the 2D Convex Hull Area
+            contours, _ = cv2.findContours(cluster_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+                
+            all_pts = np.vstack(contours)
+            hull = cv2.convexHull(all_pts)
+            hull_area = cv2.contourArea(hull)
+
+            # Fallback if hull area is invalid (e.g. single point or thin line)
+            if hull_area <= 0:
+                solid_slice = np.logical_or(solid_slice, binary_fill_holes(cluster_mask > 0))
+                continue
+
+            filled_cluster = None
+
+            # Dynamically test kernel sizes until Solidity >= solidity_thresh (0.75)
+            for k_size in range(3, max_kernel + 1, 2):
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+                closed = cv2.morphologyEx(cluster_mask, cv2.MORPH_CLOSE, kernel)
+                filled = binary_fill_holes(closed > 0)
+                
+                filled_area = np.sum(filled)
+                solidity = filled_area / hull_area
+
+                # If filled area covers at least 75% of the convex hull, stop!
+                if solidity >= solidity_thresh:
+                    filled_cluster = filled
+                    break
+
+            # Fallback if max_kernel is reached without hitting 0.75: use highest kernel attempt
+            if filled_cluster is None:
+                filled_cluster = filled if 'filled' in locals() else binary_fill_holes(cluster_mask > 0)
+
+            solid_slice = np.logical_or(solid_slice, filled_cluster)
+
+        return solid_slice
+
     def process_sample(self):
         mri_image, affine = self.load_mri(affine=True)
         nnUNet_prediction = self.load_nnUNet_prediction()
 
-        # we introduce bleeding, to connect nearby lesions, that might be fragmented
-        nnUNet_prediction_dilated = ndimage.binary_dilation(nnUNet_prediction, iterations=4)
+        for z in range(nnUNet_prediction.shape[2]):
+            nnUNet_prediction[:, :, z] = self._fillup_lesion_segmentation(
+                nnUNet_prediction[:, :, z], 
+                max_cluster_dist=nnUNet_prediction.shape[0] // 6, 
+                max_kernel=nnUNet_prediction.shape[0] // 6, 
+                solidity_thresh=0.85
+            )
         # now we label connected lesions
-        labeled_array, num_features = ndimage.label(nnUNet_prediction_dilated)
-        # we want to have the original lesion size again so we multiply with the original seg
-        labeled_array = nnUNet_prediction * labeled_array
+        labeled_array, num_features = ndimage.label(nnUNet_prediction)
 
-        # now we want to fill out holes in each lesion, we do that with a convex hull
-        for i in range(num_features):
-            lesion = labeled_array == (i + 1)
-            convex_hull = convex_hull_image(lesion)
-            labeled_array[convex_hull] = i + 1
-
-        # we calculate the sizes of each lesion
-        lesion_sizes = ndimage.sum(nnUNet_prediction, labeled_array, range(1, num_features + 1))
+        # we calculate the sizes of each lesion and the real volumen in mm³
+        spacing = np.linalg.norm(affine[:3, :3], axis=0)
+        lesion_sizes = ndimage.sum_labels(nnUNet_prediction, labeled_array, range(1, num_features + 1))
+        volume_mm3 = lesion_sizes * np.prod(spacing)
 
         # we save the position of the lesions in euclidean rotation coordinates
         lesion_positions = ndimage.center_of_mass(nnUNet_prediction, labeled_array, range(1, num_features + 1))
@@ -198,6 +311,7 @@ class DataSample:
         metadata = {
             "num_features": num_features,
             "lesion_sizes": lesion_sizes.tolist(),
+            "volume_mm3": volume_mm3.tolist(),
             "relative_lesion_sizes": (lesion_sizes / total_area).tolist(),
             "lesion_positions": lesion_positions
         }
