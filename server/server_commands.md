@@ -62,3 +62,12 @@ TERM=xterm-256color watch squeue -u $USER
 ```sh
 rsync -avP ./data/entire_yale_dataset/predictions/ node:~/projects/entire_yale_dataset/predictions
 ```
+
+## Getting the data back from the server
+
+```sh
+vpn-med
+ssh node
+sh start_mlflow.sh
+sh sync_server.sh
+```
