@@ -81,7 +81,6 @@ class MRI_Dataloader:
             if only_growing:
                 _, _, sample_ids = trj.extract_growth_phase(trj.sizes)
                 sizes = len(sample_ids)
-                trj.allowed_dates = [trj.dates[i] for i in sample_ids]
 
             if sizes < n_scans:
                 continue

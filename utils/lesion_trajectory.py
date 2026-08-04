@@ -50,6 +50,7 @@ class Lesion_Trajectory:
                 self.dates.append(sample.date)
             self.n_scans = len(sample_ids)
             self.sizes = sizes
+            self.extract_growth_phase()
 
     def save_lesion_trajectory(self):
         export = {
@@ -70,6 +71,7 @@ class Lesion_Trajectory:
             self.dates = data["dates"].tolist()
             self.n_scans = data["n_scans"].item()
             self.sizes = data["sizes"]
+            self.extract_growth_phase()
         else:
             print(f"Lesion trajectory file not found at {self.path}. Cannot load trajectory.")
 
@@ -275,6 +277,8 @@ class Lesion_Trajectory:
         best_segment = max(all_segments, key=lambda s: s['length'])
         start_idx = min(best_segment['indices'])
         end_idx = max(best_segment['indices'])
+
+        self.allowed_dates = [self.dates[i] for i in best_segment['indices']]
 
         return start_idx, end_idx, best_segment['indices']
 
