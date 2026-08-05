@@ -27,7 +27,7 @@ class Config:
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     epochs = 2
-    background_samples = 300
+    background_samples = 100
     lr = 1e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.0001

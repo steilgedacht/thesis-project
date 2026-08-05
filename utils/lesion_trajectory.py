@@ -91,7 +91,7 @@ class Lesion_Trajectory:
         self.sizes = sizes
         return sizes
 
-    def load_labels_for_inr(self, selected_date=None, absolute_day_number=False, skip_empty=True):
+    def load_labels_for_inr(self, selected_date=None, absolute_day_number=False, affine=False):
         """
         Load trajectory labels for each date.
 
@@ -111,7 +111,6 @@ class Lesion_Trajectory:
             days_since_first = [d * 2 - 1 for d in days_since_first]
 
         data = []
-        skipped_count = 0
 
         for i, date in enumerate(dates_allowed):
             if selected_date is not None:
@@ -119,31 +118,27 @@ class Lesion_Trajectory:
                 i = dates_allowed.index(selected_date)
 
             path = os.path.join(*self.path.split(os.path.sep)[:-1] + [date] + ["trajectory.nii.gz"])
-            if os.path.exists(path):
-                data_segmentation = nib.load(path).get_fdata()
-                data_segmentation = np.where(np.isin(data_segmentation, [self.label_id]), 1, 0).astype(np.uint8)
 
-                voxel_count = np.count_nonzero(data_segmentation)
-
-                if skip_empty and voxel_count == 0:
-                    skipped_count += 1
-                    if selected_date is None:
-                        continue
-                    data.append((data_segmentation, days_since_first[i]))
-                    if selected_date is not None:
-                        return data[0]
-                else:
-                    data.append((data_segmentation, days_since_first[i]))
-                    if selected_date is not None:
-                        return data[0]
-            else:
-                if selected_date is not None:
-                    print(f"Path not found: {path}")
+            if not os.path.exists(path) and selected_date is not None:
+                print(f"Path not found: {path}")
                 continue
 
-        if selected_date is None and skipped_count > 0:
-            print(f"Note: Skipped {skipped_count} empty frames from trajectory")
+            if affine and i == 0:
+                img = nib.load(path)
+                affine_mat = img.affine
 
+            data_segmentation = nib.load(path).get_fdata()
+            data_segmentation = np.where(np.isin(data_segmentation, [self.label_id]), 1, 0).astype(np.uint8)
+
+            data.append((data_segmentation, days_since_first[i]))
+
+            if selected_date is not None:
+                if affine:
+                    return data[0], affine_mat
+                return data[0]
+
+        if affine:
+            return data, affine_mat
         return data
 
     def plot_trajectory_sizes(self):

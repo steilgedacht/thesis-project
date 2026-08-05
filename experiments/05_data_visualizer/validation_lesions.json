@@ -1,0 +1,122 @@
+[
+  {
+    "idx": "1",
+    "Patient": "YG_NRSFSRTTONBY",
+    "Lesion": "3",
+    "n_scans": "24"
+  },
+  {
+    "idx": "2",
+    "Patient": "YG_NRSFSRTTONBY",
+    "Lesion": "1",
+    "n_scans": "11"
+  },
+  {
+    "idx": "3",
+    "Patient": "YG_DFS01ZHF1G5R",
+    "Lesion": "2",
+    "n_scans": "11"
+  },
+  {
+    "idx": "4",
+    "Patient": "YG_DDHY5HW3GJIP",
+    "Lesion": "2",
+    "n_scans": "11"
+  },
+  {
+    "idx": "5",
+    "Patient": "YG_UEM7VTVQNC1M",
+    "Lesion": "3",
+    "n_scans": "10"
+  },
+  {
+    "idx": "6",
+    "Patient": "YG_R4Z3IXHG01L2",
+    "Lesion": "1",
+    "n_scans": "10"
+  },
+  {
+    "idx": "7",
+    "Patient": "YG_Q1FS2D6EVG3E",
+    "Lesion": "8",
+    "n_scans": "10"
+  },
+  {
+    "idx": "8",
+    "Patient": "YG_MTO9K0JU7M07",
+    "Lesion": "11",
+    "n_scans": "10"
+  },
+  {
+    "idx": "9",
+    "Patient": "YG_04YGLO8ATWRL",
+    "Lesion": "2",
+    "n_scans": "7"
+  },
+  {
+    "idx": "10",
+    "Patient": "YG_3I6CQJCTAUAS",
+    "Lesion": "1",
+    "n_scans": "7"
+  },
+  {
+    "idx": "11",
+    "Patient": "YG_85UM3OTXRUXH",
+    "Lesion": "3",
+    "n_scans": "7"
+  },
+  {
+    "idx": "12",
+    "Patient": "YG_8HW12P6TPDBB",
+    "Lesion": "2",
+    "n_scans": "7"
+  },
+  {
+    "idx": "13",
+    "Patient": "YG_85UM3OTXRUXH",
+    "Lesion": "4",
+    "n_scans": "8"
+  },
+  {
+    "idx": "14",
+    "Patient": "YG_H19ZB9NMLHLJ",
+    "Lesion": "2",
+    "n_scans": "8"
+  },
+  {
+    "idx": "15",
+    "Patient": "YG_BSZ8HDFDH8G9",
+    "Lesion": "3",
+    "n_scans": "6"
+  },
+  {
+    "idx": "16",
+    "Patient": "YG_B3IQ5SB5YX54",
+    "Lesion": "1",
+    "n_scans": "6"
+  },
+  {
+    "idx": "17",
+    "Patient": "YG_DDHY5HW3GJIP",
+    "Lesion": "5",
+    "n_scans": "6"
+  },
+  {
+    "idx": "18",
+    "Patient": "YG_K5SXG4URBIX0",
+    "Lesion": "1",
+    "n_scans": "6"
+  },
+  {
+    "idx": "19",
+    "Patient": "YG_8HW12P6TPDBB",
+    "Lesion": "2",
+    "n_scans": "7"
+  },
+  {
+    "idx": "20",
+    "Patient": "YG_0Y74OO0HCJZA",
+    "Lesion": "1",
+    "n_scans": "9"
+  }
+]
