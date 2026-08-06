@@ -20,7 +20,6 @@ module split:
 """
 
 import io
-import ants
 import glob
 import json
 import numpy as np
@@ -61,6 +60,8 @@ class Patient:
 
     def register_all_to_first(self):
         """Register all images to the first image using linear translation only."""
+        import ants
+
         fixed_image = ants.image_read(self.samples[0].original_sample_path)
 
         for sample in self.samples:
@@ -148,6 +149,8 @@ class Patient:
             fig.add_trace(go.Scatter3d(x=x, y=y, z=z, mode="lines", line=dict(width=2, color=col), opacity=0.6))
 
     def plot_image_registration(self):
+        import ants
+
         out_path = Path(f"/tmp/registration_animation_{self.patient_id}.gif")
         frames = []
 

@@ -20,7 +20,7 @@ Samples for a Validation set:
 | [16](#16) | YG_B3IQ5SB5YX54 |  1 |  6 |
 | [17](#17) | YG_DDHY5HW3GJIP |  5 |  6 |
 | [18](#18) | YG_K5SXG4URBIX0 |  1 |  6 |
-| [19](#19) | YG_8HW12P6TPDBB |  2 |  7 |
+| [19](#19) | YG_69FMUN9PHHKE |  2 |  7 |
 | [20](#20) | YG_0Y74OO0HCJZA |  1 |  9 |
 
 ## 1
@@ -115,8 +115,8 @@ lesion_heatmap_06_lesions_patient_YG_K5SXG4URBIX0_1.gif
 
 
 ## 19
-lesion_heatmap_07_lesions_patient_YG_8HW12P6TPDBB_2.gif  
-<img src="/home/benjaminb/Dokumente/JKU/Semester_9/Practical_Work/mlruns/4/dac8683a06264c6bad22911935479d78/artifacts/lesion_heatmap_07_lesions_patient_YG_8HW12P6TPDBB_2.gif">
+lesion_heatmap_07_lesions_patient_YG_69FMUN9PHHKE_2.gif  
+<img src="/home/benjaminb/Dokumente/JKU/Semester_9/Practical_Work/mlruns/4/dac8683a06264c6bad22911935479d78/artifacts/lesion_heatmap_07_lesions_patient_YG_69FMUN9PHHKE_2.gif">
 
 
 ## 20

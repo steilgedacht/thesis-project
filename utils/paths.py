@@ -70,3 +70,10 @@ class DatasetPaths:
 
     def other_timepoint_glob(self, patient_id: str, date: str) -> str:
         return os.path.join(self.data_path, patient_id, date, "**_POST.nii.gz")
+
+    # ---- dataloader samples ------------------------------------------------
+    def patient_to_idx(self):
+        return "experiments/05_data_visualizer/patient_to_idx.json"
+
+    def validation_samples(self):
+        return "experiments/05_data_visualizer/validation_lesions.json"

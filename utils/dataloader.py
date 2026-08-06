@@ -1,5 +1,7 @@
-from torch.utils.data import Dataset
+import json
 import numpy as np
+from .paths import DatasetPaths
+from torch.utils.data import Dataset
 from scipy.ndimage import binary_dilation
 
 class LesionDataset(Dataset):
@@ -7,57 +9,45 @@ class LesionDataset(Dataset):
                  trajectories, 
                  device='cuda', 
                  dialation_iterations=5, 
-                 mode='train', 
-                 val_date_idx=None, 
-                 val_end_date_idx=None, 
                  background_samples=3000):
+
         self.device = device
         self.trajectories = trajectories
 
+        with open(DatasetPaths().patient_to_idx(), "r") as f:
+            self.patient_to_idx = json.load(f)
+
+        with open(DatasetPaths().validation_samples(), "r") as f:
+            self.validation_samples = json.load(f)
+            self.validation_patients = [sample["Patient"] + "_" + sample["Lesion"]  for sample in self.validation_samples]
+
         self.dialation_iterations = dialation_iterations
-        self.patient_to_idx = {p.patient_id: i for i, p in enumerate(trajectories)}
-        self.idx_to_patient = {i: p.patient_id for i, p in enumerate(trajectories)}
-        self.mode = mode
         self.max_samples = background_samples
         self.proportion_dialation_background = 5
         self.proportion_pos_neg_samples = 2
 
-        if val_date_idx is None:
-            self.val_date_idx = [
-                np.random.choice(trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates[1:-1]) 
-                for trj in trajectories
-            ]
-        else:
-            self.val_date_idx = val_date_idx
-
-        if val_end_date_idx is None:
-            self.val_end_date_idx = np.random.choice(range(len(trajectories)), size=len(trajectories) // 10, replace=False)
-        else:
-            self.val_end_date_idx = val_end_date_idx
-        
-        if self.mode == 'valid_extrapolation':
-            self.trajectories = [trj for i, trj in enumerate(trajectories) if i in self.val_end_date_idx]
 
     def __len__(self):
         return len(self.trajectories)
     
     def __getitem__(self, idx):
         trj = self.trajectories[idx]
-        patient_id = self.patient_to_idx[trj.patient_id]
+        embedding_idx = np.int64((self.patient_to_idx[trj.patient_id] * 100) + trj.label_id)
+            
+        dates_list = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
 
-        if self.mode == 'train':
-            dates_list = trj.dates
-            if idx in self.val_end_date_idx:
-                dates_list = trj.dates[:-1]
-            if hasattr(trj, 'allowed_dates'):
-                dates_list = trj.allowed_dates
-            random_time_point = str(np.random.choice(dates_list))
-        else:
-            if self.mode == 'valid_extrapolation':
-                random_time_point = str(trj.allowed_dates[-1] if hasattr(trj, 'allowed_dates') else trj.dates[-1])
-            else: # self.mode == 'valid_interpolation':
-                random_time_point = str(self.val_date_idx[idx])
+        if f"{trj.patient_id}_{trj.label_id}" in self.validation_patients:
+            dates_list = dates_list[:-1]
+            half_of_the_list = len(dates_list) // 2
+            del dates_list[half_of_the_list]
 
+        random_time_point = str(np.random.choice(dates_list))
+
+        coords, labels_sampled = self.prepare_data(random_time_point, trj)
+
+        return coords, labels_sampled, embedding_idx
+
+    def prepare_data(self, random_time_point, trj):
         (labels, time_point), affine = trj.load_labels_for_inr(selected_date=random_time_point, absolute_day_number=True, affine=True)
         
         pos_coords = np.argwhere(labels)
@@ -103,5 +93,46 @@ class LesionDataset(Dataset):
 
         labels_sampled = labels[i, j, k]
 
-        return coords.astype(np.float32), labels_sampled.astype(np.float32), np.int64((patient_id * 100) + self.trajectories[idx].label_id)
+        return coords.astype(np.float32), labels_sampled.astype(np.float32)
+
+
+class Validation_Extrapolation_LesionDataset(LesionDataset):
+    def __init__(self, 
+                 trajectories, 
+                 device='cuda', 
+                 dialation_iterations=5, 
+                 background_samples=3000):
+        super().__init__(trajectories, device=device, dialation_iterations=dialation_iterations, background_samples=background_samples)
+        self.trajectories = [trj for trj in self.trajectories if f"{trj.patient_id}_{trj.label_id}" in self.validation_patients]
+
+    def __getitem__(self, idx):
+        trj = self.trajectories[idx]
+        embedding_idx = np.int64((self.patient_to_idx[trj.patient_id] * 100) + trj.label_id)
+
+        dates_list = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
+        extrapolation_timestep = dates_list[-1]
+
+        coords, labels_sampled = self.prepare_data(extrapolation_timestep, trj)
+        return coords, labels_sampled, embedding_idx
+
+class Validation_Interpolation_LesionDataset(LesionDataset):
+    def __init__(self, 
+                 trajectories, 
+                 device='cuda', 
+                 dialation_iterations=5, 
+                 background_samples=3000):
+        super().__init__(trajectories, device=device, dialation_iterations=dialation_iterations, background_samples=background_samples)
+        self.trajectories = [trj for trj in self.trajectories if f"{trj.patient_id}_{trj.label_id}" in self.validation_patients]
+
+    def __getitem__(self, idx):
+        trj = self.trajectories[idx]
+        embedding_idx = np.int64((self.patient_to_idx[trj.patient_id] * 100) + trj.label_id)
+
+        dates_list = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
+
+        half_of_the_list = len(dates_list[-1]) // 2
+        interpolation_timestep = dates_list[half_of_the_list]
+        coords, labels_sampled = self.prepare_data(interpolation_timestep, trj)
+        return coords, labels_sampled, embedding_idx
+
 

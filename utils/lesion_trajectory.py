@@ -112,6 +112,11 @@ class Lesion_Trajectory:
 
         data = []
 
+        if affine:
+            img = nib.load(os.path.join(*self.path.split(os.path.sep)[:-1] + [self.dates[0]] + ["trajectory.nii.gz"]))
+            affine_mat = img.affine
+
+
         for i, date in enumerate(dates_allowed):
             if selected_date is not None:
                 date = selected_date
@@ -122,10 +127,6 @@ class Lesion_Trajectory:
             if not os.path.exists(path) and selected_date is not None:
                 print(f"Path not found: {path}")
                 continue
-
-            if affine and i == 0:
-                img = nib.load(path)
-                affine_mat = img.affine
 
             data_segmentation = nib.load(path).get_fdata()
             data_segmentation = np.where(np.isin(data_segmentation, [self.label_id]), 1, 0).astype(np.uint8)

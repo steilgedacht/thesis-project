@@ -4,11 +4,11 @@ class Config:
     """ Tracking parameters """
     mlflow_tracking_uri = "http://127.0.0.1:5000"
     mlflow_experiment_name = "Lesion_INR_Training"
-    mlflow_run_name = "Debug_TV_Regularization_INR" 
+    mlflow_run_name = "TV_Regularization_INR" 
 
 
     """ Dataloading parameters """
-    batchsize = 200
+    batchsize = 10
     num_workers = 7
     prefetch_factor = 2
     pin_memory = True
@@ -27,7 +27,7 @@ class Config:
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     epochs = 200
-    background_samples = 1500
+    background_samples = 15
     lr = 1e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.0001

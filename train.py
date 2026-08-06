@@ -8,7 +8,7 @@ import mlflow
 import mlflow.pytorch
 from tqdm import tqdm
 from utils.mri_dataloader import MRI_Dataloader
-from utils.dataloader import LesionDataset
+from utils.dataloader import LesionDataset, Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset
 from utils.train_plotting import *
 import argparse
 import requests
@@ -172,14 +172,15 @@ if __name__ == "__main__":
             n_scans=config.lesion_trajectories_with_more_than_n_scans, 
             only_growing=config.use_only_growing_lesions
         )
-        if mri_dataloader.cache_lesion_trajectories is not None:
-            trajectories = mri_dataloader.cache_lesion_trajectories * config.training_dataset_samples_duplication_factor
+
+        assert mri_dataloader.cache_lesion_trajectories is not None, "No Lesions cached"
+            
+        trajectories = mri_dataloader.cache_lesion_trajectories * config.training_dataset_samples_duplication_factor
         
         train_dataset = LesionDataset(
             trajectories, 
             dialation_iterations=config.dialation_iterations, 
             device=config.device, 
-            mode='train', 
             background_samples=config.background_samples
         )
         train_loader = DataLoader(
@@ -192,33 +193,25 @@ if __name__ == "__main__":
             persistent_workers=config.persistent_workers
         )
         
-        valid_interpolation_dataset = LesionDataset(
-            trajectories, 
+        valid_interpolation_dataset = Validation_Interpolation_LesionDataset(
+            mri_dataloader.cache_lesion_trajectories, 
             dialation_iterations=config.dialation_iterations, 
             device=config.device, 
-            mode='valid_interpolation', 
-            val_date_idx=train_dataset.val_date_idx, 
-            val_end_date_idx=train_dataset.val_end_date_idx, 
             background_samples=config.background_samples
         )
         valid_interpolation_loader = DataLoader(
             valid_interpolation_dataset, 
-            batch_size=config.batchsize, 
             shuffle=False
         )
 
-        valid_extrapolation_dataset = LesionDataset(
-            trajectories, 
+        valid_extrapolation_dataset = Validation_Extrapolation_LesionDataset(
+            mri_dataloader.cache_lesion_trajectories, 
             dialation_iterations=config.dialation_iterations, 
             device=config.device, 
-            mode='valid_extrapolation', 
-            val_date_idx=train_dataset.val_date_idx, 
-            val_end_date_idx=train_dataset.val_end_date_idx, 
             background_samples=config.background_samples
         )
         valid_extrapolation_loader = DataLoader(
             valid_extrapolation_dataset, 
-            batch_size=config.batchsize, 
             shuffle=False
         )
 
