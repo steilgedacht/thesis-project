@@ -1,0 +1,38 @@
+[
+  {
+    "idx": "1",
+    "Patient": "YG_NRSFSRTTONBY",
+    "Lesion": "3",
+    "n_scans": "24"
+  },
+  {
+    "idx": "2",
+    "Patient": "YG_NRSFSRTTONBY",
+    "Lesion": "1",
+    "n_scans": "11"
+  },
+  {
+    "idx": "3",
+    "Patient": "YG_DFS01ZHF1G5R",
+    "Lesion": "2",
+    "n_scans": "11"
+  },
+  {
+    "idx": "4",
+    "Patient": "YG_2Y6EF2NHHNMC",
+    "Lesion": "2",
+    "n_scans": "6"
+  },
+  {
+    "idx": "5",
+    "Patient": "YG_ZT0QDSINY8YF",
+    "Lesion": "1",
+    "n_scans": "5"
+  },
+  {
+    "idx": "6",
+    "Patient": "YG_Q9ZG0HF6NHH8",
+    "Lesion": "1",
+    "n_scans": "7"
+  }
+]

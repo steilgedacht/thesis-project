@@ -4,7 +4,7 @@ class Config:
     """ Tracking parameters """
     mlflow_tracking_uri = "http://127.0.0.1:5000"
     mlflow_experiment_name = "Lesion_INR_Training"
-    mlflow_run_name = "Debug_TV_Regularization_INR" 
+    mlflow_run_name = "TV_Regularization_INR" 
 
 
     """ Dataloading parameters """
@@ -14,7 +14,7 @@ class Config:
     pin_memory = True
     persistent_workers = True
 
-    lesion_trajectories_with_more_than_n_scans = 6
+    lesion_trajectories_with_more_than_n_scans = 4
     use_only_growing_lesions = True
 
     # with that the same lesions can be in the same training batch
@@ -26,8 +26,8 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 200
-    background_samples = 1500
+    epochs = 251
+    background_samples = 3000
     lr = 1e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.0001
@@ -67,6 +67,6 @@ class Config:
     print_loss_interval = 10
     
     time_evolution_steps = 100
-    time_evolution_side_length = 50
+    time_evolution_side_length = 100
 
     full_size_side_length = 500

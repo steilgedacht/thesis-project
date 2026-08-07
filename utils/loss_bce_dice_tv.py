@@ -82,3 +82,7 @@ class Loss_BCE_Dice_TV:
         tv_time = torch.abs(grad_time).mean()
 
         return tv_space, tv_time
+
+    def dice_score(self, pred, target, smooth=1e-6):
+        with torch.no_grad():
+            return 1 - self.dice_loss(pred, target, smooth)

@@ -8,7 +8,7 @@ import mlflow
 import mlflow.pytorch
 from tqdm import tqdm
 from utils.mri_dataloader import MRI_Dataloader
-from utils.dataloader import LesionDataset, Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset
+from utils.dataloader import LesionDataset, Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset, Plotting_LesionDataset
 from utils.train_plotting import *
 import argparse
 import requests
@@ -38,14 +38,18 @@ def validate_polation(data_loader, text, global_step, criterion):
         v_coords, v_labels, v_p_idx = v_coords.to(config.device), v_labels.unsqueeze(-1).to(config.device), v_p_idx.to(config.device)
         v_preds = model(v_coords, v_p_idx)
         loss += criterion.dice_loss(v_preds, v_labels).item()
-    mlflow.log_metric(text.lower().replace(" ", "_"), loss / len(data_loader), step=global_step)
+    mlflow.log_metrics({
+        text.lower().replace(" ", "_") + "_dice_loss"  : loss / len(data_loader),
+        text.lower().replace(" ", "_") + "_dice_score" : 1 - loss / len(data_loader)
+    }, step=global_step)
 
 
 def train_inr(
         model, 
         train_loader, 
         valid_interpolation_loader, 
-        valid_extrapolation_loader, 
+        valid_extrapolation_loader,
+        plotting_LesionDataset, 
         config,
     ):
     optimizer = optim.AdamW(
@@ -64,7 +68,6 @@ def train_inr(
     losses = []
     
     global_step = 0
-    monitoring_samples = np.random.choice(len(train_loader), size=config.n_monitoring_samples_to_visualize, replace=False)
 
     for epoch in range(1, config.epochs + 1):
         total_loss = 0
@@ -114,12 +117,12 @@ def train_inr(
 
         if epoch % config.validation_interval == 0:
             with torch.no_grad():
-                visualize_samples(model, epoch, monitoring_samples, train_loader, "train", config)
-                visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid", config)
+                # visualize_samples(model, epoch, monitoring_samples, train_loader, "train", config)
+                # visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid", config)
                 validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
                 validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
-                for sample in monitoring_samples:
-                    plot_lesion_time_evolution(model, epoch, sample, train_loader, config)
+                for trj in plotting_LesionDataset:
+                    plot_lesion_time_evolution(model, epoch, trj, config)
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
         scheduler.step()
@@ -137,10 +140,11 @@ def train_inr(
         name=config.model_save_name, 
         serialization_format="pickle"
     )
-        
-    for sample in monitoring_samples:
-        if config.epochs < 1: break
-        plot_lesion_time_evolution(model, epoch, sample, train_loader, config, final_side_length=True)
+
+    with torch.no_grad():
+        for trj in plotting_LesionDataset:
+            if config.epochs < 1: break
+            plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=True)
 
     return losses
 
@@ -153,8 +157,6 @@ def add_base_configurations(config):
     return config
 
 if __name__ == "__main__":
-
-
     argument_parser = argparse.ArgumentParser(description="Train a Lesion Trajectory model.")
     argument_parser.add_argument("--config", type=str, default="configs/00_default/config.py", help="Path to the configuration file.")
     args = argument_parser.parse_args()
@@ -215,6 +217,10 @@ if __name__ == "__main__":
             shuffle=False
         )
 
+        plotting_LesionDataset = Plotting_LesionDataset(
+            mri_dataloader.cache_lesion_trajectories.copy(), 
+        )
+
         model = config.model(
             trajectories=trajectories, 
             **config.model_params
@@ -233,6 +239,7 @@ if __name__ == "__main__":
             train_loader, 
             valid_interpolation_loader, 
             valid_extrapolation_loader, 
+            plotting_LesionDataset,
             config
         )
         

@@ -32,7 +32,6 @@ class LesionDataset(Dataset):
     
     def __getitem__(self, idx):
         trj = self.trajectories[idx]
-        embedding_idx = np.int64((self.patient_to_idx[trj.patient_id] * 100) + trj.label_id)
             
         dates_list = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
 
@@ -45,7 +44,10 @@ class LesionDataset(Dataset):
 
         coords, labels_sampled = self.prepare_data(random_time_point, trj)
 
-        return coords, labels_sampled, embedding_idx
+        return coords, labels_sampled, self.get_embedding_id(trj)
+
+    def get_embedding_id(self, trj):
+        return np.int64((self.patient_to_idx[trj.patient_id] * 100) + trj.label_id)
 
     def prepare_data(self, random_time_point, trj):
         (labels, time_point), affine = trj.load_labels_for_inr(selected_date=random_time_point, absolute_day_number=True, affine=True)
@@ -107,13 +109,12 @@ class Validation_Extrapolation_LesionDataset(LesionDataset):
 
     def __getitem__(self, idx):
         trj = self.trajectories[idx]
-        embedding_idx = np.int64((self.patient_to_idx[trj.patient_id] * 100) + trj.label_id)
 
         dates_list = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
         extrapolation_timestep = dates_list[-1]
 
         coords, labels_sampled = self.prepare_data(extrapolation_timestep, trj)
-        return coords, labels_sampled, embedding_idx
+        return coords, labels_sampled, self.get_embedding_id(trj)
 
 class Validation_Interpolation_LesionDataset(LesionDataset):
     def __init__(self, 
@@ -126,13 +127,35 @@ class Validation_Interpolation_LesionDataset(LesionDataset):
 
     def __getitem__(self, idx):
         trj = self.trajectories[idx]
-        embedding_idx = np.int64((self.patient_to_idx[trj.patient_id] * 100) + trj.label_id)
 
         dates_list = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
 
         half_of_the_list = len(dates_list[-1]) // 2
         interpolation_timestep = dates_list[half_of_the_list]
         coords, labels_sampled = self.prepare_data(interpolation_timestep, trj)
-        return coords, labels_sampled, embedding_idx
+        return coords, labels_sampled, self.get_embedding_id(trj)
 
+
+class Plotting_LesionDataset(LesionDataset):
+    def __init__(self, 
+                 trajectories, 
+                 device='cuda', 
+                 dialation_iterations=5, 
+                 background_samples=3000):
+        super().__init__(trajectories, device=device, dialation_iterations=dialation_iterations, background_samples=background_samples)
+        with open(DatasetPaths().plotting_samples(), "r") as f:
+            self.plotting_samples = [sample["Patient"] + "_" + sample["Lesion"]  for sample in json.load(f)]
+
+        self.trajectories = [trj for trj in self.trajectories if f"{trj.patient_id}_{trj.label_id}" in self.plotting_samples]
+
+    def __getitem__(self, idx):
+        trj = self.trajectories[idx]
+
+        dates_list = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
+
+        coords, labels = self.prepare_data(dates_list[0], trj)
+        trj.embedding_id = self.get_embedding_id(trj)
+        trj.coords = coords
+        trj.labels = labels
+        return self.trajectories[idx]
 

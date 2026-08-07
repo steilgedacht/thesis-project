@@ -26,3 +26,7 @@ class Loss_BCE_Dice():
         pred = torch.sigmoid(pred)
         intersection = (pred * target).sum()
         return 1 - ((2. * intersection + smooth) / (pred.sum() + target.sum() + smooth))
+
+    def dice_score(self, pred, target, smooth=1e-6):
+        with torch.no_grad():
+            return 1 - self.dice_loss(pred, target, smooth)
