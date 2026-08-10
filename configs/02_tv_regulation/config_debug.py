@@ -26,7 +26,7 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 2
+    epochs = 1
     background_samples = 15
     lr = 1e-4
     weight_decay = 1e-6
@@ -57,6 +57,8 @@ class Config:
         "max_t" : 3650.0,
     }
     model_save_name = "lesion_inr_model"
+    load_model = True
+    load_model_path = f"runs:/ff017ddb6b924e56bc7973bbca3a5c72/{model_save_name}"
 
 
     """ Logging parameters """

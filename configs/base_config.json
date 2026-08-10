@@ -1,3 +1,4 @@
 {
-    "use_total_variation_loss": false
+    "use_total_variation_loss": false,
+    "load_model" : false
 }

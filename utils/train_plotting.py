@@ -6,35 +6,30 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, ImageMagickWriter
 from scipy import ndimage
+from .patient import Patient
+from dataclasses import dataclass
+from typing import List, Tuple
 
 
 def _get_voxel_spacing(affine):
-    """Physical voxel spacing (mm) per axis from a 4x4 NIfTI-style affine."""
-    if affine is None:
-        return np.array([1.0, 1.0, 1.0])
-    affine = np.asarray(affine, dtype=float)
-    if affine.shape == (4, 4):
-        return np.abs(np.diag(affine)[:3])
-    if affine.shape == (3, 3):
-        return np.abs(np.diag(affine)[:3])
-    return np.array([1.0, 1.0, 1.0])
-
+    """Physical voxel spacing (mm) per axis, from a 4x4 NIfTI-style affine."""
+    return np.abs(np.diag(affine)[:3])
 
 def _resize_2d(img, target_shape, order=0):
     """Resize a 2D array to an exact target shape (order=0 keeps masks binary)."""
     if img.shape == tuple(target_shape):
-        return img.astype(float, copy=False)
+        return img
     zoom_factors = (target_shape[0] / img.shape[0], target_shape[1] / img.shape[1])
     return ndimage.zoom(img, zoom_factors, order=order)
-
 
 def _nice_scale_length_mm(pixel_extent_mm):
     """Pick a round physical length for a scale bar, roughly 1/4 of the visible width."""
     target = pixel_extent_mm / 4
     magnitude = 10 ** np.floor(np.log10(target))
     for mult in (1, 2, 2.5, 5, 10):
-        if target / magnitude <= mult:
-            return mult * magnitude
+        candidate = mult * magnitude
+        if candidate >= target:
+            return candidate
     return 10 * magnitude
 
 def plot_predictions(v_preds, v_labels, v_coords, epoch, title=""):
@@ -116,224 +111,470 @@ def visualize_samples(model, epoch, monitoring_samples, data_loader, text, confi
         plot_predictions(predictions, labels, coords, epoch, f"{text}_patient_{patient_idx.item()}_sample_{sample_idx}")
 
 
-def plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=False):
-    side_length = config.time_evolution_side_length if not final_side_length else config.full_size_side_length
-    patient_idx = torch.tensor(trj.embedding_id).unsqueeze(0).to(config.device)
 
-    full_matrix_labels = trj.load_labels_for_inr(absolute_day_number=True)
-    if not full_matrix_labels:
-        return
-
-    label_shape = np.array(full_matrix_labels[0][0].shape)
-    label_affine = np.diag([max(1.0, label_shape[0]), max(1.0, label_shape[1]), max(1.0, label_shape[2]), 1.0])
-    label_spacing = _get_voxel_spacing(label_affine)
-    label_aspect = label_spacing[1] / label_spacing[0]
-
-    heatmaps = []
-    heatmap_affines = []
-    labels_list = []
-    list_3d = []
-    lesion_sizes = []
-
+@dataclass
+class ReferenceGeometry:
+    """Physical-space reference info, all derived from the real label-grid
+    affine (the same affine `LesionDataset.prepare_data` uses)."""
+    affine: np.ndarray
+    volume_center_phys: np.ndarray  # mm, grid's geometric center -- training's origin
+    voxel_spacing: np.ndarray       # mm per voxel along (i, j, k)
+    label_aspect: float             # voxel_spacing[1] / voxel_spacing[0]
+ 
+ 
+@dataclass
+class LesionTimeSeries:
+    """Everything the animation needs, pre-computed once."""
+    time_points: np.ndarray
+    heatmaps: np.ndarray            # (T, S, S), normalized to [0, 1] per frame
+    heatmap_aspect: float           # aspect ratio for the S x S query grid specifically
+    heatmap_pixel_spacing_mm: Tuple[float, float]  # (row, col) mm per heatmap pixel
+    label_slices: np.ndarray        # (T, X, Y) 2D label slice at lesion height
+    volumes_3d: np.ndarray          # (T, X, Y, Z) full label volumes
+    topdown_maps: List[np.ndarray]  # (T,) each (X, Y) height map
+    lesion_sizes_cm3: np.ndarray    # (T,)
+    change_points: np.ndarray       # (T,) bool, True where lesion size changed
+    lesion_z_voxel: float           # trimmed-mean lesion z, in voxel index units
+    geometry: ReferenceGeometry
+ 
+ 
+@dataclass
+class AnimationArtists:
+    """Matplotlib objects the per-frame update function needs to mutate."""
+    fig: object
+    ax_heatmap: object
+    im_heatmap: object
+    scale_line: object
+    scale_text: object
+    im_label: object
+    scatter_3d: object
+    cube_scale: Tuple[float, float, float]
+    im_overlap_heatmap: object
+    im_overlap_label: object
+    progress_line: object
+    current_marker: object
+    mid_y: float
+    im_topdown: object
+ 
+ 
+# ---------------------------------------------------------------------------
+# Step 1: geometry / reference frame (matches LesionDataset.prepare_data)
+# ---------------------------------------------------------------------------
+ 
+def _load_full_matrix_with_affine(trj):
+    """Load every timepoint's label volume together with the physical affine.
+ 
+    ASSUMPTION: mirrors the per-date training call
+    `(labels, day_number), affine = trj.load_labels_for_inr(selected_date=..., affine=True)`,
+    just batched across all dates and without `selected_date`. Verify this
+    matches your actual `load_labels_for_inr` signature -- if it returns a
+    separate affine per timepoint instead of one shared affine, this
+    function and `_assemble_time_series` need to carry a list of affines.
+    """
+    full_matrix_labels, affine = trj.load_labels_for_inr(absolute_day_number=True, affine=True)
+    return full_matrix_labels, affine
+ 
+ 
+def _compute_lesion_z_voxel(full_matrix_labels) -> float:
+    """Trimmed-mean z *voxel index* of the lesion. Used only to choose which
+    axial slice to display -- the model itself is queried with this z voxel
+    run through the full affine transform in `_voxel_to_model_space`, not
+    with this raw index directly."""
+    centers_of_mass_z = np.stack([
+        ndimage.center_of_mass(labels)[-1] for labels, _ in full_matrix_labels
+    ])
+    return float(np.mean(np.sort(centers_of_mass_z)[1:-1]))
+ 
+ 
+def _volume_center_phys(label_shape: np.ndarray, affine: np.ndarray) -> np.ndarray:
+    """Geometric center of the voxel grid in physical (mm) space -- the same
+    reference point `LesionDataset.prepare_data` centers training coords on."""
+    center_voxel = (np.asarray(label_shape) - 1) / 2.0
+    return affine[:3, :3] @ center_voxel + affine[:3, 3]
+ 
+ 
+def _voxel_to_model_space(voxel_ijk: np.ndarray, affine: np.ndarray,
+                           volume_center_phys: np.ndarray) -> np.ndarray:
+    """Voxel indices (N, 3) -> the exact coordinate space the INR was trained
+    on. Mirrors `LesionDataset.prepare_data` exactly: affine to physical mm,
+    center on the grid's geometric center, scale so 1 unit = 10 cm."""
+    ones = np.ones((voxel_ijk.shape[0], 1))
+    homogeneous = np.concatenate([voxel_ijk, ones], axis=1)
+    physical = (affine @ homogeneous.T).T[:, :3]
+    return (physical - volume_center_phys) / 100.0
+ 
+ 
+def _compute_reference_geometry(label_shape: np.ndarray, affine: np.ndarray) -> ReferenceGeometry:
+    voxel_spacing = _get_voxel_spacing(affine)
+    label_aspect = voxel_spacing[1] / voxel_spacing[0]
+    volume_center_phys = _volume_center_phys(label_shape, affine)
+    return ReferenceGeometry(affine, volume_center_phys, voxel_spacing, label_aspect)
+ 
+ 
+def _heatmap_pixel_spacing(geometry: ReferenceGeometry, label_shape: np.ndarray,
+                            side_length: int) -> Tuple[float, float]:
+    """mm spanned by one heatmap pixel along (row, col). The query grid
+    resamples the label grid's full x/y physical extent at `side_length`
+    resolution, so its per-pixel spacing differs from the label grid's
+    native voxel spacing by the resampling ratio on each axis."""
+    spacing_i = geometry.voxel_spacing[0] * (label_shape[0] - 1) / max(side_length - 1, 1)
+    spacing_j = geometry.voxel_spacing[1] * (label_shape[1] - 1) / max(side_length - 1, 1)
+    return spacing_i, spacing_j
+ 
+ 
+# ---------------------------------------------------------------------------
+# Step 2: model inference + label matching over time
+# ---------------------------------------------------------------------------
+ 
+def _predict_heatmap(model, patient_idx_tensor, t, x, y, z, side_length, batch_size=150_000):
+    """Query the INR for one timepoint, in chunks to bound memory use."""
+    time_col = np.full_like(x, t)
+    coords = np.stack([x, y, z, time_col], axis=1)
+    coords_tensor = torch.from_numpy(coords).float().to(next(model.parameters()).device).unsqueeze(0)
+ 
+    chunks = []
     with torch.no_grad():
-        center_of_mass = np.stack([
-            ndimage.center_of_mass(volume)[-1] for volume, _ in full_matrix_labels if np.any(volume)
-        ])
-        if center_of_mass.size > 0:
-            avg_center_of_mass = float(np.mean(np.sort(center_of_mass)[1:-1])) if center_of_mass.size > 2 else float(np.mean(center_of_mass))
-        else:
-            avg_center_of_mass = 0.0
-        lesion_z_norm = avg_center_of_mass / max(label_shape[-1] - 1, 1) * 2 - 1
-
-        meshgrid = np.meshgrid(np.linspace(0, 1, side_length), np.linspace(0, 1, side_length), indexing='ij')
-        x = meshgrid[0].flatten() * 2 - 1
-        y = meshgrid[1].flatten() * 2 - 1
-        z = np.full_like(x, lesion_z_norm)
-
-        time_points = np.linspace(0, full_matrix_labels[-1][1] + 180, config.time_evolution_steps)
-
-        for t in time_points:
-            time_point = np.full_like(x, t)
-            hm_coords = np.stack([x, y, z, time_point], axis=1)
-            coords_tensor = torch.from_numpy(hm_coords).float().to(next(model.parameters()).device).unsqueeze(0)
-
-            for slice_idx in range(0, coords_tensor.shape[1], 150_000):
-                slice_coords = coords_tensor[:, slice_idx:slice_idx + 150_000]
-                slice_preds = model(slice_coords, patient_idx)
-                if slice_idx == 0:
-                    heatmap_preds = slice_preds.cpu().numpy()
-                else:
-                    heatmap_preds = np.concatenate([heatmap_preds, slice_preds.cpu().numpy()], axis=1)
-
-            heatmap_preds = heatmap_preds.reshape(side_length, side_length)
-            heatmaps.append(heatmap_preds)
-            heatmap_affines.append(label_affine)
-
-            for element in reversed(full_matrix_labels):
-                if element[1] <= t:
-                    z_size = element[0].shape[-1]
-                    z_idx = int(np.clip(((lesion_z_norm + 1) / 2) * (z_size - 1), 0, z_size - 1))
-                    labels_list.append(element[0][:, :, z_idx])
-                    list_3d.append(element[0])
-                    lesion_sizes.append(float(element[0].sum()))
-                    break
-
+        for start in range(0, coords_tensor.shape[1], batch_size):
+            chunk = coords_tensor[:, start:start + batch_size]
+            chunks.append(model(chunk, patient_idx_tensor).cpu().numpy())
+    preds = np.concatenate(chunks, axis=1)
+    return preds.reshape(side_length, side_length)
+ 
+ 
+def _find_label_at_time(full_matrix_labels, t, lesion_z_voxel):
+    """Most recent label (day <= t), plus its 2D slice at lesion height."""
+    for volume, day in reversed(full_matrix_labels):
+        if day <= t:
+            z_size = volume.shape[-1]
+            z_idx = int(np.clip(round(lesion_z_voxel), 0, z_size - 1))
+            return volume, volume[:, :, z_idx]
+    raise ValueError(f"No label found at or before t={t}.")
+ 
+ 
+def _build_topdown_height_map(volume: np.ndarray) -> np.ndarray:
+    """Max lesion-voxel z-index per (x, y) column; columns with no lesion -> 0."""
+    height_map = np.full(volume.shape[:2], np.nan, dtype=float)
+    lesion_x, lesion_y, lesion_z = np.where(volume == 1)
+    for x_idx, y_idx, z_idx in zip(lesion_x, lesion_y, lesion_z):
+        current = height_map[x_idx, y_idx]
+        if np.isnan(current) or z_idx > current:
+            height_map[x_idx, y_idx] = z_idx
+    if np.isnan(height_map).all():
+        return np.zeros(volume.shape[:2], dtype=float)
+    return height_map
+ 
+ 
+def _build_query_grid(label_shape: np.ndarray, affine: np.ndarray, geometry: ReferenceGeometry,
+                       lesion_z_voxel: float, side_length: int):
+    """Voxel indices spanning the label grid's full x/y extent at
+    `side_length` resolution, held at the lesion's z voxel -- then converted
+    to the model's training coordinate space."""
+    grid_i, grid_j = np.meshgrid(
+        np.linspace(0, label_shape[0] - 1, side_length),
+        np.linspace(0, label_shape[1] - 1, side_length),
+        indexing='ij',
+    )
+    voxel_ijk = np.stack([
+        grid_i.flatten(), grid_j.flatten(), np.full(grid_i.size, lesion_z_voxel),
+    ], axis=1)
+    xyz = _voxel_to_model_space(voxel_ijk, affine, geometry.volume_center_phys)
+    return xyz[:, 0], xyz[:, 1], xyz[:, 2]
+ 
+ 
+def _assemble_time_series(model, patient_idx_tensor, config, full_matrix_labels,
+                           label_shape, affine, geometry, side_length) -> LesionTimeSeries:
+    lesion_z_voxel = _compute_lesion_z_voxel(full_matrix_labels)
+    time_points = np.linspace(0, full_matrix_labels[-1][1] + 180, config.time_evolution_steps)
+ 
+    x, y, z = _build_query_grid(label_shape, affine, geometry, lesion_z_voxel, side_length)
+ 
+    heatmaps, label_slices, volumes_3d, lesion_sizes = [], [], [], []
+    for t in time_points:
+        heatmaps.append(_predict_heatmap(model, patient_idx_tensor, t, x, y, z, side_length))
+        volume, label_slice = _find_label_at_time(full_matrix_labels, t, lesion_z_voxel)
+        volumes_3d.append(volume)
+        label_slices.append(label_slice)
+        lesion_sizes.append(float(volume.sum()))
+ 
     heatmaps = np.array(heatmaps)
-    heatmap_max = np.max(heatmaps, axis=(1, 2))
-    heatmap_max[heatmap_max == 0] = 1.0
-    heatmaps = heatmaps / heatmap_max[:, np.newaxis, np.newaxis]
-
-    label_grid = np.array(labels_list)
-    list_3d = np.array(list_3d)
+    heatmap_peak = np.max(heatmaps, axis=(1, 2))
+    heatmap_peak[heatmap_peak == 0] = 1.0
+    heatmaps = heatmaps / heatmap_peak[:, np.newaxis, np.newaxis]
+ 
+    volumes_3d = np.array(volumes_3d)
+    label_slices = np.array(label_slices)
     lesion_sizes = np.array(lesion_sizes, dtype=float)
-    if lesion_sizes.size > 0:
-        lesion_sizes = lesion_sizes / max(lesion_sizes.max(), 1.0)
-
-    def build_topdown_height(volume):
-        height_map = np.full(volume.shape[:2], np.nan, dtype=float)
-        for x_idx in range(volume.shape[0]):
-            for y_idx in range(volume.shape[1]):
-                z_coords = np.where(volume[x_idx, y_idx, :] == 1)[0]
-                if z_coords.size > 0:
-                    height_map[x_idx, y_idx] = z_coords.max()
-        if np.isnan(height_map).all():
-            return np.zeros(volume.shape[:2], dtype=float)
-        return height_map
-
-    topdown_maps = [build_topdown_height(volume) for volume in list_3d]
+ 
+    voxel_volume_mm3 = np.prod(geometry.voxel_spacing)
+    lesion_sizes_cm3 = lesion_sizes * voxel_volume_mm3 / 1000.0  # mm^3 -> cm^3
+ 
+    topdown_maps = [_build_topdown_height_map(volume) for volume in volumes_3d]
+ 
     change_points = np.zeros(len(time_points), dtype=bool)
-    for idx in range(1, len(label_grid)):
-        change_points[idx] = not np.array_equal(lesion_sizes[idx], lesion_sizes[idx - 1])
+    change_points[1:] = lesion_sizes_cm3[1:] != lesion_sizes_cm3[:-1]
+ 
+    spacing_i, spacing_j = _heatmap_pixel_spacing(geometry, label_shape, side_length)
+    heatmap_aspect = spacing_j / spacing_i
+ 
+    return LesionTimeSeries(
+        time_points=time_points,
+        heatmaps=heatmaps,
+        heatmap_aspect=heatmap_aspect,
+        heatmap_pixel_spacing_mm=(spacing_i, spacing_j),
+        label_slices=label_slices,
+        volumes_3d=volumes_3d,
+        topdown_maps=topdown_maps,
+        lesion_sizes_cm3=lesion_sizes_cm3,
+        change_points=change_points,
+        lesion_z_voxel=lesion_z_voxel,
+        geometry=geometry,
+    )
+ 
+ 
+# ---------------------------------------------------------------------------
+# Step 3: figure construction (one builder per panel)
+# ---------------------------------------------------------------------------
+ 
+def _init_heatmap_panel(ax, data: LesionTimeSeries, patient_idx):
+    im = ax.imshow(data.heatmaps[0], cmap='copper', vmin=0, vmax=1,
+                    aspect=data.heatmap_aspect, animated=True)
+    ax.set_title(f"Predicted Lesion Heatmap {patient_idx} frame 0/{len(data.heatmaps)}")
+    ax.axis('off')
+ 
+    img_h_px, img_w_px = data.heatmaps[0].shape
+    _, col_spacing = data.heatmap_pixel_spacing_mm  # mm per heatmap pixel, not label-grid spacing
+    bar_length_mm = _nice_scale_length_mm(img_w_px * col_spacing)
+    bar_length_px = bar_length_mm / col_spacing
+ 
+    bar_x0, bar_y = img_w_px * 0.05, img_h_px * 0.92
+    scale_line, = ax.plot([bar_x0, bar_x0 + bar_length_px], [bar_y, bar_y],
+                           color='white', lw=3, solid_capstyle='butt')
+    scale_text = ax.text(bar_x0 + bar_length_px / 2, bar_y - img_h_px * 0.03,
+                          f"{bar_length_mm:.0f} mm", color='white', ha='center', va='bottom',
+                          fontsize=10)
+    return im, scale_line, scale_text
+ 
+ 
+def _init_label_panel(ax, data: LesionTimeSeries):
+    im = ax.imshow(data.label_slices[0], cmap='copper', vmin=0, vmax=1, aspect=data.geometry.label_aspect)
+    ax.set_title("Lesion Label of nnUNet")
+    ax.axis('off')
+    return im
+ 
+ 
+def _init_3d_panel(ax, data: LesionTimeSeries):
+    nx, ny, nz = data.volumes_3d[0].shape
+    cube_extent = max(nx, ny, nz, 1)
+    scale = (cube_extent / max(nx, 1), cube_extent / max(ny, 1), cube_extent / max(nz, 1))
+ 
+    xs, ys, zs = np.where(data.volumes_3d[0] == 1)
+    scatter = ax.scatter(xs * scale[0], ys * scale[1], zs * scale[2])
+ 
+    ax.set_title("Lesion Label in 3D space")
+    ax.set_xlim3d(0, cube_extent)
+    ax.set_ylim3d(0, cube_extent)
+    ax.set_zlim3d(0, cube_extent)
 
-    def raw_aspect_for(frame_idx):
-        spacing = _get_voxel_spacing(heatmap_affines[frame_idx])
-        return spacing[0] / spacing[1]
+    ax.xaxis.set_tick_params(labelbottom=False)
+    ax.yaxis.set_tick_params(labelleft=False)
+    ax.zaxis.set_tick_params(labelbottom=False)
 
+    ax.set_box_aspect((1, 1, 1))
+ 
+    plane_x, plane_y = np.meshgrid(np.linspace(0, cube_extent, 10), np.linspace(0, cube_extent, 10))
+    z_slice_idx = int(np.clip(round(data.lesion_z_voxel), 0, nz - 1))
+    plane_z = np.full_like(plane_x, z_slice_idx * scale[2])
+    ax.plot_surface(plane_x, plane_y, plane_z, alpha=0.3, color='lightblue',
+                     antialiased=False, label="slice_of_heatmap")
+    
+    return scatter, scale
+ 
+ 
+def _init_overlap_panel(ax, data: LesionTimeSeries):
+    heatmap0_resized = _resize_2d(data.heatmaps[0], data.label_slices[0].shape)
+    im_heatmap = ax.imshow(heatmap0_resized, cmap='copper', vmin=0, vmax=1,
+                            aspect=data.geometry.label_aspect, animated=True)
+    im_label = ax.imshow(data.label_slices[0], cmap='Reds', vmin=0, vmax=1, alpha=0.5,
+                          aspect=data.geometry.label_aspect)
+    ax.set_title("Lesion Label + Prediction Overlap")
+    ax.axis('off')
+    return im_heatmap, im_label
+ 
+ 
+def _init_timeline_panel(ax, data: LesionTimeSeries):
+    max_vol = max(data.lesion_sizes_cm3.max(), 1e-6)
+    mid_y = max_vol / 2
+ 
+    ax.fill_between(data.time_points, 0, data.lesion_sizes_cm3, color='skyblue', alpha=0.25)
+    ax.plot(data.time_points, data.lesion_sizes_cm3, color='steelblue', lw=1.5, label='Lesion size [cm³]')
+    ax.plot(data.time_points, np.full_like(data.time_points, mid_y), color='lightgray', lw=1)
+    ax.scatter(data.time_points[data.change_points],
+               np.full(data.change_points.sum(), mid_y), marker='|', color='red', s=120, label='Label Timepoints')
+ 
+    progress_line, = ax.plot(
+        [data.time_points[0], data.time_points[0]],
+        [mid_y - max_vol * 0.25, mid_y + max_vol * 0.25],
+        color='royalblue', lw=3,
+    )
+    current_marker, = ax.plot([data.time_points[0]], [mid_y], marker='o', color='royalblue', markersize=8, label='Current position')
+ 
+    ax.set_xlim(data.time_points[0], data.time_points[-1])
+    ax.set_ylim(-max_vol * 0.1, max_vol * 1.2)
+    ax.set_yticks(np.linspace(0, max_vol, 4))
+    ax.set_xticks(np.linspace(data.time_points[0], data.time_points[-1], 5))
+    ax.set_xlabel('Time [days]')
+    ax.set_ylabel('Lesion Size [cm³]')
+    ax.set_title('Lesion Growth Time Evolution Timeline')
+
+    ax.legend(loc='lower right', fontsize=9, framealpha=0.9)
+
+    return progress_line, current_marker, mid_y
+ 
+ 
+def _init_topdown_panel(ax, data: LesionTimeSeries):
+    nz = data.volumes_3d[0].shape[-1]
+    topdown_max = max(1, nz - 1)
+    im = ax.imshow(data.topdown_maps[0], cmap='terrain', vmin=0, vmax=topdown_max,
+                    aspect=data.geometry.label_aspect)
+    ax.set_title('Top-down lesion height map')
+    ax.axis('off')
+
+    # Add colorbar on the left
+    cbar = plt.colorbar(im, ax=ax, orientation='vertical', pad=0.02, shrink=0.8)
+    cbar.ax.yaxis.set_label_position('right')
+    cbar.ax.yaxis.tick_right()
+    return im
+ 
+ 
+def _build_figure(data: LesionTimeSeries, patient_idx) -> AnimationArtists:
     fig = plt.figure(figsize=(18, 12))
     gs = fig.add_gridspec(2, 3, width_ratios=[1, 1, 1], height_ratios=[1, 1])
-
-    ax1 = fig.add_subplot(gs[0, 0])
-    im = ax1.imshow(heatmaps[0], cmap='copper', vmin=0, vmax=1, aspect=raw_aspect_for(0), animated=True)
-
-    img_h_px, img_w_px = heatmaps[0].shape
-    col_spacing0 = _get_voxel_spacing(heatmap_affines[0])[1]
-    bar_length_mm = _nice_scale_length_mm(img_w_px * col_spacing0)
-    bar_length_px0 = bar_length_mm / col_spacing0
-
-    bar_x0 = img_w_px * 0.05
-    bar_y = img_h_px * 0.92
-    scale_line, = ax1.plot([bar_x0, bar_x0 + bar_length_px0], [bar_y, bar_y], color='white', lw=3, solid_capstyle='butt')
-    scale_text = ax1.text(bar_x0 + bar_length_px0 / 2, bar_y - img_h_px * 0.03, f"{bar_length_mm:.0f} mm", color='white', ha='center', va='bottom', fontsize=10)
-
-    ax1.set_title(f"Predicted Lesion Heatmap {patient_idx.item()} frame 0/{len(heatmaps)}")
-    ax1.axis('off')
-
-    ax2 = fig.add_subplot(gs[0, 1])
-    im_label = ax2.imshow(label_grid[0], cmap='copper', vmin=0, vmax=1, aspect=label_aspect)
-    ax2.set_title("Lesion Label of nnUNet")
-    ax2.axis('off')
-
-    ax3 = fig.add_subplot(gs[1, 0], projection='3d')
-    nx, ny, nz = list_3d[0].shape
-    cube_extent = max(nx, ny, nz, 1)
-    x_scale = cube_extent / max(nx, 1)
-    y_scale = cube_extent / max(ny, 1)
-    z_scale = cube_extent / max(nz, 1)
-    xs, ys, zs = np.where(list_3d[0] == 1)
-    scatter = ax3.scatter(xs * x_scale, ys * y_scale, zs * z_scale)
-    ax3.set_title("Lesion Label in 3D space")
-    ax3.set_xlim3d(0, cube_extent)
-    ax3.set_ylim3d(0, cube_extent)
-    ax3.set_zlim3d(0, cube_extent)
-    ax3.set_box_aspect((1, 1, 1))
-
-    x_plane = np.linspace(0, cube_extent, 10)
-    y_plane = np.linspace(0, cube_extent, 10)
-    X_p, Y_p = np.meshgrid(x_plane, y_plane)
-    z_slice_idx0 = int(np.clip(((lesion_z_norm + 1) / 2) * (nz - 1), 0, nz - 1))
-    Z_p = np.full_like(X_p, z_slice_idx0 * z_scale)
-    ax3.plot_surface(X_p, Y_p, Z_p, alpha=0.3, color='lightblue', antialiased=False, label="slice_of_heatmap")
-
-    ax4 = fig.add_subplot(gs[0, 2])
-    heatmap0_resized = _resize_2d(heatmaps[0], label_grid[0].shape)
-    im_label_4 = ax4.imshow(heatmap0_resized, cmap='copper', vmin=0, vmax=1, aspect=label_aspect, animated=True)
-    im_seg_4 = ax4.imshow(label_grid[0], cmap='Reds', vmin=0, vmax=1, alpha=0.5, aspect=label_aspect)
-    ax4.set_title("Lesion Label + Prediction Overlap")
-    ax4.axis('off')
-
-    max_vol = max(lesion_sizes.max(), 1e-6) if lesion_sizes.size > 0 else 1e-6
-    mid_y = max_vol / 2
-
+ 
+    ax_heatmap = fig.add_subplot(gs[0, 0])
+    im_heatmap, scale_line, scale_text = _init_heatmap_panel(ax_heatmap, data, patient_idx)
+ 
+    ax_label = fig.add_subplot(gs[0, 1])
+    im_label = _init_label_panel(ax_label, data)
+ 
+    ax_3d = fig.add_subplot(gs[1, 0], projection='3d')
+    scatter_3d, cube_scale = _init_3d_panel(ax_3d, data)
+ 
+    ax_overlap = fig.add_subplot(gs[0, 2])
+    im_overlap_heatmap, im_overlap_label = _init_overlap_panel(ax_overlap, data)
+ 
     ax_timeline = fig.add_subplot(gs[1, 2])
-    ax_timeline.fill_between(time_points, 0, lesion_sizes, color='skyblue', alpha=0.25)
-    ax_timeline.plot(time_points, lesion_sizes, color='steelblue', lw=1.5)
-    ax_timeline.plot(time_points, np.full_like(time_points, 0.5), color='lightgray', lw=1)
-    ax_timeline.scatter(time_points[change_points], np.full(change_points.sum(), 0.5), marker='|', color='red', s=120)
-    progress_line, = ax_timeline.plot([time_points[0], time_points[0]], [0.25, 0.75], color='royalblue', lw=3)
-    current_marker, = ax_timeline.plot([time_points[0]], [0.5], marker='o', color='royalblue', markersize=8)
-    ax_timeline.set_xlim(time_points[0], time_points[-1])
-    ax_timeline.set_ylim(-max_vol * 0.1, max_vol * 1.2)
-    ax_timeline.set_yticks(np.linspace(0, max_vol, 4))
-    ax_timeline.set_xlabel('Time')
-    ax_timeline.set_ylabel('Lesion Size')
-    ax_timeline.set_title('Lesion Growth Time Evolution Timeline')
-    ax_timeline.set_xticks(np.linspace(time_points[0], time_points[-1], 5))
-
+    progress_line, current_marker, mid_y = _init_timeline_panel(ax_timeline, data)
+ 
     ax_topdown = fig.add_subplot(gs[1, 1])
-    topdown_max = max(1, nz - 1)
-    topdown_im = ax_topdown.imshow(topdown_maps[0], cmap='terrain', vmin=0, vmax=topdown_max, aspect=label_aspect)
-    ax_topdown.set_title('Top-down lesion height map')
-    ax_topdown.axis('off')
-
+    im_topdown = _init_topdown_panel(ax_topdown, data)
+ 
     fig.tight_layout()
-
-    def update(i):
-        if i == len(heatmaps) - 1:
-            im.set_array(np.ones_like(heatmaps[0]))
-            im_label.set_array(np.ones_like(label_grid[0]))
-            im_label_4.set_array(np.ones_like(heatmap0_resized))
-            im_seg_4.set_array(np.ones_like(label_grid[0]))
-            scatter._offsets3d = ([], [], [])
-            ax1.set_title("--- End of Sequence ---")
-            progress_line.set_data([time_points[0], time_points[-1]], [mid_y, mid_y])
-            current_marker.set_data([time_points[-1]], [mid_y])
-            topdown_im.set_array(topdown_maps[-1])
-            topdown_im.set_clim(0, topdown_max)
-        else:
-            ax1.set_aspect(raw_aspect_for(i))
-            im.set_array(heatmaps[i])
-            im_label.set_array(label_grid[i])
-            im_label_4.set_array(_resize_2d(heatmaps[i], label_grid[i].shape))
-            im_seg_4.set_array(label_grid[i])
-
-            col_spacing_i = _get_voxel_spacing(heatmap_affines[i])[1]
-            bar_length_px_i = bar_length_mm / col_spacing_i
-            scale_line.set_xdata([bar_x0, bar_x0 + bar_length_px_i])
-            scale_text.set_position((bar_x0 + bar_length_px_i / 2, bar_y - img_h_px * 0.03))
-
-            xs, ys, zs = np.where(list_3d[i] == 1)
-            scatter._offsets3d = (xs * x_scale, ys * y_scale, zs * z_scale)
-            ax1.set_title(f'Predicted Lesion Heatmap {patient_idx.item()} frame {i:03d}/{len(heatmaps)}')
-            progress_line.set_data([time_points[0], time_points[i]], [mid_y, mid_y])
-            current_marker.set_data([time_points[i]], [mid_y])
-            topdown_im.set_array(topdown_maps[i])
-            topdown_im.set_clim(0, topdown_max)
-        return [im, im_label, im_label_4, im_seg_4, scatter, progress_line, current_marker, topdown_im, scale_line, scale_text, ax1.title]
-
-    ani = FuncAnimation(fig, update, frames=len(heatmaps), interval=50)
-
-    # because in older versions of magick, the convert command is used instead of magick, we try both
-    try:
-        plt.rcParams['animation.convert_path'] = 'convert'
-        writer = ImageMagickWriter(fps=10, extra_args=['-layers', 'Optimize'])
-        file_name = f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_{trj.patient_id}_{patient_idx.item()}_lesion_{trj.label_id}.gif"
-        ani.save(file_name, writer=writer, dpi=50)
-    except Exception:
-        plt.rcParams['animation.convert_path'] = 'magick'
-        writer = ImageMagickWriter(fps=10, extra_args=['-layers', 'Optimize'])
-        file_name = f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_{trj.patient_id}_{patient_idx.item()}_lesion_{trj.label_id}.gif"
-        ani.save(file_name, writer=writer, dpi=50)
-
-    mlflow.log_artifact(file_name)
-    plt.close(fig)
-
+ 
+    return AnimationArtists(
+        fig=fig,
+        ax_heatmap=ax_heatmap, im_heatmap=im_heatmap, scale_line=scale_line, scale_text=scale_text,
+        im_label=im_label,
+        scatter_3d=scatter_3d, cube_scale=cube_scale,
+        im_overlap_heatmap=im_overlap_heatmap, im_overlap_label=im_overlap_label,
+        progress_line=progress_line, current_marker=current_marker, mid_y=mid_y,
+        im_topdown=im_topdown,
+    )
+ 
+ 
+# ---------------------------------------------------------------------------
+# Step 4: per-frame update + GIF export
+# ---------------------------------------------------------------------------
+ 
+def _update_frame(frame_idx, data: LesionTimeSeries, artists: AnimationArtists, patient_idx):
+    is_last_frame = frame_idx == len(data.heatmaps) - 1
+ 
+    if is_last_frame:
+        artists.im_heatmap.set_array(np.ones_like(data.heatmaps[0]))
+        artists.im_label.set_array(np.ones_like(data.label_slices[0]))
+        artists.im_overlap_heatmap.set_array(np.ones_like(artists.im_overlap_heatmap.get_array()))
+        artists.im_overlap_label.set_array(np.ones_like(data.label_slices[0]))
+        artists.scatter_3d._offsets3d = ([], [], [])
+        artists.ax_heatmap.set_title("--- End of Sequence ---")
+        artists.progress_line.set_data([data.time_points[0], data.time_points[-1]],
+                                        [artists.mid_y, artists.mid_y])
+        artists.current_marker.set_data([data.time_points[-1]], [artists.mid_y])
+        artists.im_topdown.set_array(data.topdown_maps[-1])
+    else:
+        artists.im_heatmap.set_array(data.heatmaps[frame_idx])
+        artists.im_label.set_array(data.label_slices[frame_idx])
+        artists.im_overlap_heatmap.set_array(
+            _resize_2d(data.heatmaps[frame_idx], data.label_slices[frame_idx].shape)
+        )
+        artists.im_overlap_label.set_array(data.label_slices[frame_idx])
+ 
+        sx, sy, sz = artists.cube_scale
+        xs, ys, zs = np.where(data.volumes_3d[frame_idx] == 1)
+        artists.scatter_3d._offsets3d = (xs * sx, ys * sy, zs * sz)
+ 
+        artists.ax_heatmap.set_title(
+            f'Predicted Lesion Heatmap {patient_idx} frame {frame_idx:03d}/{len(data.heatmaps)}'
+        )
+        artists.progress_line.set_data([data.time_points[0], data.time_points[frame_idx]],
+                                        [artists.mid_y, artists.mid_y])
+        artists.current_marker.set_data([data.time_points[frame_idx]], [artists.mid_y])
+        artists.im_topdown.set_array(data.topdown_maps[frame_idx])
+ 
+    return [
+        artists.im_heatmap, artists.im_label, artists.im_overlap_heatmap, artists.im_overlap_label,
+        artists.scatter_3d, artists.progress_line, artists.current_marker, artists.im_topdown,
+        artists.scale_line, artists.scale_text, artists.ax_heatmap.title,
+    ]
+ 
+ 
+def _save_gif(fig, update_fn, n_frames: int, output_path: str):
+    """Render and save the animation, tolerating either ImageMagick binary name."""
+    ani = FuncAnimation(fig, update_fn, frames=n_frames, interval=50)
+    last_error = None
+    for convert_path in ('convert', 'magick'):
+        try:
+            plt.rcParams['animation.convert_path'] = convert_path
+            writer = ImageMagickWriter(fps=10, extra_args=['-layers', 'Optimize'])
+            ani.save(output_path, writer=writer, dpi=50)
+            return
+        except Exception as exc:  # noqa: BLE001 - genuinely need to try the other binary name
+            last_error = exc
+    raise last_error
+ 
+ 
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+ 
+def plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=False):
+    """Render a multi-panel GIF of predicted lesion evolution vs. nnUNet
+    ground-truth labels over time, and log it to mlflow.
+ 
+    Panels: predicted heatmap, ground-truth label slice, 3D label scatter,
+    heatmap/label overlap, lesion-size timeline, top-down height map.
+    """
+    side_length = config.full_size_side_length if final_side_length else config.time_evolution_side_length
+    patient_idx_tensor = torch.tensor(trj.embedding_id).unsqueeze(0).to(config.device)
+    patient_idx = patient_idx_tensor.item()
+ 
+    full_matrix_labels, affine = _load_full_matrix_with_affine(trj)
+    label_shape = np.array(full_matrix_labels[0][0].shape)  # (X, Y, Z)
+ 
+    geometry = _compute_reference_geometry(label_shape, affine)
+    data = _assemble_time_series(
+        model, patient_idx_tensor, config, full_matrix_labels, label_shape, affine, geometry, side_length
+    )
+ 
+    artists = _build_figure(data, patient_idx)
+ 
+    def update(frame_idx):
+        return _update_frame(frame_idx, data, artists, patient_idx)
+ 
+    output_path = (
+        f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_"
+        f"{trj.patient_id}_{patient_idx}_lesion_{trj.label_id}.gif"
+    )
+    _save_gif(artists.fig, update, len(data.heatmaps), output_path)
+ 
+    mlflow.log_artifact(output_path)
+    plt.close(artists.fig)
+ 

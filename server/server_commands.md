@@ -55,6 +55,7 @@ mlflow server --host 0.0.0.0 --port 5124 --backend-store-uri ./mlruns --default-
 ```bash
 cp projects/thesis/train.sbatch . && sbatch train.sbatch
 TERM=xterm-256color watch squeue -u $USER
+sh watch_logs.sh projects/thesis/logs projects/thesis/logs
 ```
 
 ## When the predictions and labels where renewed:

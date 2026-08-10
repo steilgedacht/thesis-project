@@ -3,7 +3,6 @@ from pathlib import Path
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import numpy as np
 import mlflow
 import mlflow.pytorch
 from tqdm import tqdm
@@ -67,7 +66,7 @@ def train_inr(
     model.to(config.device)
     losses = []
     
-    global_step = 0
+    global_step = epoch = 0
 
     for epoch in range(1, config.epochs + 1):
         total_loss = 0
@@ -142,8 +141,7 @@ def train_inr(
     )
 
     with torch.no_grad():
-        for trj in plotting_LesionDataset:
-            if config.epochs < 1: break
+        for trj in plotting_LesionDataset:  
             plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=True)
 
     return losses
@@ -225,6 +223,12 @@ if __name__ == "__main__":
             trajectories=trajectories, 
             **config.model_params
         )
+        # if config.load_model:
+        #     if config.load_model_path.startswith("runs"):
+        #         model = mlflow.pytorch.load_model(config.load_model_path)
+        #     else:
+        #         model.load_state_dict(torch.load(config.load_model_path, weights_only=True))
+
         
         mlflow.log_params({
             "dataset_size": len(train_dataset),
@@ -242,5 +246,5 @@ if __name__ == "__main__":
             plotting_LesionDataset,
             config
         )
-        
-        mlflow.log_metric("final_train_loss", losses[-1])
+        if len(losses) != 0:
+            mlflow.log_metric("final_train_loss", losses[-1])

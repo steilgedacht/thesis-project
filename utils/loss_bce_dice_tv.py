@@ -3,11 +3,12 @@ import torch
 class Loss_BCE_Dice_TV:
     def __init__(
         self,
-        loss_fn_1=torch.nn.BCEWithLogitsLoss(),
         lambda_space=1e-4,
         lambda_time=1e-3,
+        pos_weight=1.0,
     ):
-        self.loss_fn_1 = loss_fn_1
+        self.loss_bce_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
+        self.pos_weight = pos_weight
         self.lambda_space = lambda_space
         self.lambda_time = lambda_time
 
@@ -20,8 +21,8 @@ class Loss_BCE_Dice_TV:
 
 
     def __call__(self, pred, target, coords=None):
-        self.loss_bce = self.loss_fn_1(pred, target)
-        self.loss_dice = self.dice_loss(pred, target)
+        self.loss_bce = self.loss_bce_fn(pred, target)
+        self.loss_dice = self.dice_loss(pred, target, pos_weight=self.pos_weight)
 
         total_loss = self.loss_bce + self.loss_dice
 
@@ -48,12 +49,12 @@ class Loss_BCE_Dice_TV:
             "training_loss_tv_time": self.loss_tv_time if isinstance(self.loss_tv_time, float) else self.loss_tv_time.cpu().detach().item(),
         }
 
-    def dice_loss(self, pred, target, smooth=1e-6):
+    def dice_loss(self, pred, target, pos_weight=1, smooth=1e-6):
         pred = torch.sigmoid(pred)
-        intersection = (pred * target).sum()
-        return 1 - (
-            (2.0 * intersection + smooth) / (pred.sum() + target.sum() + smooth)
-        )
+        weights = torch.where(target == 1, pos_weight, 1.0)
+        intersection = (pred * target * weights).sum()
+        denom = (pred * weights).sum() + (target * weights).sum()
+        return 1 - (2.0 * intersection + smooth) / (denom + smooth)
 
     def compute_tv_losses(self, pred, coords):
         """Berechnet die räumliche (Space) und zeitliche (Time) Ableitung der Predictions
