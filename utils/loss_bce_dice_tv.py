@@ -6,8 +6,9 @@ class Loss_BCE_Dice_TV:
         lambda_space=1e-4,
         lambda_time=1e-3,
         pos_weight=1.0,
+        device="cuda"
     ):
-        self.loss_bce_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
+        self.loss_bce_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
         self.pos_weight = pos_weight
         self.lambda_space = lambda_space
         self.lambda_time = lambda_time
