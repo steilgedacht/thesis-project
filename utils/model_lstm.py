@@ -193,3 +193,122 @@ class LesionLSTM(nn.Module):
                 current_input = torch.sigmoid(pred_logits)
 
         return torch.stack(preds, dim=1)
+# --- Autoencoder + Latent-LSTM variant -------------------------------------------------
+class Encoder3D(nn.Module):
+    """Simple 3D conv encoder that maps a 1-channel occupancy grid to a latent vector."""
+    def __init__(self, in_channels=1, latent_dim=128, base_channels=16):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(),
+            nn.Conv3d(base_channels, base_channels*2, kernel_size=3, stride=2, padding=1),
+            nn.LeakyReLU(),
+            nn.Conv3d(base_channels*2, base_channels*4, kernel_size=3, stride=2, padding=1),
+            nn.LeakyReLU(),
+            nn.AdaptiveAvgPool3d(1),
+        )
+        self.fc = nn.Linear(base_channels*4, latent_dim)
+
+    def forward(self, x):
+        # x: [B, 1, D, H, W]
+        h = self.conv(x)
+        h = h.view(h.shape[0], -1)
+        return self.fc(h)
+
+
+class Decoder3D(nn.Module):
+    """Simple decoder that maps latent vector back to a 1-channel occupancy grid via upsampling convs."""
+    def __init__(self, latent_dim=128, out_channels=1, base_channels=16, out_size=(64,64,64)):
+        super().__init__()
+        self.out_size = out_size
+        self.fc = nn.Linear(latent_dim, base_channels*4)
+        self.up = nn.Sequential(
+            nn.Unflatten(1, (base_channels*4, 1, 1, 1)),
+            nn.ConvTranspose3d(base_channels*4, base_channels*2, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(),
+            nn.ConvTranspose3d(base_channels*2, base_channels, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(),
+            nn.Conv3d(base_channels, out_channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, z):
+        # z: [B, latent_dim]
+        h = self.fc(z)
+        h = self.up(h)
+        # if spatial size doesn't match exactly, interpolate
+        if h.shape[-3:] != self.out_size:
+            h = nn.functional.interpolate(h, size=self.out_size, mode='trilinear', align_corners=False)
+        return h
+
+
+class LesionLatentLSTM(nn.Module):
+    """
+    Latent-space recurrent model:
+      encoder: grid -> z
+      latent-LSTM (FiLM-style conditioning on time + optional patient embedding)
+      decoder: z -> grid
+
+    This keeps a similar conditioning scheme (concatenate time encoding to z)
+    and uses a small RNN over latent vectors instead of ConvLSTM over
+    full grids, which reduces memory and lets the autoencoder learn compact
+    visit representations.
+    """
+    def __init__(self, trajectories, latent_dim=128, hidden_dim=256, n_layers=2, time_freqs=6, max_t=3650.0, encoder_params=None, decoder_params=None, use_patient_embedding=False):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.use_patient_embedding = use_patient_embedding
+
+        num_patients = len(trajectories) * 100
+        if use_patient_embedding:
+            self.patient_emb = nn.Embedding(num_patients, latent_dim)
+            torch.nn.init.normal_(self.patient_emb.weight, std=1.0 / np.sqrt(latent_dim))
+
+        self.encoder = Encoder3D(latent_dim=latent_dim, **(encoder_params or {}))
+        self.decoder = Decoder3D(latent_dim=latent_dim, **(decoder_params or {}))
+
+        self.time_encoder = TimeEncoder(max_t=max_t, num_frequencies=time_freqs)
+        lstm_input_dim = latent_dim + 2 * time_freqs + (latent_dim if use_patient_embedding else 0)
+        self.rnn = nn.GRU(lstm_input_dim, hidden_dim, num_layers=n_layers, batch_first=True)
+        self.fc_out = nn.Linear(hidden_dim, latent_dim)
+
+    def forward(self, grids, times, patient_idx=None, teacher_forcing=True, n_future=0):
+        # grids: [B, T, 1, D, H, W]
+        B, T = grids.shape[0], grids.shape[1]
+        device = grids.device
+
+        # encode each observed grid into z
+        z_obs = []
+        for t in range(T):
+            grid_t = grids[:, t]
+            z_t = self.encoder(grid_t)
+            z_obs.append(z_t)
+        z_obs = torch.stack(z_obs, dim=1)  # [B, T, latent_dim]
+
+        total_steps = (T - 1) + n_future
+
+        # build inputs to RNN: for each prediction step we condition on the target time
+        inputs = []
+        for step in range(total_steps):
+            target_time = times[:, step + 1]
+            t_enc = self.time_encoder(target_time)
+            z_curr = z_obs[:, step]
+            if self.use_patient_embedding and patient_idx is not None:
+                p_emb = self.patient_emb(patient_idx)
+                rnn_in = torch.cat([z_curr, t_enc, p_emb], dim=-1)
+            else:
+                rnn_in = torch.cat([z_curr, t_enc], dim=-1)
+            inputs.append(rnn_in)
+
+        rnn_in = torch.stack(inputs, dim=1)  # [B, total_steps, input_dim]
+        out, _ = self.rnn(rnn_in)            # [B, total_steps, hidden_dim]
+        z_pred = self.fc_out(out)            # [B, total_steps, latent_dim]
+
+        # decode predicted latents to predicted grids
+        preds = []
+        for s in range(z_pred.shape[1]):
+            g = self.decoder(z_pred[:, s])
+            preds.append(g)
+        preds = torch.stack(preds, dim=1)  # [B, total_steps, 1, D, H, W]
+        return preds

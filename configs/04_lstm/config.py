@@ -18,7 +18,13 @@ class Config:
     only_train = False
 
     from utils.loss_bce_dice import Loss_BCE_Dice
-    loss_fn = Loss_BCE_Dice()
+
+    # Optional class-weighting for the BCE component. Set to None to disable.
+    # For a heavily imbalanced dataset set e.g. bce_pos_weight = 5.0
+    bce_pos_weight = None
+
+    # Instantiate the loss, passing the pos_weight if provided so BCE uses it
+    loss_fn = Loss_BCE_Dice(pos_weight=bce_pos_weight)
     use_total_variation_loss = True
 
 
@@ -48,23 +54,41 @@ class Config:
         "device": device
     }
 
-    
-
-
     """ Model parameters """
-    from utils.model_lstm import LesionLSTM
-    model = LesionLSTM
-    model_params = {
-        "grid_size" : lstm_grid_size,
-        "latent_dim" : 128,
-        "hidden_channels" : 32,
-        "n_layers" : 2,
-        "time_freqs" : 6,
-        "max_t" : 3650.0,
-        "kernel_size" : 3
-    }
-    model_save_name = "lesion_lstm"
+    from utils.model_lstm import LesionLSTM, LesionLatentLSTM
 
+    # If True, use an autoencoder to encode each visit into a latent vector and
+    # run an RNN in latent space (encoder + latent-LSTM + decoder). If False,
+    # use the ConvLSTM that operates on full grids.
+    use_autoencoder_lstm = False
+
+    if use_autoencoder_lstm:
+        model = LesionLatentLSTM
+        model_params = {
+            "grid_size": lstm_grid_size,
+            "latent_dim": 128,
+            "hidden_dim": 256,
+            "n_layers": 2,
+            "time_freqs": 6,
+            "max_t": 3650.0,
+            # encoder/decoder params can be tuned; keep sensible defaults
+            "encoder_params": {"base_channels": 16},
+            "decoder_params": {"base_channels": 16, "out_size": lstm_grid_size},
+            "use_patient_embedding": False,
+        }
+        model_save_name = "lesion_lstm_autoencoder"
+    else:
+        model = LesionLSTM
+        model_params = {
+            "grid_size" : lstm_grid_size,
+            "latent_dim" : 128,
+            "hidden_channels" : 32,
+            "n_layers" : 2,
+            "time_freqs" : 6,
+            "max_t" : 3650.0,
+            "kernel_size" : 3
+        }
+        model_save_name = "lesion_lstm"
 
     """ Logging parameters """
     train_log_interval = 10
