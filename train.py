@@ -12,6 +12,7 @@ from utils.train_plotting import *
 import argparse
 import requests
 import json
+import os
 
 def check_if_mlflow_is_running(config):
     try:
@@ -236,7 +237,7 @@ if __name__ == "__main__":
             **{key: getattr(config, key) for key in dir(config) if not key.startswith("_")}
         })
         mlflow.log_artifact(args.config)
-        mlflow.log_artifact("train.py")
+        mlflow.log_artifact(os.path.basename(__file__))
 
         losses = train_inr(
             model, 

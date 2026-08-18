@@ -32,6 +32,11 @@ def _nice_scale_length_mm(pixel_extent_mm):
             return candidate
     return 10 * magnitude
 
+def _is_lstm_model(model):
+    """Detect if model is LesionLSTM/LesionLatentLSTM vs INR."""
+    model_class_name = model.__class__.__name__
+    return 'LSTM' in model_class_name or 'Latent' in model_class_name
+
 def plot_predictions(v_preds, v_labels, v_coords, epoch, title=""):
     fig, axes = plt.subplots(2, 2, figsize=(12, 12))
 
@@ -225,13 +230,13 @@ def _heatmap_pixel_spacing(geometry: ReferenceGeometry, label_shape: np.ndarray,
 # ---------------------------------------------------------------------------
 # Step 2: model inference + label matching over time
 # ---------------------------------------------------------------------------
- 
-def _predict_heatmap(model, patient_idx_tensor, t, x, y, z, side_length, batch_size=150_000):
+
+def _predict_heatmap_inr(model, patient_idx_tensor, t, x, y, z, side_length, batch_size=150_000):
     """Query the INR for one timepoint, in chunks to bound memory use."""
     time_col = np.full_like(x, t)
     coords = np.stack([x, y, z, time_col], axis=1)
     coords_tensor = torch.from_numpy(coords).float().to(next(model.parameters()).device).unsqueeze(0)
- 
+
     chunks = []
     with torch.no_grad():
         for start in range(0, coords_tensor.shape[1], batch_size):
@@ -239,6 +244,102 @@ def _predict_heatmap(model, patient_idx_tensor, t, x, y, z, side_length, batch_s
             chunks.append(model(chunk, patient_idx_tensor).cpu().numpy())
     preds = np.concatenate(chunks, axis=1)
     return preds.reshape(side_length, side_length)
+
+
+def _extract_2d_slice_from_grid(grid_3d, lesion_z_voxel):
+    """Extract a 2D axial slice at lesion height from a 3D grid.
+    
+    Args:
+        grid_3d: [D, H, W] or [1, D, H, W] tensor or array
+        lesion_z_voxel: z index for slicing
+        
+    Returns:
+        2D slice [H, W]
+    """
+    if isinstance(grid_3d, torch.Tensor):
+        grid_3d = grid_3d.cpu().numpy()
+    
+    # Handle batch dimension if present
+    if grid_3d.ndim == 4:
+        grid_3d = grid_3d[0]  # Take first batch
+    elif grid_3d.ndim == 5:  # [B, T, 1, D, H, W] - take last time step
+        grid_3d = grid_3d[0, -1, 0]
+    elif grid_3d.ndim == 3 and grid_3d.shape[0] == 1:
+        grid_3d = grid_3d[0]
+        
+    # Extract z slice
+    z_size = grid_3d.shape[0] if grid_3d.ndim == 3 else grid_3d.shape[-1]
+    z_idx = int(np.clip(round(lesion_z_voxel), 0, z_size - 1))
+    
+    if grid_3d.ndim == 3:
+        return grid_3d[z_idx]
+    else:
+        return grid_3d[..., z_idx]
+
+
+def _predict_grids_lstm(model, patient_idx_tensor, config, time_points, observed_grids, 
+                        observed_times, lesion_z_voxel):
+    """Predict LSTM grids over time using autoregressive rollout.
+    
+    For LSTM: runs one forward pass per time point, extracting 2D slices.
+    Much more memory-efficient than coordinate queries.
+    
+    Args:
+        model: LesionLSTM or LesionLatentLSTM
+        patient_idx_tensor: [1] patient ID
+        config: config object with device
+        time_points: array of target times to predict at
+        observed_grids: [1, T_obs, 1, D, H, W] observed history
+        observed_times: [1, T_obs] observed timestamps
+        lesion_z_voxel: lesion z position for 2D slice extraction
+        
+    Returns:
+        heatmaps: [T, S, S] 2D slices at each time point
+    """
+    device = config.device
+    model.eval()
+    heatmaps = []
+    
+    with torch.no_grad():
+        for t in time_points:
+            # Build time array: observed times + target time
+            full_times = torch.cat([
+                observed_times,
+                torch.tensor([[t]], dtype=torch.float32, device=device)
+            ], dim=1)
+            
+            # Run model with teacher forcing on history, predict one step ahead
+            preds = model(
+                observed_grids.to(device),
+                full_times.to(device),
+                patient_idx_tensor.to(device),
+                teacher_forcing=True,
+                n_future=1
+            )  # [1, T_obs, 1, D, H, W]
+            
+            # Extract the last predicted step (the future prediction)
+            last_pred = preds[:, -1]  # [1, 1, D, H, W]
+            
+            # Apply sigmoid to convert logits to probabilities
+            last_pred = torch.sigmoid(last_pred)
+            
+            # Extract 2D slice at lesion height
+            slice_2d = _extract_2d_slice_from_grid(last_pred, lesion_z_voxel)
+            heatmaps.append(slice_2d)
+            
+            # Clear GPU memory
+            del preds, last_pred
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    heatmaps = np.array(heatmaps)
+    return heatmaps
+
+
+def _predict_heatmap(model, patient_idx_tensor, t, x, y, z, side_length, batch_size=150_000):
+    """Legacy function for compatibility - detects model type and routes accordingly."""
+    if _is_lstm_model(model):
+        raise ValueError("Use _predict_grids_lstm for LSTM models, not _predict_heatmap")
+    return _predict_heatmap_inr(model, patient_idx_tensor, t, x, y, z, side_length, batch_size)
  
  
 def _find_label_at_time(full_matrix_labels, t, lesion_z_voxel):
@@ -283,39 +384,142 @@ def _build_query_grid(label_shape: np.ndarray, affine: np.ndarray, geometry: Ref
  
 def _assemble_time_series(model, patient_idx_tensor, config, full_matrix_labels,
                            label_shape, affine, geometry, side_length) -> LesionTimeSeries:
+    """Assemble time series, routing to INR or LSTM implementation based on model type."""
+    if _is_lstm_model(model):
+        return _assemble_time_series_lstm(
+            model, patient_idx_tensor, config, full_matrix_labels, 
+            label_shape, affine, geometry, side_length
+        )
+    else:
+        return _assemble_time_series_inr(
+            model, patient_idx_tensor, config, full_matrix_labels,
+            label_shape, affine, geometry, side_length
+        )
+
+
+def _assemble_time_series_lstm(model, patient_idx_tensor, config, full_matrix_labels,
+                                label_shape, affine, geometry, side_length) -> LesionTimeSeries:
+    """Assemble time series for LSTM by loading observation grids and predicting forward.
+    
+    MEMORY EFFICIENT: One forward pass per time point, extracts 2D slices directly.
+    No coordinate queries needed.
+    """
+    from .dataloader_lstm import LesionSequenceDataset
+    from .mri_dataloader import MRI_Dataloader
+    
     lesion_z_voxel = _compute_lesion_z_voxel(full_matrix_labels)
-    time_points = np.linspace(0, full_matrix_labels[-1][1] + 180, config.time_evolution_steps)
- 
-    x, y, z = _build_query_grid(label_shape, affine, geometry, lesion_z_voxel, side_length)
- 
-    heatmaps, label_slices, volumes_3d, lesion_sizes = [], [], [], []
+    
+    # Use time points from labels (observation times + extrapolation into future)
+    label_times = np.array([day for _, day in full_matrix_labels])
+    last_time = label_times[-1]
+    future_days = config.time_evolution_steps - len(label_times)
+    max_future = min(last_time + 365, last_time * 1.5)  # Don't predict too far
+    
+    if future_days > 0:
+        future_times = np.linspace(last_time + 1, max_future, future_days)
+        time_points = np.concatenate([label_times, future_times])
+    else:
+        time_points = label_times[:config.time_evolution_steps]
+    
+    # Load observed grids (all labels)
+    observed_grids_list = []
+    observed_times_list = []
+    
+    for labels, day in full_matrix_labels[:config.max_sequence_len]:  # Use history up to max sequence length
+        # Resize label to LSTM grid size
+        grid = ndimage.zoom(labels.astype(float), 
+                           np.array(config.lstm_grid_size) / np.array(labels.shape),
+                           order=1)
+        observed_grids_list.append(torch.from_numpy(grid[None, None]).float())  # [1, D, H, W]
+        observed_times_list.append(day)
+    
+    observed_grids = torch.stack(observed_grids_list, dim=1)  # [1, T, 1, D, H, W]
+    observed_times = torch.tensor([observed_times_list], dtype=torch.float32)  # [1, T]
+    
+    # Predict grids over time
+    heatmaps = _predict_grids_lstm(model, patient_idx_tensor, config, 
+                                   time_points, observed_grids, observed_times, 
+                                   lesion_z_voxel)
+    
+    # Normalize heatmaps
+    heatmap_peak = np.max(heatmaps, axis=(1, 2), keepdims=True)
+    heatmap_peak[heatmap_peak == 0] = 1.0
+    heatmaps = heatmaps / heatmap_peak
+    
+    # Get labels at each time point
+    label_slices, volumes_3d, lesion_sizes = [], [], []
     for t in time_points:
-        heatmaps.append(_predict_heatmap(model, patient_idx_tensor, t, x, y, z, side_length))
         volume, label_slice = _find_label_at_time(full_matrix_labels, t, lesion_z_voxel)
         volumes_3d.append(volume)
         label_slices.append(label_slice)
         lesion_sizes.append(float(volume.sum()))
- 
+    
+    volumes_3d = np.array(volumes_3d)
+    label_slices = np.array(label_slices)
+    lesion_sizes = np.array(lesion_sizes, dtype=float)
+    
+    voxel_volume_mm3 = np.prod(geometry.voxel_spacing)
+    lesion_sizes_cm3 = lesion_sizes * voxel_volume_mm3 / 1000.0
+    
+    topdown_maps = [_build_topdown_height_map(volume) for volume in volumes_3d]
+    
+    change_points = np.zeros(len(time_points), dtype=bool)
+    change_points[1:] = lesion_sizes_cm3[1:] != lesion_sizes_cm3[:-1]
+    
+    spacing_i, spacing_j = _heatmap_pixel_spacing(geometry, label_shape, side_length)
+    heatmap_aspect = spacing_j / spacing_i
+    
+    return LesionTimeSeries(
+        time_points=time_points,
+        heatmaps=heatmaps,
+        heatmap_aspect=heatmap_aspect,
+        heatmap_pixel_spacing_mm=(spacing_i, spacing_j),
+        label_slices=label_slices,
+        volumes_3d=volumes_3d,
+        topdown_maps=topdown_maps,
+        lesion_sizes_cm3=lesion_sizes_cm3,
+        change_points=change_points,
+        lesion_z_voxel=lesion_z_voxel,
+        geometry=geometry,
+    )
+
+
+def _assemble_time_series_inr(model, patient_idx_tensor, config, full_matrix_labels,
+                               label_shape, affine, geometry, side_length) -> LesionTimeSeries:
+    """Original INR-based time series assembly using coordinate queries."""
+    lesion_z_voxel = _compute_lesion_z_voxel(full_matrix_labels)
+    time_points = np.linspace(0, full_matrix_labels[-1][1] + 180, config.time_evolution_steps)
+
+    x, y, z = _build_query_grid(label_shape, affine, geometry, lesion_z_voxel, side_length)
+
+    heatmaps, label_slices, volumes_3d, lesion_sizes = [], [], [], []
+    for t in time_points:
+        heatmaps.append(_predict_heatmap_inr(model, patient_idx_tensor, t, x, y, z, side_length))
+        volume, label_slice = _find_label_at_time(full_matrix_labels, t, lesion_z_voxel)
+        volumes_3d.append(volume)
+        label_slices.append(label_slice)
+        lesion_sizes.append(float(volume.sum()))
+
     heatmaps = np.array(heatmaps)
     heatmap_peak = np.max(heatmaps, axis=(1, 2))
     heatmap_peak[heatmap_peak == 0] = 1.0
     heatmaps = heatmaps / heatmap_peak[:, np.newaxis, np.newaxis]
- 
+
     volumes_3d = np.array(volumes_3d)
     label_slices = np.array(label_slices)
     lesion_sizes = np.array(lesion_sizes, dtype=float)
- 
+
     voxel_volume_mm3 = np.prod(geometry.voxel_spacing)
-    lesion_sizes_cm3 = lesion_sizes * voxel_volume_mm3 / 1000.0  # mm^3 -> cm^3
- 
+    lesion_sizes_cm3 = lesion_sizes * voxel_volume_mm3 / 1000.0
+
     topdown_maps = [_build_topdown_height_map(volume) for volume in volumes_3d]
- 
+
     change_points = np.zeros(len(time_points), dtype=bool)
     change_points[1:] = lesion_sizes_cm3[1:] != lesion_sizes_cm3[:-1]
- 
+
     spacing_i, spacing_j = _heatmap_pixel_spacing(geometry, label_shape, side_length)
     heatmap_aspect = spacing_j / spacing_i
- 
+
     return LesionTimeSeries(
         time_points=time_points,
         heatmaps=heatmaps,

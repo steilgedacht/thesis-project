@@ -19,13 +19,23 @@ class Config:
 
     from utils.loss_bce_dice import Loss_BCE_Dice
 
-    # Optional class-weighting for the BCE component. Set to None to disable.
-    # For a heavily imbalanced dataset set e.g. bce_pos_weight = 5.0
-    bce_pos_weight = None
+    # Dynamic class weighting based on ground truth lesion proportion
+    # The loss will compute pos_weight = (negative_pixels / positive_pixels)
+    # for each batch, automatically adapting to varying lesion sizes
+    use_dynamic_pos_weight = True
 
-    # Instantiate the loss, passing the pos_weight if provided so BCE uses it
-    loss_fn = Loss_BCE_Dice(pos_weight=bce_pos_weight)
+    # Total Variation loss weight for spatial smoothness
+    # Encourages neighboring voxels to have similar predictions
+    # Reduces noise and promotes coherent lesion regions
     use_total_variation_loss = True
+    tv_loss_weight = 0.01  # Scale relative to BCE+Dice (try 0.001-0.05)
+
+    # Instantiate loss with dynamic weighting
+    loss_fn = Loss_BCE_Dice(
+        use_dynamic_pos_weight=use_dynamic_pos_weight,
+        use_tv_loss=use_total_variation_loss,
+        tv_weight=tv_loss_weight
+    )
 
 
     """ Dataloading parameters """
@@ -46,11 +56,12 @@ class Config:
     background_samples_proportion = 1
 
     lstm_grid_size = (64, 64, 64)
+    max_sequence_len = 6  # Max observation history for plotting
     dataset_params = {
         "grid_size": lstm_grid_size,
         "margin_mm": 20.0,
         "min_extent_mm": 80.0,
-        "max_sequence_len" : 6,
+        "max_sequence_len" : max_sequence_len,
         "device": device
     }
 
@@ -60,20 +71,20 @@ class Config:
     # If True, use an autoencoder to encode each visit into a latent vector and
     # run an RNN in latent space (encoder + latent-LSTM + decoder). If False,
     # use the ConvLSTM that operates on full grids.
-    use_autoencoder_lstm = False
+    use_autoencoder_lstm = True
+
 
     if use_autoencoder_lstm:
         model = LesionLatentLSTM
         model_params = {
-            "grid_size": lstm_grid_size,
-            "latent_dim": 128,
+            "latent_dim": 256,
             "hidden_dim": 256,
             "n_layers": 2,
             "time_freqs": 6,
             "max_t": 3650.0,
             # encoder/decoder params can be tuned; keep sensible defaults
-            "encoder_params": {"base_channels": 16},
-            "decoder_params": {"base_channels": 16, "out_size": lstm_grid_size},
+            "encoder_params": {"base_channels": 32},
+            "decoder_params": {"base_channels": 32, "out_size": lstm_grid_size},
             "use_patient_embedding": False,
         }
         model_save_name = "lesion_lstm_autoencoder"

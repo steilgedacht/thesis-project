@@ -196,7 +196,7 @@ class LesionLSTM(nn.Module):
 # --- Autoencoder + Latent-LSTM variant -------------------------------------------------
 class Encoder3D(nn.Module):
     """Simple 3D conv encoder that maps a 1-channel occupancy grid to a latent vector."""
-    def __init__(self, in_channels=1, latent_dim=128, base_channels=16):
+    def __init__(self, in_channels=1, latent_dim=256, base_channels=64):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1),
@@ -218,7 +218,7 @@ class Encoder3D(nn.Module):
 
 class Decoder3D(nn.Module):
     """Simple decoder that maps latent vector back to a 1-channel occupancy grid via upsampling convs."""
-    def __init__(self, latent_dim=128, out_channels=1, base_channels=16, out_size=(64,64,64)):
+    def __init__(self, latent_dim=256, out_channels=1, base_channels=64, out_size=(64,64,64)):
         super().__init__()
         self.out_size = out_size
         self.fc = nn.Linear(latent_dim, base_channels*4)

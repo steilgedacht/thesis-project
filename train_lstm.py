@@ -12,6 +12,7 @@ from utils.train_plotting import *
 import argparse
 import requests
 import json
+import os
 
 def check_if_mlflow_is_running(config):
     try:
@@ -32,7 +33,8 @@ def load_config(config_path: str):
 
 
 def validate_polation(data_loader, text, global_step, criterion):
-    loss = 0
+    bce_loss = 0
+    dice_loss = 0
     with torch.no_grad():
         for history_grids, history_times, target_grid, target_time, patient_idx in tqdm(
             data_loader, desc=text, total=len(data_loader)
@@ -48,11 +50,18 @@ def validate_polation(data_loader, text, global_step, criterion):
             preds = model(history_grids, full_times, patient_idx, teacher_forcing=True, n_future=1)
             target_pred = preds[:, -1]  # [1, 1, D, H, W] logits for the held-out step
 
-            loss += criterion.dice_loss(target_pred, target_grid).item()
+            # Use the same loss as training (BCE + Dice) for consistent monitoring
+            bce_loss += criterion.loss_fn_1(target_pred, target_grid).item()
+            dice_loss += criterion.dice_loss(target_pred, target_grid).item()
 
+    avg_bce = bce_loss / len(data_loader)
+    avg_dice = dice_loss / len(data_loader)
+    
     mlflow.log_metrics({
-        text.lower().replace(" ", "_") + "_dice_loss"  : loss / len(data_loader),
-        text.lower().replace(" ", "_") + "_dice_score" : 1 - loss / len(data_loader)
+        text.lower().replace(" ", "_") + "_bce_loss"  : avg_bce,
+        text.lower().replace(" ", "_") + "_dice_loss" : avg_dice,
+        text.lower().replace(" ", "_") + "_total_loss": avg_bce + avg_dice,
+        text.lower().replace(" ", "_") + "_dice_score": 1 - avg_dice,
     }, step=global_step)
 
 def train_lstm(
@@ -90,9 +99,6 @@ def train_lstm(
             grids = grids.to(config.device)          # [1, T, 1, D, H, W]
             times = times.to(config.device)          # [1, T]
             patient_idx = patient_idx.to(config.device)
-
-            if grids.shape[1] < 2:
-                continue   # need at least 2 visits to form one transition
 
             predictions = model(grids, times, patient_idx, teacher_forcing=True)  # [1, T-1, 1, D, H, W]
             targets = grids[:, 1:]                                                # ground-truth next-frame at each step
@@ -247,7 +253,7 @@ if __name__ == "__main__":
             **{key: getattr(config, key) for key in dir(config) if not key.startswith("_")}
         })
         mlflow.log_artifact(args.config)
-        mlflow.log_artifact("train.py")
+        mlflow.log_artifact(os.path.basename(__file__))
 
         losses = train_lstm(
             model, 
