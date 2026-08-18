@@ -10,7 +10,7 @@ MERGE_SCRIPT="utils/merge_dbs.py"
 # 1. Push code changes to the remote
 echo "Syncing code to $REMOTE_HOST..."
 rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='data' --exclude='.archive' \
-      --exclude='mlruns' --exclude='mlflow.db' --exclude='mlartifacts' --exclude='server' \
+      --exclude='mlruns' --exclude='mlflow.db' --exclude='mlartifacts' --exclude='nnunet_2' --exclude='server' \
       . "${REMOTE_HOST}:${REMOTE_PROJECT_DIR}"
 
 # 2. Pull down only changed files

@@ -578,3 +578,188 @@ def plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=Fals
     mlflow.log_artifact(output_path)
     plt.close(artists.fig)
  
+
+
+#############################################
+## LSTM
+############################################
+
+@dataclass
+class CanonicalGridGeometry:
+    """The LSTM's per-trajectory canonical resampling grid. Must match
+    LesionSequenceDataset exactly -- same center/extent it computed for this
+    trajectory (read off trj.canonical_center / trj.canonical_extent_mm,
+    set by Plotting_LesionSequenceDataset), same grid_size the model was
+    trained/run with."""
+    center: np.ndarray                 # mm, canonical crop center
+    extent_mm: float                   # mm, cubic crop side length
+    grid_size: Tuple[int, int, int]
+
+
+def _lesion_z_voxel_to_phys(lesion_z_voxel, label_shape, affine):
+    """Physical z (mm) of the lesion's representative z voxel index, with the
+    other axes held at the volume's center (only z matters for picking a
+    display height, but the affine isn't necessarily perfectly axis-aligned
+    so this goes through the full transform rather than just scaling z)."""
+    center_voxel = (np.asarray(label_shape) - 1) / 2.0
+    voxel = center_voxel.copy()
+    voxel[2] = lesion_z_voxel
+    phys = affine[:3, :3] @ voxel + affine[:3, 3]
+    return phys[2]
+
+
+def _lesion_z_to_canonical_index(lesion_z_phys, canonical_geom: CanonicalGridGeometry):
+    """Map a physical z coordinate (mm) into the voxel index along axis 2 of
+    the LSTM's canonical resampled grid. Must mirror exactly how
+    LesionSequenceDataset._resample_to_grid built that axis:
+    linspace(-extent/2, extent/2, grid_size) + canonical_center, with the
+    (d, h, w) grid axes assumed to align with physical (x, y, z) in that
+    order -- same assumption the dataset's resampling already makes."""
+    axis_len = canonical_geom.grid_size[2]
+    if axis_len <= 1:
+        return 0
+    lin = np.linspace(-canonical_geom.extent_mm / 2, canonical_geom.extent_mm / 2, axis_len)
+    lin = lin + canonical_geom.center[2]
+    return int(np.argmin(np.abs(lin - lesion_z_phys)))
+
+
+def _predict_lstm_grid_sequence(model, trj, query_times, canonical_geom: CanonicalGridGeometry):
+    """
+    Dense, LSTM-native equivalent of `_predict_heatmap`. The LSTM is causal
+    and sequential, not a continuous field, so there's no single batched
+    query like the INR had. For each query time t: teacher-force every REAL
+    observed visit strictly before t through the model, then take one
+    autoregressive step (n_future=1) targeting t. That's a full forward pass
+    per query time -- O(len(query_times) * len(real_visits)) cost, not free,
+    but it's the honest way to ask "what would the model have forecast if it
+    only knew about visits before t."
+
+    Query times at or before the first real visit fall back to that real
+    grid directly -- the model has no way to predict with zero history.
+
+    Returns: [len(query_times), D, H, W] occupancy probabilities on the
+    LSTM's canonical grid (not the label volume's native resolution/frame).
+    """
+    device = next(model.parameters()).device
+    real_times = trj.times            # [T_real], chronological
+    real_grids = trj.grids            # [T_real, 1, D, H, W]
+    patient_idx = torch.tensor([trj.embedding_id], dtype=torch.long, device=device)
+
+    pred_volumes = []
+    with torch.no_grad():
+        for t in query_times:
+            if t <= real_times[0]:
+                pred_volumes.append(real_grids[0, 0])
+                continue
+
+            n_hist = int((real_times < t).sum())
+            hist_grids = torch.from_numpy(real_grids[:n_hist]).unsqueeze(0).float().to(device)
+            hist_times = torch.from_numpy(real_times[:n_hist]).unsqueeze(0).float().to(device)
+            target_time = torch.tensor([[t]], dtype=torch.float32, device=device)
+            full_times = torch.cat([hist_times, target_time], dim=1)
+
+            preds = model(hist_grids, full_times, patient_idx, teacher_forcing=True, n_future=1)
+            pred_volumes.append(torch.sigmoid(preds[0, -1, 0]).cpu().numpy())
+
+    return np.stack(pred_volumes, axis=0)
+
+
+def _assemble_lstm_time_series(model, trj, config, full_matrix_labels,
+                                label_shape, affine, geometry, canonical_geom) -> LesionTimeSeries:
+    lesion_z_voxel = _compute_lesion_z_voxel(full_matrix_labels)
+    lesion_z_phys = _lesion_z_voxel_to_phys(lesion_z_voxel, label_shape, affine)
+    canonical_z_idx = _lesion_z_to_canonical_index(lesion_z_phys, canonical_geom)
+
+    real_times = trj.times
+    # Starts at the first real visit, not day 0 -- unlike the INR's
+    # continuous field, the model literally has no basis to predict before
+    # it has seen any data.
+    time_points = np.linspace(real_times.min(), real_times[-1] + 180, config.time_evolution_steps)
+
+    pred_volumes = _predict_lstm_grid_sequence(model, trj, time_points, canonical_geom)  # [T, D, H, W]
+    heatmaps = pred_volumes[:, :, :, canonical_z_idx]  # z-slice -> [T, D, H]
+
+    label_slices, volumes_3d, lesion_sizes = [], [], []
+    for t in time_points:
+        volume, label_slice = _find_label_at_time(full_matrix_labels, t, lesion_z_voxel)
+        volumes_3d.append(volume)
+        label_slices.append(label_slice)
+        lesion_sizes.append(float(volume.sum()))
+
+    heatmap_peak = np.max(heatmaps, axis=(1, 2))
+    heatmap_peak[heatmap_peak == 0] = 1.0
+    heatmaps = heatmaps / heatmap_peak[:, np.newaxis, np.newaxis]
+
+    volumes_3d = np.array(volumes_3d)
+    label_slices = np.array(label_slices)
+    lesion_sizes = np.array(lesion_sizes, dtype=float)
+
+    voxel_volume_mm3 = np.prod(geometry.voxel_spacing)
+    lesion_sizes_cm3 = lesion_sizes * voxel_volume_mm3 / 1000.0
+
+    topdown_maps = [_build_topdown_height_map(volume) for volume in volumes_3d]
+
+    change_points = np.zeros(len(time_points), dtype=bool)
+    change_points[1:] = lesion_sizes_cm3[1:] != lesion_sizes_cm3[:-1]
+
+    # Canonical grid is resampled with the same physical extent along every
+    # axis (cubic crop), so in-plane spacing is isotropic -- aspect is 1.
+    axis_len = canonical_geom.grid_size[0]
+    spacing = canonical_geom.extent_mm / max(axis_len - 1, 1)
+
+    return LesionTimeSeries(
+        time_points=time_points,
+        heatmaps=heatmaps,
+        heatmap_aspect=1.0,
+        heatmap_pixel_spacing_mm=(spacing, spacing),
+        label_slices=label_slices,
+        volumes_3d=volumes_3d,
+        topdown_maps=topdown_maps,
+        lesion_sizes_cm3=lesion_sizes_cm3,
+        change_points=change_points,
+        lesion_z_voxel=lesion_z_voxel,
+        geometry=geometry,
+    )
+
+
+def plot_lesion_time_evolution_lstm(model, epoch, trj, config, final_side_length=False):
+    """Render a multi-panel GIF of predicted lesion evolution vs. nnUNet
+    ground-truth labels over time, and log it to mlflow.
+
+    `trj` must come from Plotting_LesionSequenceDataset: needs trj.grids,
+    trj.times, trj.embedding_id, trj.canonical_center, trj.canonical_extent_mm.
+
+    `final_side_length` is currently unused -- heatmap resolution is now
+    fixed to the LSTM's canonical grid_size rather than a configurable
+    query-grid resolution, since the model can only emit predictions on the
+    grid it was trained on. Kept in the signature for call-site compatibility.
+    """
+    patient_idx = trj.embedding_id
+
+    full_matrix_labels, affine = _load_full_matrix_with_affine(trj)
+    label_shape = np.array(full_matrix_labels[0][0].shape)  # (X, Y, Z)
+
+    geometry = _compute_reference_geometry(label_shape, affine)
+    canonical_geom = CanonicalGridGeometry(
+        center=trj.canonical_center,
+        extent_mm=trj.canonical_extent_mm,
+        grid_size=config.lstm_grid_size,
+    )
+
+    data = _assemble_lstm_time_series(
+        model, trj, config, full_matrix_labels, label_shape, affine, geometry, canonical_geom
+    )
+
+    artists = _build_figure(data, patient_idx)
+
+    def update(frame_idx):
+        return _update_frame(frame_idx, data, artists, patient_idx)
+
+    output_path = (
+        f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_"
+        f"{trj.patient_id}_{patient_idx}_lesion_{trj.label_id}.gif"
+    )
+    _save_gif(artists.fig, update, len(data.heatmaps), output_path)
+
+    mlflow.log_artifact(output_path)
+    plt.close(artists.fig)

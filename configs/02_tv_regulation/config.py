@@ -36,8 +36,8 @@ class Config:
 
     from utils.loss_bce_dice_tv import Loss_BCE_Dice_TV
     loss_fn = Loss_BCE_Dice_TV(
-        lambda_space=1e-2, 
-        lambda_time=0.5
+        lambda_space=5e-2, 
+        lambda_time=0.75
     )
     use_total_variation_loss = True
     
