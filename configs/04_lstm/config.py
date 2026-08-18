@@ -18,7 +18,13 @@ class Config:
     only_train = False
 
     from utils.loss_bce_dice import Loss_BCE_Dice
-    loss_fn = Loss_BCE_Dice()
+
+    # Optional class-weighting for the BCE component. Set to None to disable.
+    # For a heavily imbalanced dataset set e.g. bce_pos_weight = 5.0
+    bce_pos_weight = None
+
+    # Instantiate the loss, passing the pos_weight if provided so BCE uses it
+    loss_fn = Loss_BCE_Dice(pos_weight=bce_pos_weight)
     use_total_variation_loss = True
 
 
