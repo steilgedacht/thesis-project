@@ -3,8 +3,8 @@ import torch
 class Config:
     """ Tracking parameters """
     mlflow_tracking_uri = "http://127.0.0.1:5000"
-    mlflow_experiment_name = "Lesion_INR_Training"
-    mlflow_run_name = "Runname" 
+    mlflow_experiment_name = "Lesion_INR_MetaLearning"
+    mlflow_run_name = "MAML_INR" 
 
 
     """ Dataloading parameters """
@@ -26,7 +26,7 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 2
+    epochs = 100
     background_samples = 3000
     lr = 1e-4
     weight_decay = 1e-6
@@ -51,9 +51,13 @@ class Config:
         tv_weight=tv_loss_weight
     )
 
+    """ Meta-Learning specific parameters """
+    # Inner loop (patient adaptation) hyperparameters
+    inner_lr = 0.01                # Learning rate for inner loop SGD
+    inner_steps = 3                # Number of inner loop update steps per task
 
     """ Model parameters """
-    from utils.model_inr import LesionINR
+    from utils.model_inr_meta import LesionINR
     model = LesionINR
     model_params = {
         "latent_dim" : 128,
@@ -65,7 +69,7 @@ class Config:
         "time_freqs" : 6,
         "max_t" : 3650.0,
     }
-    model_save_name = "lesion_inr_model"
+    model_save_name = "lesion_inr_meta_learning"
 
 
     """ Logging parameters """

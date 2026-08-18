@@ -10,6 +10,7 @@ import argparse
 import requests
 import json
 import higher  # <-- Required for Meta-Learning inner loops
+import os
 
 # Utility imports (Assuming these are in your local directory)
 from utils.mri_dataloader import MRI_Dataloader
@@ -34,7 +35,15 @@ def load_config(config_path: str):
     return config_module.Config()
 
 def validate_polation(data_loader, text, global_step, criterion, model, config):
-    loss = 0
+    """
+    Test-time adaptation validation: adapt to support set, evaluate on query set.
+    Uses the same loss function as training for consistency.
+    """
+    bce_loss_total = 0.0
+    dice_loss_total = 0.0
+    tv_loss_total = 0.0
+    num_batches = 0
+    
     model.eval()
     
     # Meta-Learning Hyperparameters for Test-Time Adaptation
@@ -58,23 +67,49 @@ def validate_polation(data_loader, text, global_step, criterion, model, config):
         
         # Test-time adaptation (track_higher_grads=False saves memory since we don't update meta-weights here)
         with higher.innerloop_ctx(model, inner_optimizer, copy_initial_weights=False, track_higher_grads=False) as (fmodel, diffopt):
-            # Adapt to the patient's support scans
+            # Adapt to the patient's support scans using the full loss (BCE + Dice + TV)
             for _ in range(inner_steps):
                 supp_preds = fmodel(supp_coords)
-                inner_loss = criterion.dice_loss(supp_preds, supp_labels) # Using dice_loss for validation adaptation
+                inner_loss = criterion(supp_preds, supp_labels)
                 diffopt.step(inner_loss)
 
             # Evaluate on the patient's query scans
             with torch.no_grad():
                 query_preds = fmodel(query_coords)
-                outer_loss = criterion.dice_loss(query_preds, query_labels).item()
-                loss += outer_loss
+                # Use full loss for evaluation consistency with training
+                eval_loss = criterion(query_preds, query_labels)
+                
+                # Track individual components
+                bce_loss_total += criterion.loss_bce.item() if isinstance(criterion.loss_bce, torch.Tensor) else criterion.loss_bce
+                dice_loss_total += criterion.loss_dice.item() if isinstance(criterion.loss_dice, torch.Tensor) else criterion.loss_dice
+                tv_loss_total += (criterion.loss_tv.item() if isinstance(criterion.loss_tv, torch.Tensor) else criterion.loss_tv) if hasattr(criterion, 'loss_tv') else 0.0
+                num_batches += 1
 
-    avg_loss = loss / len(data_loader) if len(data_loader) > 0 else 0
+    # Calculate averages
+    num_batches = max(num_batches, 1)
+    avg_bce = bce_loss_total / num_batches
+    avg_dice = dice_loss_total / num_batches
+    avg_tv = tv_loss_total / num_batches
+    avg_total = avg_bce + avg_dice + avg_tv
+    
     mlflow.log_metrics({
-        text.lower().replace(" ", "_") + "_dice_loss"  : avg_loss,
-        text.lower().replace(" ", "_") + "_dice_score" : 1 - avg_loss
+        text.lower().replace(" ", "_") + "_bce_loss"  : avg_bce,
+        text.lower().replace(" ", "_") + "_dice_loss" : avg_dice,
+        text.lower().replace(" ", "_") + "_dice_score": 1 - avg_dice,
     }, step=global_step)
+    
+    # Log TV loss if enabled
+    if hasattr(criterion, 'use_tv_loss') and criterion.use_tv_loss:
+        mlflow.log_metrics({
+            text.lower().replace(" ", "_") + "_tv_loss"   : avg_tv,
+            text.lower().replace(" ", "_") + "_total_loss": avg_total,
+        }, step=global_step)
+    
+    # Log dynamic pos_weight if enabled
+    if hasattr(criterion, 'use_dynamic_pos_weight') and criterion.use_dynamic_pos_weight:
+        mlflow.log_metrics({
+            text.lower().replace(" ", "_") + "_dynamic_pos_weight": criterion.current_pos_weight,
+        }, step=global_step)
 
 
 def train_inr(
@@ -85,6 +120,25 @@ def train_inr(
         plotting_LesionDataset, 
         config,
     ):
+    """
+    Meta-Learning training loop for INR using MAML-style approach.
+    
+    Architecture:
+    - INNER LOOP (Patient-specific adaptation):
+      Adapts model parameters to patient support set using SGD.
+    
+    - OUTER LOOP (Meta-weight update):
+      Updates meta-weights (theta_meta) based on performance on query set,
+      enabling rapid adaptation to new patients.
+    
+    Loss Function:
+    - Uses full Loss_BCE_Dice with dynamic pos_weight and TV regularization
+    - Inner loop: Adapts on support set losses
+    - Outer loop: Computes meta-gradient on query set losses
+    - Both use same loss function for consistency
+    
+    Uses `higher` library for differentiable inner loop computation.
+    """
     # Outer optimizer (updates theta_meta)
     optimizer = optim.AdamW(
         model.parameters(), 
@@ -131,14 +185,15 @@ def train_inr(
                 
                 # --- INNER LOOP (Patient Adaptation) ---
                 for _ in range(inner_steps):
-                    # Notice: patient_idx is no longer passed to the model
                     supp_preds = fmodel(supp_coords)
-                    inner_loss = criterion(supp_preds, supp_labels, coords=supp_coords if config.use_total_variation_loss else None)
+                    # Use full loss (BCE + Dice + TV) for inner loop adaptation
+                    inner_loss = criterion(supp_preds, supp_labels)
                     diffopt.step(inner_loss)
 
                 # --- OUTER LOOP (Meta-Weight Update) ---
                 query_preds = fmodel(query_coords)
-                outer_loss = criterion(query_preds, query_labels, coords=query_coords if config.use_total_variation_loss else None)
+                # Use full loss (BCE + Dice + TV) for meta-weight update
+                outer_loss = criterion(query_preds, query_labels)
 
                 if outer_loss.requires_grad:
                     outer_loss.backward()
@@ -151,7 +206,7 @@ def train_inr(
                 mlflow.log_metrics(
                     {
                         "training_loss" : outer_loss.item(),
-                        **criterion.loss_to_report,
+                        **criterion.loss_to_report,  # Includes BCE, Dice, TV, pos_weight components
                         # Approximation based on the query set predictions
                         "wrongly_predicted_total_volume" : (query_preds > 0.5).sum().item() - (query_labels > 0.5).sum().item(),
                     },
@@ -284,7 +339,7 @@ if __name__ == "__main__":
             **{key: getattr(config, key) for key in dir(config) if not key.startswith("_")}
         })
         mlflow.log_artifact(args.config)
-        mlflow.log_artifact("train.py")
+        mlflow.log_artifact(os.path.basename(__file__))
 
         losses = train_inr(
             model, 

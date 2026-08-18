@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -n 8
 #SBATCH --gres=gpu:1
-#SBATCH -J inr_lstm
+#SBATCH -J inr_meta
 #SBATCH --partition=full_optima
 #SBATCH --mem=64G
 #SBATCH --exclude=cn1,cn2,cn5,on1,vn1,cn6,on2,on3,vn2
@@ -25,4 +25,4 @@ singularity instance start --nv thesis.sif "$INSTANCE_NAME"
 trap 'singularity instance stop "$INSTANCE_NAME"' EXIT
 
 singularity exec --nv instance://"$INSTANCE_NAME" \
-    bash -c "cd /home/optima/bbergmann/projects/thesis && python3.11 train_lstm.py --config configs/04_lstm/config.py"
+    bash -c "cd /home/optima/bbergmann/projects/thesis && python3.11 train_meta.py --config configs/05_meta_learning/config.py"
