@@ -72,3 +72,15 @@ ssh node
 sh start_mlflow.sh
 sh sync_server.sh
 ```
+
+## Build Container for Segmentation
+
+```sh
+salloc -n8 --gres=gpu:1 -J singularity_bash --partition=full_optima --mem=64G --exclude="cn1,cn2,cn5,on1,vn1,cn6,on2,on3,vn2" --qos normal_msc --time=48:00:00 srun --pty /bin/bash
+cp projects/thesis/server/container_seg.def . && sudo singularity build thesis_seg.sif container_seg.def
+```
+
+Download the seg files
+```sh
+rsync -avm --include='*/' --include='seg_nnUnet.nii.gz' --exclude='*' node:~/projects/entire_yale_dataset/predictions ./data/entire_yale_dataset/predictions
+```

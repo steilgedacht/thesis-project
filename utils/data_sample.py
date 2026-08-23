@@ -17,7 +17,6 @@ import nibabel as nib
 from scipy import ndimage
 from scipy.ndimage import zoom, label, binary_fill_holes
 from scipy.spatial.distance import cdist
-from skimage.morphology import convex_hull_image
 from skimage.measure import find_contours
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation

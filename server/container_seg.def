@@ -1,0 +1,72 @@
+Bootstrap: docker
+From: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=Europe/Vienna
+
+    # 1. Essential System Packages
+    apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        ca-certificates \
+        build-essential \
+        curl \
+        git \
+        libsm6 \
+        libxext6 \
+        zlib1g-dev \
+        liblzo2-dev \
+        python3.11 \
+        python3.11-dev
+
+    # 2. Setup Python 3.11, Pip, and uv
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+    python3.11 -m pip install --upgrade pip setuptools wheel
+
+    curl -LsSf https://astral.sh/uv/install.sh | INSTALLER_NO_MODIFY_PATH=1 sh
+    mv $HOME/.local/bin/uv /usr/local/bin/uv
+
+    # 3. Build Environment Variables
+    export PATH="/usr/local/cuda/bin:/usr/bin:$PATH"
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+    export CUDA_HOME=/usr/local/cuda
+    export UV_PYTHON=/usr/bin/python3.11
+
+    # Force ITK single-threading inside container by default
+    export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1
+
+    # 4. Install PyTorch Suite
+    uv pip install --system --no-cache \
+        torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+        --index-url https://download.pytorch.org/whl/cu124
+
+    # 5. Install Pipeline Dependencies (ANTs, nnU-Net requirements, NIfTI tools, blosc2)
+    uv pip install --system --no-cache \
+        antspyx \
+        blosc2 \
+        tables \
+        nibabel \
+        numpy \
+        scipy \
+        scikit-image \
+        tqdm \
+        dynamic-network-architectures \
+        dicom2nifti \
+        batchgenerators \
+        unittest2 \
+        yacs \
+        triton
+
+%environment
+    export PATH="/usr/local/cuda/bin:/usr/bin:$PATH"
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+    export CUDA_HOME=/usr/local/cuda
+    export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    if [ $# -eq 0 ]; then
+        exec /usr/bin/python3.11 "$@"
+    else
+        exec "$@"
+    fi
