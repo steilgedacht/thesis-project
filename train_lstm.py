@@ -51,8 +51,8 @@ def validate_polation(data_loader, text, global_step, criterion):
             target_pred = preds[:, -1]  # [1, 1, D, H, W] logits for the held-out step
 
             # Use the same loss as training (BCE + Dice) for consistent monitoring
-            bce_loss += criterion.loss_fn_1(target_pred, target_grid).item()
-            dice_loss += criterion.dice_loss(target_pred, target_grid).item()
+            bce_loss += criterion.loss_fn_1(target_pred, target_grid).mean().item()
+            dice_loss += criterion.dice_loss(target_pred, target_grid).mean().item()
 
     avg_bce = bce_loss / len(data_loader)
     avg_dice = dice_loss / len(data_loader)
@@ -100,7 +100,7 @@ def train_lstm(
             times = times.to(config.device)          # [1, T]
             patient_idx = patient_idx.to(config.device)
 
-            predictions = model(grids, times, patient_idx, teacher_forcing=True)  # [1, T-1, 1, D, H, W]
+            predictions = model(grids, times, patient_idx)  # [1, T-1, 1, D, H, W]
             targets = grids[:, 1:]                                                # ground-truth next-frame at each step
 
             loss = criterion(predictions, targets)
@@ -203,9 +203,9 @@ if __name__ == "__main__":
         assert mri_dataloader.cache_lesion_trajectories is not None, "No Lesions cached"
             
         trajectories = mri_dataloader.cache_lesion_trajectories * config.training_dataset_samples_duplication_factor
-        
         train_dataset = LesionSequenceDataset(
             trajectories, 
+            cache_dir="/tmp/lesion_sequence_cache",
             **config.dataset_params
         )
         train_loader = DataLoader(

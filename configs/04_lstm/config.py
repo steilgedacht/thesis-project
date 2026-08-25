@@ -27,7 +27,7 @@ class Config:
     # Total Variation loss weight for spatial smoothness
     # Encourages neighboring voxels to have similar predictions
     # Reduces noise and promotes coherent lesion regions
-    use_total_variation_loss = True
+    use_total_variation_loss = False
     tv_loss_weight = 0.01  # Scale relative to BCE+Dice (try 0.001-0.05)
 
     # Instantiate loss with dynamic weighting
@@ -85,7 +85,7 @@ class Config:
             # encoder/decoder params can be tuned; keep sensible defaults
             "encoder_params": {"base_channels": 32},
             "decoder_params": {"base_channels": 32, "out_size": lstm_grid_size},
-            "use_patient_embedding": False,
+            "use_patient_embedding": True,
         }
         model_save_name = "lesion_lstm_autoencoder"
     else:

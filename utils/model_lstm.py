@@ -273,7 +273,7 @@ class LesionLatentLSTM(nn.Module):
         self.rnn = nn.GRU(lstm_input_dim, hidden_dim, num_layers=n_layers, batch_first=True)
         self.fc_out = nn.Linear(hidden_dim, latent_dim)
 
-    def forward(self, grids, times, patient_idx=None, teacher_forcing=True, n_future=0):
+    def forward(self, grids, times, patient_idx=None, n_future=0):
         # grids: [B, T, 1, D, H, W]
         B, T = grids.shape[0], grids.shape[1]
         device = grids.device
@@ -282,7 +282,7 @@ class LesionLatentLSTM(nn.Module):
         z_obs = []
         for t in range(T):
             grid_t = grids[:, t]
-            z_t = self.encoder(grid_t)
+            z_t = self.encoder(grid_t) # [1, latent_dim]
             z_obs.append(z_t)
         z_obs = torch.stack(z_obs, dim=1)  # [B, T, latent_dim]
 
@@ -292,7 +292,7 @@ class LesionLatentLSTM(nn.Module):
         inputs = []
         for step in range(total_steps):
             target_time = times[:, step + 1]
-            t_enc = self.time_encoder(target_time)
+            t_enc = self.time_encoder(target_time) # [B, 12]
             z_curr = z_obs[:, step]
             if self.use_patient_embedding and patient_idx is not None:
                 p_emb = self.patient_emb(patient_idx)
