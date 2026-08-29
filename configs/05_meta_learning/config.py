@@ -34,7 +34,7 @@ class Config:
     max_grad_norm_clip = 1.0
     only_train = False
 
-    from utils.loss_bce_dice import Loss_BCE_Dice
+    from utils.loss_bce_dice_tv import Loss_BCE_Dice_TV
     
     # Dynamic class weighting based on ground truth imbalance
     # Automatically adapts pos_weight per batch from label class ratio
@@ -45,10 +45,9 @@ class Config:
     tv_loss_weight = 0.01
     
     # Instantiate loss with dynamic weighting
-    loss_fn = Loss_BCE_Dice(
-        use_dynamic_pos_weight=use_dynamic_pos_weight,
-        use_tv_loss=use_total_variation_loss,
-        tv_weight=tv_loss_weight
+    loss_fn = Loss_BCE_Dice_TV(
+        lambda_space=2e-2, 
+        lambda_time=0.6
     )
 
     """ Meta-Learning specific parameters """
@@ -76,7 +75,7 @@ class Config:
     train_log_interval = 10
     train_delete_cache_interval = 10
     n_monitoring_samples_to_visualize = 5
-    validation_interval = 20
+    validation_interval = 50
     print_loss_interval = 10
     
     time_evolution_steps = 100

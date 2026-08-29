@@ -15,7 +15,7 @@ import os
 # Utility imports (Assuming these are in your local directory)
 from utils.mri_dataloader import MRI_Dataloader
 from utils.dataloader import LesionDataset, Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset, Plotting_LesionDataset
-from utils.train_plotting import *
+from utils.train_plotting_meta import *
 
 def check_if_mlflow_is_running(config):
     try:
