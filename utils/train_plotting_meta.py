@@ -240,7 +240,7 @@ def plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=Fals
 
     with torch.enable_grad():
         inner_optimizer = optim.SGD(model.parameters(), lr=inner_lr)
-        with higher.innerloop_ctx(model, inner_optimizer, copy_initial_weights=False, track_higher_grads=False) as (fmodel, diffopt):
+        with higher.innerloop_ctx(model, inner_optimizer, copy_initial_weights=True, track_higher_grads=False) as (fmodel, diffopt):
             for _ in range(inner_steps):
                 supp_preds = fmodel(supp_coords)
                 inner_loss = criterion(supp_preds, supp_labels)

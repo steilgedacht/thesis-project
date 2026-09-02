@@ -26,7 +26,7 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 100
+    epochs = 200
     background_samples = 3000
     lr = 1e-4
     weight_decay = 1e-6
@@ -34,7 +34,7 @@ class Config:
     max_grad_norm_clip = 1.0
     only_train = False
 
-    from utils.loss_bce_dice_tv import Loss_BCE_Dice_TV
+    from utils.loss_bce_dice_tv_meta import Loss_BCE_Dice_TV
     
     # Dynamic class weighting based on ground truth imbalance
     # Automatically adapts pos_weight per batch from label class ratio
@@ -46,8 +46,9 @@ class Config:
     
     # Instantiate loss with dynamic weighting
     loss_fn = Loss_BCE_Dice_TV(
-        lambda_space=2e-2, 
-        lambda_time=0.6
+        lambda_space=2e-2,
+        lambda_time=0.6,
+        use_dynamic_pos_weight=use_dynamic_pos_weight,
     )
 
     """ Meta-Learning specific parameters """

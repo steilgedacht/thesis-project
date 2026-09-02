@@ -64,9 +64,11 @@ def validate_polation(data_loader, text, global_step, criterion, model, config):
             continue
 
         inner_optimizer = optim.SGD(model.parameters(), lr=inner_lr)
-        
-        # Test-time adaptation (track_higher_grads=False saves memory since we don't update meta-weights here)
-        with higher.innerloop_ctx(model, inner_optimizer, copy_initial_weights=False, track_higher_grads=False) as (fmodel, diffopt):
+
+        # `copy_initial_weights=True` keeps the shared meta-weights untouched while we
+        # adapt a task-specific copy. Using the in-place mode here causes the model to
+        # drift across tasks and converge toward a trivial all-positive predictor.
+        with higher.innerloop_ctx(model, inner_optimizer, copy_initial_weights=True, track_higher_grads=False) as (fmodel, diffopt):
             # Adapt to the patient's support scans using the full loss (BCE + Dice + TV)
             for _ in range(inner_steps):
                 supp_preds = fmodel(supp_coords)
@@ -180,9 +182,14 @@ def train_inr(
 
             optimizer.zero_grad()
 
-            # higher library context manager for the differentiable inner loop
-            with higher.innerloop_ctx(model, inner_optimizer, copy_initial_weights=False) as (fmodel, diffopt):
-                
+            # Create a fresh inner optimizer for each task to avoid reusing stale fast-weights state
+            inner_optimizer = optim.SGD(model.parameters(), lr=inner_lr)
+
+            # `copy_initial_weights=True` is the correct MAML behaviour: adapt a task-specific copy
+            # and only update the meta-weights via the query loss. In-place adaptation causes the
+            # shared model to drift toward trivial all-positive predictions across tasks.
+            with higher.innerloop_ctx(model, inner_optimizer, copy_initial_weights=True) as (fmodel, diffopt):
+
                 # --- INNER LOOP (Patient Adaptation) ---
                 for _ in range(inner_steps):
                     supp_preds = fmodel(supp_coords)
