@@ -313,7 +313,6 @@ def _predict_grids_lstm(model, patient_idx_tensor, config, time_points, observed
                 observed_grids.to(device),
                 full_times.to(device),
                 patient_idx_tensor.to(device),
-                teacher_forcing=True,
                 n_future=1
             )  # [1, T_obs, 1, D, H, W]
             

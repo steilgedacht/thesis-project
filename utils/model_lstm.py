@@ -193,41 +193,91 @@ class LesionLSTM(nn.Module):
                 current_input = torch.sigmoid(pred_logits)
 
         return torch.stack(preds, dim=1)
+
+
 # --- Autoencoder + Latent-LSTM variant -------------------------------------------------
 class Encoder3D(nn.Module):
-    """Simple 3D conv encoder that maps a 1-channel occupancy grid to a latent vector."""
-    def __init__(self, in_channels=1, latent_dim=256, base_channels=64):
+    """3D conv encoder that maps a 1-channel occupancy grid to a latent vector.
+
+    Downsamples progressively (e.g. 64 -> 32 -> 16 -> 8 -> 4) with *learned*
+    strided convolutions, instead of collapsing straight to a single
+    fully-pooled global vector. The remaining small spatial map (4x4x4 by
+    default) is flattened and linearly projected to latent_dim, so the
+    bottleneck still has to retain *where* structure is, not just *whether*
+    it's present anywhere in the volume.
+
+    This matters a lot for small, sparse targets (e.g. small lesions): if you
+    pool all spatial information away before the latent even exists, the only
+    thing that survives is roughly "is there lesion somewhere", and the
+    decoder has no choice but to reconstruct a vague, centered blob.
+    """
+    def __init__(self, in_channels=1, latent_dim=256, base_channels=32, grid_size=(64, 64, 64)):
         super().__init__()
+        self.grid_size = grid_size
+        # 4 strided-conv stages -> downsample by 16x total (e.g. 64 -> 4)
+        self.bottleneck_size = tuple(max(1, s // 16) for s in grid_size)
+
         self.conv = nn.Sequential(
             nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1),
-            nn.LeakyReLU(),
-            nn.Conv3d(base_channels, base_channels*2, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(),
-            nn.Conv3d(base_channels*2, base_channels*4, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(),
-            nn.AdaptiveAvgPool3d(1),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv3d(base_channels, base_channels, kernel_size=4, stride=2, padding=1),          # /2
+            nn.LeakyReLU(inplace=True),
+            nn.Conv3d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1),      # /4
+            nn.LeakyReLU(inplace=True),
+            nn.Conv3d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1),  # /8
+            nn.LeakyReLU(inplace=True),
+            nn.Conv3d(base_channels * 4, base_channels * 4, kernel_size=4, stride=2, padding=1),  # /16
+            nn.LeakyReLU(inplace=True),
         )
-        self.fc = nn.Linear(base_channels*4, latent_dim)
+        # Only nudges odd input sizes to exactly match bottleneck_size; the
+        # strided convs above do the actual downsampling work, not this pool.
+        self.pool = nn.AdaptiveAvgPool3d(self.bottleneck_size)
+
+        flat_dim = base_channels * 4 * self.bottleneck_size[0] * self.bottleneck_size[1] * self.bottleneck_size[2]
+        self.fc = nn.Linear(flat_dim, latent_dim)
 
     def forward(self, x):
         # x: [B, 1, D, H, W]
         h = self.conv(x)
+        h = self.pool(h)
         h = h.view(h.shape[0], -1)
         return self.fc(h)
 
 
 class Decoder3D(nn.Module):
-    """Simple decoder that maps latent vector back to a 1-channel occupancy grid via upsampling convs."""
-    def __init__(self, latent_dim=256, out_channels=1, base_channels=64, out_size=(64,64,64)):
+    """Decoder mirroring Encoder3D: latent vector -> small spatial feature map
+    -> 4 *learned* transposed-conv upsampling stages -> full-resolution grid.
+
+    Previously this went from a near-scalar (1x1x1) feature map almost all
+    the way to the target resolution via `F.interpolate`, i.e. nearly the
+    entire spatial shape of the output was produced by smooth interpolation
+    rather than learned weights. That is exactly what produces a large,
+    blurry, roughly-centered blob instead of a small, sharply-localized
+    lesion: interpolation from a near-scalar latent can only vary smoothly
+    and slowly across space, it cannot manufacture high-frequency detail.
+    Upsampling in several learned stages (mirroring the encoder's
+    downsampling) lets the network represent small, localized structure
+    again. `F.interpolate` is kept only as a safety net for grid sizes that
+    aren't exactly divisible by 16.
+    """
+    def __init__(self, latent_dim=256, out_channels=1, base_channels=32, out_size=(64, 64, 64)):
         super().__init__()
         self.out_size = out_size
-        self.fc = nn.Linear(latent_dim, base_channels*4)
+        self.bottleneck_size = tuple(max(1, s // 16) for s in out_size)
+
+        flat_dim = base_channels * 4 * self.bottleneck_size[0] * self.bottleneck_size[1] * self.bottleneck_size[2]
+        self.fc = nn.Linear(latent_dim, flat_dim)
+
         self.up = nn.Sequential(
-            nn.Unflatten(1, (base_channels*4, 1, 1, 1)),
-            nn.ConvTranspose3d(base_channels*4, base_channels*2, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(),
-            nn.ConvTranspose3d(base_channels*2, base_channels, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(),
+            nn.Unflatten(1, (base_channels * 4, *self.bottleneck_size)),
+            nn.ConvTranspose3d(base_channels * 4, base_channels * 4, kernel_size=4, stride=2, padding=1),  # x2
+            nn.LeakyReLU(inplace=True),
+            nn.ConvTranspose3d(base_channels * 4, base_channels * 2, kernel_size=4, stride=2, padding=1),  # x4
+            nn.LeakyReLU(inplace=True),
+            nn.ConvTranspose3d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1),      # x8
+            nn.LeakyReLU(inplace=True),
+            nn.ConvTranspose3d(base_channels, base_channels, kernel_size=4, stride=2, padding=1),          # x16
+            nn.LeakyReLU(inplace=True),
             nn.Conv3d(base_channels, out_channels, kernel_size=3, padding=1),
         )
 
@@ -235,7 +285,7 @@ class Decoder3D(nn.Module):
         # z: [B, latent_dim]
         h = self.fc(z)
         h = self.up(h)
-        # if spatial size doesn't match exactly, interpolate
+        # safety net only -- with grid_size divisible by 16 this is a no-op
         if h.shape[-3:] != self.out_size:
             h = nn.functional.interpolate(h, size=self.out_size, mode='trilinear', align_corners=False)
         return h
@@ -252,8 +302,18 @@ class LesionLatentLSTM(nn.Module):
     and uses a small RNN over latent vectors instead of ConvLSTM over
     full grids, which reduces memory and lets the autoencoder learn compact
     visit representations.
+
+    Supports staged training:
+      - `forward_autoencoder(grids)` runs encoder+decoder independently per
+        frame (no RNN at all), for an autoencoder-only pretraining phase.
+      - `freeze_autoencoder()` / `unfreeze_autoencoder()` toggle
+        requires_grad on the encoder+decoder.
+      - `freeze_temporal()` / `unfreeze_temporal()` toggle requires_grad on
+        the RNN, fc_out, and (if used) the patient embedding.
     """
-    def __init__(self, trajectories, latent_dim=128, hidden_dim=256, n_layers=2, time_freqs=6, max_t=3650.0, encoder_params=None, decoder_params=None, use_patient_embedding=False):
+    def __init__(self, trajectories, latent_dim=128, hidden_dim=256, n_layers=2, time_freqs=6,
+                 max_t=3650.0, encoder_params=None, decoder_params=None,
+                 use_patient_embedding=False, grid_size=(64, 64, 64)):
         super().__init__()
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
@@ -265,13 +325,68 @@ class LesionLatentLSTM(nn.Module):
             self.patient_emb = nn.Embedding(num_patients, latent_dim)
             torch.nn.init.normal_(self.patient_emb.weight, std=1.0 / np.sqrt(latent_dim))
 
-        self.encoder = Encoder3D(latent_dim=latent_dim, **(encoder_params or {}))
-        self.decoder = Decoder3D(latent_dim=latent_dim, **(decoder_params or {}))
+        encoder_params = dict(encoder_params or {})
+        encoder_params.setdefault("grid_size", grid_size)
+        decoder_params = dict(decoder_params or {})
+        decoder_params.setdefault("out_size", grid_size)
+
+        self.encoder = Encoder3D(latent_dim=latent_dim, **encoder_params)
+        self.decoder = Decoder3D(latent_dim=latent_dim, **decoder_params)
 
         self.time_encoder = TimeEncoder(max_t=max_t, num_frequencies=time_freqs)
         lstm_input_dim = latent_dim + 2 * time_freqs + (latent_dim if use_patient_embedding else 0)
-        self.rnn = nn.GRU(lstm_input_dim, hidden_dim, num_layers=n_layers, batch_first=True)
+        # NOTE: was nn.GRU -- switched to a proper LSTM as requested.
+        self.rnn = nn.LSTM(lstm_input_dim, hidden_dim, num_layers=n_layers, batch_first=True)
         self.fc_out = nn.Linear(hidden_dim, latent_dim)
+
+    # ---------------------------------------------------------------
+    # Staged-training helpers
+    # ---------------------------------------------------------------
+    @staticmethod
+    def _set_requires_grad(module, flag):
+        for p in module.parameters():
+            p.requires_grad = flag
+
+    def freeze_autoencoder(self):
+        self._set_requires_grad(self.encoder, False)
+        self._set_requires_grad(self.decoder, False)
+
+    def unfreeze_autoencoder(self):
+        self._set_requires_grad(self.encoder, True)
+        self._set_requires_grad(self.decoder, True)
+
+    def freeze_temporal(self):
+        self._set_requires_grad(self.rnn, False)
+        self._set_requires_grad(self.fc_out, False)
+        if self.use_patient_embedding:
+            self._set_requires_grad(self.patient_emb, False)
+
+    def unfreeze_temporal(self):
+        self._set_requires_grad(self.rnn, True)
+        self._set_requires_grad(self.fc_out, True)
+        if self.use_patient_embedding:
+            self._set_requires_grad(self.patient_emb, True)
+
+    def forward_autoencoder(self, grids):
+        """
+        Encode and decode every observed frame independently -- no RNN
+        involved at all. Used for the autoencoder-only pretraining phase, so
+        the encoder/decoder learn a faithful per-frame reconstruction before
+        the (initially random, noisy) temporal model starts pushing
+        gradients through them.
+
+        grids: [B, T, 1, D, H, W]
+        returns: reconstructions [B, T, 1, D, H, W] logits
+        """
+        B, T = grids.shape[0], grids.shape[1]
+        recons = []
+        for t in range(T):
+            z = self.encoder(grids[:, t])
+            recon = self.decoder(z)
+            recons.append(recon)
+        return torch.stack(recons, dim=1)
+
+    # ---------------------------------------------------------------
 
     def forward(self, grids, times, patient_idx=None, n_future=0):
         # grids: [B, T, 1, D, H, W]
@@ -282,7 +397,7 @@ class LesionLatentLSTM(nn.Module):
         z_obs = []
         for t in range(T):
             grid_t = grids[:, t]
-            z_t = self.encoder(grid_t) # [1, latent_dim]
+            z_t = self.encoder(grid_t)  # [B, latent_dim]
             z_obs.append(z_t)
         z_obs = torch.stack(z_obs, dim=1)  # [B, T, latent_dim]
 
@@ -292,7 +407,7 @@ class LesionLatentLSTM(nn.Module):
         inputs = []
         for step in range(total_steps):
             target_time = times[:, step + 1]
-            t_enc = self.time_encoder(target_time) # [B, 12]
+            t_enc = self.time_encoder(target_time)  # [B, 12]
             z_curr = z_obs[:, step]
             if self.use_patient_embedding and patient_idx is not None:
                 p_emb = self.patient_emb(patient_idx)
@@ -302,7 +417,7 @@ class LesionLatentLSTM(nn.Module):
             inputs.append(rnn_in)
 
         rnn_in = torch.stack(inputs, dim=1)  # [B, total_steps, input_dim]
-        out, _ = self.rnn(rnn_in)            # [B, total_steps, hidden_dim]
+        out, _ = self.rnn(rnn_in)            # [B, total_steps, hidden_dim]  (LSTM returns (h_n, c_n) as the 2nd item)
         z_pred = self.fc_out(out)            # [B, total_steps, latent_dim]
 
         # decode predicted latents to predicted grids

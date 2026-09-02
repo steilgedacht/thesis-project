@@ -32,6 +32,59 @@ def load_config(config_path: str):
     return config_module.Config()
 
 
+# ---------------------------------------------------------------------------
+# Staged-training helpers
+# ---------------------------------------------------------------------------
+_PHASE_TO_INT = {"autoencoder": 0, "lstm_only": 1, "joint": 2}
+
+
+def get_training_phase(epoch, config):
+    """
+    Decide which part of the model should be trained this epoch.
+
+      'autoencoder' -> encoder+decoder only, reconstructing each individual
+                        frame (no RNN involved). Lets the autoencoder learn to
+                        actually represent small/localized structures before
+                        an untrained, noisy RNN starts pushing gradients
+                        through it.
+      'lstm_only'   -> encoder+decoder frozen, only the temporal model (LSTM
+                        + fc_out [+ patient embedding]) is trained on top of
+                        the now-stable latent space.
+      'joint'       -> everything trainable together (original behaviour).
+
+    Controlled by config.autoencoder_pretrain_epochs and
+    config.lstm_only_epochs (both default to 0, i.e. pure joint training,
+    if not set -- so this is backward compatible with old configs).
+    """
+    ae_epochs = getattr(config, "autoencoder_pretrain_epochs", 0)
+    lstm_epochs = getattr(config, "lstm_only_epochs", 0)
+    if epoch <= ae_epochs:
+        return "autoencoder"
+    elif epoch <= ae_epochs + lstm_epochs:
+        return "lstm_only"
+    return "joint"
+
+
+def apply_training_phase(model, phase):
+    """
+    Set requires_grad flags on the model according to the phase. This is a
+    no-op (always full 'joint' behaviour) for models that don't implement
+    the staged-pretraining helpers (e.g. the plain grid-based LesionLSTM),
+    so it's safe to call regardless of which model class is configured.
+    """
+    if not hasattr(model, "freeze_autoencoder"):
+        return
+    if phase == "autoencoder":
+        model.unfreeze_autoencoder()
+        model.freeze_temporal()
+    elif phase == "lstm_only":
+        model.freeze_autoencoder()
+        model.unfreeze_temporal()
+    else:
+        model.unfreeze_autoencoder()
+        model.unfreeze_temporal()
+
+
 def validate_polation(data_loader, text, global_step, criterion):
     bce_loss = 0
     dice_loss = 0
@@ -47,7 +100,7 @@ def validate_polation(data_loader, text, global_step, criterion):
 
             full_times = torch.cat([history_times, target_time], dim=1)  # [1, T+1]
 
-            preds = model(history_grids, full_times, patient_idx, teacher_forcing=True, n_future=1)
+            preds = model(history_grids, full_times, patient_idx=patient_idx, n_future=1)
             target_pred = preds[:, -1]  # [1, 1, D, H, W] logits for the held-out step
 
             # Use the same loss as training (BCE + Dice) for consistent monitoring
@@ -92,16 +145,26 @@ def train_lstm(
     for epoch in range(1, config.epochs + 1):
         total_loss = 0
 
+        # ==== Decide / apply this epoch's training phase ====
+        phase = get_training_phase(epoch, config)
+        apply_training_phase(model, phase)
+        supports_staged_training = hasattr(model, "forward_autoencoder")
+
         # ==== Training Loop ====
         model.train()
-        for i, (grids, times, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}/{config.epochs}"):
+        for i, (grids, times, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}/{config.epochs} [{phase}]"):
 
             grids = grids.to(config.device)          # [1, T, 1, D, H, W]
             times = times.to(config.device)          # [1, T]
             patient_idx = patient_idx.to(config.device)
 
-            predictions = model(grids, times, patient_idx)  # [1, T-1, 1, D, H, W]
-            targets = grids[:, 1:]                                                # ground-truth next-frame at each step
+            if phase == "autoencoder" and supports_staged_training:
+                # No RNN involved: reconstruct every observed frame independently.
+                predictions = model.forward_autoencoder(grids)   # [1, T, 1, D, H, W]
+                targets = grids
+            else:
+                predictions = model(grids, times, patient_idx)   # [1, T-1, 1, D, H, W]
+                targets = grids[:, 1:]                            # ground-truth next-frame at each step
 
             loss = criterion(predictions, targets)
 
@@ -116,17 +179,23 @@ def train_lstm(
 
             # 3. Only step the optimizer every 'b' steps
             if (i + 1) % config.gradient_accumulation_steps == 0 or (i + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm_clip)
+                torch.nn.utils.clip_grad_norm_(
+                    (p for p in model.parameters() if p.requires_grad),
+                    max_norm=config.max_grad_norm_clip,
+                )
                 optimizer.step()
                 optimizer.zero_grad()
 
             if i % config.train_log_interval == 0:
+                # predictions/targets are logits here; compare against 0 (== sigmoid(x) > 0.5),
+                # not 0.5, since these are raw logits not probabilities.
                 mlflow.log_metrics(
                     {
                         # Report unscaled loss for accurate tracking
                         "training_loss": loss.item() * config.gradient_accumulation_steps,
                         **criterion.loss_to_report,
-                        "wrongly_predicted_total_volume": (predictions > 0.5).sum().item() - (targets > 0.5).sum().item(),
+                        "wrongly_predicted_total_volume": (predictions > 0).sum().item() - (targets > 0.5).sum().item(),
+                        "training_phase": _PHASE_TO_INT[phase],
                     },
                     step=global_step
                 )
@@ -141,7 +210,9 @@ def train_lstm(
         # ==== Evaluation Loop ====
         model.eval()
 
-        if epoch % config.validation_interval == 0:
+        # Extrapolation/interpolation validation exercises the RNN, which is
+        # meaningless (frozen/untrained) during the pure autoencoder phase, so skip it then.
+        if epoch % config.validation_interval == 0 and phase != "autoencoder":
             with torch.no_grad():
                 # visualize_samples(model, epoch, monitoring_samples, train_loader, "train", config)
                 # visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid", config)
@@ -157,7 +228,7 @@ def train_lstm(
         losses.append(avg_loss)
         
         if (epoch + 1) % config.print_loss_interval == 0:
-            print(f"Epoch {epoch+1}/{config.epochs}, Loss: {avg_loss:.6f}")
+            print(f"Epoch {epoch+1}/{config.epochs}, Loss: {avg_loss:.6f}, Phase: {phase}")
 
     # ==== Final Logging and Visualization ====
     

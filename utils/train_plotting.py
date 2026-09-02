@@ -658,7 +658,7 @@ def _predict_lstm_grid_sequence(model, trj, query_times, canonical_geom: Canonic
             target_time = torch.tensor([[t]], dtype=torch.float32, device=device)
             full_times = torch.cat([hist_times, target_time], dim=1)
 
-            preds = model(hist_grids, full_times, patient_idx, teacher_forcing=True, n_future=1)
+            preds = model(hist_grids, full_times, patient_idx, n_future=1)
             pred_volumes.append(torch.sigmoid(preds[0, -1, 0]).cpu().numpy())
 
     return np.stack(pred_volumes, axis=0)

@@ -13,7 +13,7 @@ class Loss_BCE_Dice():
       use_tv_loss: if True, add total variation regularization for spatial smoothness.
       tv_weight: coefficient for TV loss term (default 0.01).
     """
-    def __init__(self, use_dynamic_pos_weight=True, pos_weight=None, weight=None, 
+    def __init__(self, use_dynamic_pos_weight=True, 
                  use_tv_loss=False, tv_weight=0.01):
         self.use_dynamic_pos_weight = use_dynamic_pos_weight
         
@@ -29,7 +29,7 @@ class Loss_BCE_Dice():
 
         self.report_losses()
     
-    def __call__(self, pred, target, coords=None):
+    def __call__(self, pred, target):
         # Compute dynamic pos_weight from class imbalance if enabled
         if self.use_dynamic_pos_weight:
             positive_pixels = target.sum().item()
