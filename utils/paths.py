@@ -44,19 +44,19 @@ class DatasetPaths:
         return os.path.join(self.prediction_dir(patient_id, date), "registered_transform.npy")
 
     def nnunet_prediction_path(self, patient_id: str, date: str) -> str:
-        return os.path.join(self.prediction_dir(patient_id, date), "0.nii.gz")
+        return os.path.join(self.prediction_dir(patient_id, date), "seg_nnUnet.nii.gz")
 
     def lesion_segmentation_path(self, patient_id: str, date: str) -> str:
-        return os.path.join(self.prediction_dir(patient_id, date), "label.nii.gz")
+        return os.path.join(self.prediction_dir(patient_id, date), "label2.nii.gz")
 
     def lesion_trajectory_seg_path(self, patient_id: str, date: str) -> str:
         return os.path.join(self.prediction_dir(patient_id, date), "trajectory.nii.gz")
 
     def zoomed_segmentation_path(self, patient_id: str, date: str) -> str:
-        return os.path.join(self.prediction_dir(patient_id, date), "zoomed_label.nii.gz")
+        return os.path.join(self.prediction_dir(patient_id, date), "zoomed_label2.nii.gz")
 
     def zoomed_pre_post_path(self, patient_id: str, date: str) -> str:
-        return os.path.join(self.prediction_dir(patient_id, date), "zoomed_mri.nii.gz")
+        return os.path.join(self.prediction_dir(patient_id, date), "zoomed_mri2.nii.gz")
 
     # ---- trajectory files -------------------------------------------------
     def lesion_trajectory_npz_path(self, patient_id: str, label_id) -> str:

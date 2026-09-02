@@ -19,6 +19,7 @@ module split:
    module level.
 """
 
+import os
 import io
 import glob
 import json
@@ -65,6 +66,9 @@ class Patient:
         fixed_image = ants.image_read(self.samples[0].original_sample_path)
 
         for sample in self.samples:
+            if not os.path.exists(sample.original_sample_path) and not os.path.exists(sample.lesion_segmentation_path):
+                print(f"Skipping registration for {sample.patient_id} on {sample.date}: files not found.")
+                continue
             moving_image = ants.image_read(sample.original_sample_path)
             moving_label = ants.image_read(sample.lesion_segmentation_path)
 
