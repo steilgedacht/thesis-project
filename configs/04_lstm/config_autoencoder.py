@@ -5,7 +5,7 @@ class Config:
     """ Tracking parameters """
     mlflow_tracking_uri = "http://127.0.0.1:5000"
     mlflow_experiment_name = "Lesion_INR_Training"
-    mlflow_run_name = "LSTM"
+    mlflow_run_name = "Autoencoder"
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -22,8 +22,8 @@ class Config:
     # autoencoder_pretrain_epochs < epoch <= autoencoder_pretrain_epochs+lstm_only_epochs -> LSTM-only (encoder+decoder frozen)
     # epoch beyond that                                                     -> joint training (everything trainable)
     # Both default to 0 in train_lstm.py if omitted, i.e. pure joint training (old behaviour).
-    autoencoder_pretrain_epochs = 10
-    lstm_only_epochs = 10
+    autoencoder_pretrain_epochs = 210
+    lstm_only_epochs = 2
 
     from utils.loss_bce_dice import Loss_BCE_Dice
 
@@ -47,7 +47,7 @@ class Config:
 
     """ Dataloading parameters """
     batchsize = 1
-    gradient_accumulation_steps = 128
+    gradient_accumulation_steps = 64
     num_workers = 7
     prefetch_factor = 2
     pin_memory = True
@@ -108,7 +108,7 @@ class Config:
             "max_t": 3650.0,
             "kernel_size": 3,
         }
-        model_save_name = "lesion_lstm"
+        model_save_name = "autoencoder"
 
     """ Logging parameters """
     train_log_interval = 10

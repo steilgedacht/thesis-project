@@ -79,6 +79,11 @@ class LesionDataset(Dataset):
             pos_sampled = pos_coords[pos_idx]
             all_sampled_indices = np.vstack([pos_sampled, neg_coords])
 
+        # Randomize before the meta split so support and query both contain
+        # positive and negative samples instead of one class each.
+        permutation = np.random.permutation(len(all_sampled_indices))
+        all_sampled_indices = all_sampled_indices[permutation]
+
         # Convert sampled voxel indices to physical coordinates (mm) using the affine,
         # then center the volume and scale so 1 INR unit = 10 cm.
         i, j, k = all_sampled_indices.T

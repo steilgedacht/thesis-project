@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 
@@ -194,50 +195,65 @@ class LesionLSTM(nn.Module):
 
         return torch.stack(preds, dim=1)
 
-
-# --- Autoencoder + Latent-LSTM variant -------------------------------------------------
-class Encoder3D(nn.Module):
-    """3D conv encoder that maps a 1-channel occupancy grid to a latent vector.
-
-    Downsamples progressively (e.g. 64 -> 32 -> 16 -> 8 -> 4) with *learned*
-    strided convolutions, instead of collapsing straight to a single
-    fully-pooled global vector. The remaining small spatial map (4x4x4 by
-    default) is flattened and linearly projected to latent_dim, so the
-    bottleneck still has to retain *where* structure is, not just *whether*
-    it's present anywhere in the volume.
-
-    This matters a lot for small, sparse targets (e.g. small lesions): if you
-    pool all spatial information away before the latent even exists, the only
-    thing that survives is roughly "is there lesion somewhere", and the
-    decoder has no choice but to reconstruct a vague, centered blob.
+class ResBlock3D(nn.Module):
+    """Intra-block 3D Residual Block (Identity + Conv -> LeakyReLU -> Conv).
+    
+    Operates strictly inside the block (no cross-network UNet skip connections).
+    Preserves fine spatial features and stabilizes gradient flow.
     """
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        )
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+
+    def forward(self, x):
+        return self.act(x + self.block(x))
+
+
+class UpResBlock3D(nn.Module):
+    """Upsampling Block: Nearest-Neighbor Interpolation -> Conv (Channel Change) -> ResBlock."""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.conv_match = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.res_block = ResBlock3D(out_channels)
+
+    def forward(self, x):
+        x = self.upsample(x)
+        x = self.conv_match(x)
+        x = self.res_block(x)
+        return x
+
+
+class Encoder3D(nn.Module):
+    """3D conv encoder mapping a 1-channel occupancy grid to a latent vector."""
     def __init__(self, in_channels=1, latent_dim=256, base_channels=32, grid_size=(64, 64, 64)):
         super().__init__()
         self.grid_size = grid_size
-        # 4 strided-conv stages -> downsample by 16x total (e.g. 64 -> 4)
-        self.bottleneck_size = tuple(max(1, s // 16) for s in grid_size)
+        self.bottleneck_size = tuple(max(1, s // 16) for s in grid_size)  # 4 downsample steps = 16x
 
         self.conv = nn.Sequential(
             nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1),
-            nn.LeakyReLU(inplace=True),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Conv3d(base_channels, base_channels, kernel_size=4, stride=2, padding=1),          # /2
-            nn.LeakyReLU(inplace=True),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Conv3d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1),      # /4
-            nn.LeakyReLU(inplace=True),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Conv3d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1),  # /8
-            nn.LeakyReLU(inplace=True),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Conv3d(base_channels * 4, base_channels * 4, kernel_size=4, stride=2, padding=1),  # /16
-            nn.LeakyReLU(inplace=True),
+            nn.LeakyReLU(0.2, inplace=True),
         )
-        # Only nudges odd input sizes to exactly match bottleneck_size; the
-        # strided convs above do the actual downsampling work, not this pool.
         self.pool = nn.AdaptiveAvgPool3d(self.bottleneck_size)
 
         flat_dim = base_channels * 4 * self.bottleneck_size[0] * self.bottleneck_size[1] * self.bottleneck_size[2]
         self.fc = nn.Linear(flat_dim, latent_dim)
 
     def forward(self, x):
-        # x: [B, 1, D, H, W]
         h = self.conv(x)
         h = self.pool(h)
         h = h.view(h.shape[0], -1)
@@ -245,51 +261,41 @@ class Encoder3D(nn.Module):
 
 
 class Decoder3D(nn.Module):
-    """Decoder mirroring Encoder3D: latent vector -> small spatial feature map
-    -> 4 *learned* transposed-conv upsampling stages -> full-resolution grid.
-
-    Previously this went from a near-scalar (1x1x1) feature map almost all
-    the way to the target resolution via `F.interpolate`, i.e. nearly the
-    entire spatial shape of the output was produced by smooth interpolation
-    rather than learned weights. That is exactly what produces a large,
-    blurry, roughly-centered blob instead of a small, sharply-localized
-    lesion: interpolation from a near-scalar latent can only vary smoothly
-    and slowly across space, it cannot manufacture high-frequency detail.
-    Upsampling in several learned stages (mirroring the encoder's
-    downsampling) lets the network represent small, localized structure
-    again. `F.interpolate` is kept only as a safety net for grid sizes that
-    aren't exactly divisible by 16.
-    """
+    """3D Decoder using intra-block residual connections and nearest upsampling."""
     def __init__(self, latent_dim=256, out_channels=1, base_channels=32, out_size=(64, 64, 64)):
         super().__init__()
         self.out_size = out_size
-        self.bottleneck_size = tuple(max(1, s // 16) for s in out_size)
+        self.bottleneck_size = tuple(max(1, s // 16) for s in out_size)  # Matches Encoder's /16
 
         flat_dim = base_channels * 4 * self.bottleneck_size[0] * self.bottleneck_size[1] * self.bottleneck_size[2]
         self.fc = nn.Linear(latent_dim, flat_dim)
 
-        self.up = nn.Sequential(
-            nn.Unflatten(1, (base_channels * 4, *self.bottleneck_size)),
-            nn.ConvTranspose3d(base_channels * 4, base_channels * 4, kernel_size=4, stride=2, padding=1),  # x2
-            nn.LeakyReLU(inplace=True),
-            nn.ConvTranspose3d(base_channels * 4, base_channels * 2, kernel_size=4, stride=2, padding=1),  # x4
-            nn.LeakyReLU(inplace=True),
-            nn.ConvTranspose3d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1),      # x8
-            nn.LeakyReLU(inplace=True),
-            nn.ConvTranspose3d(base_channels, base_channels, kernel_size=4, stride=2, padding=1),          # x16
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(base_channels, out_channels, kernel_size=3, padding=1),
-        )
+        self.unflatten = nn.Unflatten(1, (base_channels * 4, *self.bottleneck_size))
+        
+        # Upsampling with intra-block Residuals
+        self.layer1 = UpResBlock3D(base_channels * 4, base_channels * 4)  # x2
+        self.layer2 = UpResBlock3D(base_channels * 4, base_channels * 2)  # x4
+        self.layer3 = UpResBlock3D(base_channels * 2, base_channels)      # x8
+        self.layer4 = UpResBlock3D(base_channels, base_channels)          # x16
+        
+        # Final projection to target channels (output logits or probabilities)
+        self.final_conv = nn.Conv3d(base_channels, out_channels, kernel_size=3, padding=1)
 
     def forward(self, z):
-        # z: [B, latent_dim]
         h = self.fc(z)
-        h = self.up(h)
-        # safety net only -- with grid_size divisible by 16 this is a no-op
-        if h.shape[-3:] != self.out_size:
-            h = nn.functional.interpolate(h, size=self.out_size, mode='trilinear', align_corners=False)
-        return h
-
+        h = self.unflatten(h)
+        
+        h = self.layer1(h)
+        h = self.layer2(h)
+        h = self.layer3(h)
+        h = self.layer4(h)
+        
+        out = self.final_conv(h)
+        
+        if out.shape[-3:] != self.out_size:
+            out = F.interpolate(out, size=self.out_size, mode='trilinear', align_corners=False)
+            
+        return out
 
 class LesionLatentLSTM(nn.Module):
     """

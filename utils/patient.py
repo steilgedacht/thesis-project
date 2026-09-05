@@ -63,10 +63,12 @@ class Patient:
         """Register all images to the first image using linear translation only."""
         import ants
 
+        ants.set_num_threads(2)
+
         fixed_image = ants.image_read(self.samples[0].original_sample_path)
 
         for sample in self.samples:
-            if not os.path.exists(sample.original_sample_path) and not os.path.exists(sample.lesion_segmentation_path):
+            if not os.path.exists(sample.original_sample_path) or not os.path.exists(sample.lesion_segmentation_path):
                 print(f"Skipping registration for {sample.patient_id} on {sample.date}: files not found.")
                 continue
             moving_image = ants.image_read(sample.original_sample_path)
