@@ -26,7 +26,7 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 2
+    epochs = 300
     background_samples = 3000
     lr = 1e-4
     weight_decay = 1e-6
@@ -34,7 +34,7 @@ class Config:
     max_grad_norm_clip = 1.0
     only_train = False
 
-    from utils.loss_bce_dice import Loss_BCE_Dice
+    from utils.loss_bce_dice_tv import Loss_BCE_Dice_TV
     
     # Dynamic class weighting based on ground truth imbalance
     # Automatically adapts pos_weight per batch from label class ratio
@@ -45,10 +45,9 @@ class Config:
     tv_loss_weight = 0.01
     
     # Instantiate loss with dynamic weighting
-    loss_fn = Loss_BCE_Dice(
-        use_dynamic_pos_weight=use_dynamic_pos_weight,
-        use_tv_loss=use_total_variation_loss,
-        tv_weight=tv_loss_weight
+    loss_fn = Loss_BCE_Dice_TV(
+        lambda_space=3e-3, 
+        lambda_time=0.01
     )
 
 
@@ -57,14 +56,14 @@ class Config:
     model = NeuralODE_INR
     model_params = dict(
         patient_embed_dim=32,
-        latent_dim=64,
-        ode_hidden_dim=128,
-        ode_layers=2,
+        latent_dim=256,
+        ode_hidden_dim=256,
+        ode_layers=5,
         ode_steps=16,        # mehr = genauer, aber langsamer/mehr Speicher (Backprop through time)
         ode_method="rk4",    # oder "euler"
         spatial_hidden_dim=256,
-        spatial_layers=4,
-        num_fourier_frequencies=6,  # 0 = deaktiviert
+        spatial_layers=8,
+        num_fourier_frequencies=12,  # 0 = deaktiviert
     )
 
     model_save_name = "lesion_ode_model"

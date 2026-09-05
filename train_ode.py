@@ -125,7 +125,7 @@ def train_inr(
                     plot_lesion_time_evolution(model, epoch, trj, config)
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
-        scheduler.step()
+        scheduler.step()epoch
         
         avg_loss = total_loss / len(train_loader)
         losses.append(avg_loss)
@@ -222,16 +222,26 @@ if __name__ == "__main__":
 
         # NOTE (Neural ODE change): the patient embedding table now lives
         # inside the model (NeuralODE_INR), so its size has to be passed in
-        # explicitly. `patient_to_idx` is the same lookup LesionDataset uses
-        # internally to build embedding ids, so its length is exactly the
-        # number of distinct patients the embedding table needs to cover.
-        # This is a no-op for any older model class that doesn't declare a
-        # `num_patients` constructor argument -- Python will just ignore an
-        # unused kwarg only if the model explicitly accepts **kwargs; for
-        # strict compatibility with old configs, num_patients is only
-        # injected when not already provided in config.model_params.
+        # explicitly. IMPORTANT: LesionDataset.get_embedding_id() does NOT
+        # return a dense 0..len(patient_to_idx)-1 range -- it's
+        # `patient_to_idx[patient_id] * 100 + label_id`, which can be far
+        # larger than the number of distinct patients. Sizing the embedding
+        # table as len(patient_to_idx) causes an out-of-range index on the
+        # embedding lookup, which on CUDA doesn't fail at the lookup itself
+        # (async execution) but surfaces as an opaque CUBLAS error on the
+        # *next* kernel launch. Instead, size it from the actual max
+        # embedding id used across every trajectory (train + validation +
+        # plotting all draw from the same underlying cache, so this single
+        # pass covers all of them), reusing the dataset's own method so the
+        # id formula can never drift out of sync with dataloader.py.
+        max_embedding_id = max(
+            train_dataset.get_embedding_id(trj)
+            for trj in mri_dataloader.cache_lesion_trajectories
+        )
+        num_patients = int(max_embedding_id) + 1
+
         model_params = dict(config.model_params)
-        model_params.setdefault("num_patients", len(train_dataset.patient_to_idx))
+        model_params.setdefault("num_patients", num_patients)
 
         model = config.model(
             trajectories=trajectories, 
