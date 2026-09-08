@@ -56,14 +56,13 @@ class Patient:
         self.dates = [sample.date for sample in self.samples]
         self.path = self.dataloader.paths.sample_dir(patient_id)
         self.registrator = registrator
-        self.load_registered_transforms()
         self.patient_trajectory_paths = glob.glob(self.dataloader.paths.lesion_trajectory_glob(patient_id))
 
     def register_all_to_first(self):
         """Register all images to the first image using linear translation only."""
         import ants
 
-        ants.set_num_threads(2)
+        # ants.set_num_threads(2)
 
         fixed_image = ants.image_read(self.samples[0].original_sample_path)
 
@@ -328,15 +327,6 @@ class Patient:
     def process_samples(self):
         for sample in self.samples:
             sample.process_sample()
-
-    def load_registered_transforms(self):
-        self.registered_transforms = []
-        for sample in self.samples:
-            if hasattr(sample, "registered_transform") and sample.registered_transform is not None:
-                self.registered_transforms.append(sample.registered_transform)
-            else:
-                self.registered_transforms.append(sample.load_registered_transform())
-        return self.registered_transforms
 
     def _transform_points(self, points, transform_params):
         """

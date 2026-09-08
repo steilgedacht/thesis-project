@@ -9,7 +9,7 @@ ssh node
 
 Sync the local folder up
 ```bash
-rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='venv/' --exclude='data' --exclude='server/mlartifacts' --exclude='mlruns' --exclude='mlflow.db' --exclude='.archive' . node:~/projects/thesis
+rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='venv/' --exclude='data' --exclude='server/mlartifacts' --exclude='mlartifacts' --exclude='mlruns' --exclude='mlflow.db' --exclude='.archive'  . node:~/projects/thesis
 ```
 
 Get some memory
@@ -20,7 +20,17 @@ salloc -n8 --gres=gpu:1 -J singularity_bash --partition=full_optima --mem=64G --
 Stop the existing singularity
 ```bash
 singularity instance stop thesis_env
+cp projects/thesis/server/container.def .
 sudo singularity build thesis.sif container.def
+```
+
+If the tmp directory is full
+```bash
+mkdir -p /scratch/$USER/sing_tmp /scratch/$USER/sing_cache
+
+sudo SINGULARITY_TMPDIR=/scratch/$USER/sing_tmp \
+     SINGULARITY_CACHEDIR=/scratch/$USER/sing_cache \
+     singularity build thesis.sif container.def
 ```
 
 Start the singularity

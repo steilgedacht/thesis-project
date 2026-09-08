@@ -125,7 +125,7 @@ def train_inr(
                     plot_lesion_time_evolution(model, epoch, trj, config)
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
-        scheduler.step()epoch
+        scheduler.step()
         
         avg_loss = total_loss / len(train_loader)
         losses.append(avg_loss)

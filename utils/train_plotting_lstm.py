@@ -1,3 +1,5 @@
+import os
+
 import torch
 import numpy as np
 import mlflow
@@ -125,6 +127,14 @@ class ReferenceGeometry:
     volume_center_phys: np.ndarray  # mm, grid's geometric center -- training's origin
     voxel_spacing: np.ndarray       # mm per voxel along (i, j, k)
     label_aspect: float             # voxel_spacing[1] / voxel_spacing[0]
+
+
+@dataclass
+class CanonicalGridGeometry:
+    """Physical geometry of one trajectory's canonical LSTM crop."""
+    center: np.ndarray
+    extent_mm: float
+    grid_size: Tuple[int, int, int]
  
  
 @dataclass
@@ -334,6 +344,52 @@ def _predict_grids_lstm(model, patient_idx_tensor, config, time_points, observed
     return heatmaps
 
 
+def _canonical_to_native_slice(pred_volume, label_shape, affine, canonical_geom,
+                               lesion_z_voxel):
+    """Resample a canonical prediction onto a native-label axial slice."""
+    rows, cols = np.meshgrid(
+        np.arange(label_shape[0]), np.arange(label_shape[1]), indexing='ij'
+    )
+    voxel_ijk = np.stack([
+        rows.ravel(), cols.ravel(),
+        np.full(rows.size, lesion_z_voxel, dtype=float),
+    ], axis=1)
+    ones = np.ones((voxel_ijk.shape[0], 1))
+    physical = (affine @ np.concatenate([voxel_ijk, ones], axis=1).T).T[:, :3]
+    canonical_coords = (
+        (physical - canonical_geom.center) / canonical_geom.extent_mm + 0.5
+    ) * (np.asarray(canonical_geom.grid_size) - 1)
+    native_slice = ndimage.map_coordinates(
+        pred_volume, canonical_coords.T, order=1, mode='constant', cval=0.0
+    )
+    return native_slice.reshape(label_shape[:2])
+
+
+def _predict_lstm_grid_sequence(model, trj, query_times):
+    """Predict canonical-grid volumes using the real trajectory history."""
+    device = next(model.parameters()).device
+    real_times = trj.times
+    real_grids = trj.grids
+    patient_idx = torch.tensor([trj.embedding_id], dtype=torch.long, device=device)
+
+    pred_volumes = []
+    with torch.no_grad():
+        for time_point in query_times:
+            if time_point <= real_times[0]:
+                pred_volumes.append(real_grids[0, 0])
+                continue
+
+            history_length = int((real_times < time_point).sum())
+            history_grids = torch.from_numpy(real_grids[:history_length]).unsqueeze(0).float().to(device)
+            history_times = torch.from_numpy(real_times[:history_length]).unsqueeze(0).float().to(device)
+            target_time = torch.tensor([[time_point]], dtype=torch.float32, device=device)
+            full_times = torch.cat([history_times, target_time], dim=1)
+            predictions = model(history_grids, full_times, patient_idx, n_future=1)
+            pred_volumes.append(torch.sigmoid(predictions[0, -1, 0]).cpu().numpy())
+
+    return np.stack(pred_volumes, axis=0)
+
+
 def _predict_heatmap(model, patient_idx_tensor, t, x, y, z, side_length, batch_size=150_000):
     """Legacy function for compatibility - detects model type and routes accordingly."""
     if _is_lstm_model(model):
@@ -396,54 +452,30 @@ def _assemble_time_series(model, patient_idx_tensor, config, full_matrix_labels,
         )
 
 
-def _assemble_time_series_lstm(model, patient_idx_tensor, config, full_matrix_labels,
-                                label_shape, affine, geometry, side_length) -> LesionTimeSeries:
+def _assemble_time_series_lstm(model, trj, config, full_matrix_labels,
+                                label_shape, affine, geometry,
+                                canonical_geom) -> LesionTimeSeries:
     """Assemble time series for LSTM by loading observation grids and predicting forward.
     
     MEMORY EFFICIENT: One forward pass per time point, extracts 2D slices directly.
     No coordinate queries needed.
     """
-    from .dataloader_lstm import LesionSequenceDataset
-    from .mri_dataloader import MRI_Dataloader
-    
     lesion_z_voxel = _compute_lesion_z_voxel(full_matrix_labels)
-    
-    # Use time points from labels (observation times + extrapolation into future)
-    label_times = np.array([day for _, day in full_matrix_labels])
-    last_time = label_times[-1]
-    future_days = config.time_evolution_steps - len(label_times)
-    max_future = min(last_time + 365, last_time * 1.5)  # Don't predict too far
-    
-    if future_days > 0:
-        future_times = np.linspace(last_time + 1, max_future, future_days)
-        time_points = np.concatenate([label_times, future_times])
-    else:
-        time_points = label_times[:config.time_evolution_steps]
-    
-    # Load observed grids (all labels)
-    observed_grids_list = []
-    observed_times_list = []
-    
-    for labels, day in full_matrix_labels[:config.max_sequence_len]:  # Use history up to max sequence length
-        # Resize label to LSTM grid size
-        grid = ndimage.zoom(labels.astype(float), 
-                           np.array(config.lstm_grid_size) / np.array(labels.shape),
-                           order=1)
-        observed_grids_list.append(torch.from_numpy(grid[None, None]).float())  # [1, D, H, W]
-        observed_times_list.append(day)
-    
-    observed_grids = torch.stack(observed_grids_list, dim=1)  # [1, T, 1, D, H, W]
-    observed_times = torch.tensor([observed_times_list], dtype=torch.float32)  # [1, T]
-    
-    # Predict grids over time
-    heatmaps = _predict_grids_lstm(model, patient_idx_tensor, config, 
-                                   time_points, observed_grids, observed_times, 
-                                   lesion_z_voxel)
-    
-    # Normalize heatmaps
-    heatmap_peak = np.max(heatmaps, axis=(1, 2), keepdims=True)
+    real_times = trj.times
+    time_points = np.linspace(real_times.min(), real_times[-1] + 180,
+                              config.time_evolution_steps)
+
+    pred_volumes = _predict_lstm_grid_sequence(model, trj, time_points)
+    heatmaps = np.array([
+        _canonical_to_native_slice(
+            prediction, label_shape, affine, canonical_geom, lesion_z_voxel
+        )
+        for prediction in pred_volumes
+    ])
+
+    heatmap_peak = np.max(heatmaps, axis=(1, 2))
     heatmap_peak[heatmap_peak == 0] = 1.0
-    heatmaps = heatmaps / heatmap_peak
+    heatmaps = heatmaps / heatmap_peak[:, np.newaxis, np.newaxis]
     
     # Get labels at each time point
     label_slices, volumes_3d, lesion_sizes = [], [], []
@@ -465,8 +497,8 @@ def _assemble_time_series_lstm(model, patient_idx_tensor, config, full_matrix_la
     change_points = np.zeros(len(time_points), dtype=bool)
     change_points[1:] = lesion_sizes_cm3[1:] != lesion_sizes_cm3[:-1]
     
-    spacing_i, spacing_j = _heatmap_pixel_spacing(geometry, label_shape, side_length)
-    heatmap_aspect = spacing_j / spacing_i
+    spacing_i, spacing_j = geometry.voxel_spacing[:2]
+    heatmap_aspect = geometry.label_aspect
     
     return LesionTimeSeries(
         time_points=time_points,
@@ -755,6 +787,9 @@ def plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=Fals
     Panels: predicted heatmap, ground-truth label slice, 3D label scatter,
     heatmap/label overlap, lesion-size timeline, top-down height map.
     """
+    if _is_lstm_model(model):
+        return plot_lesion_time_evolution_lstm(model, epoch, trj, config, final_side_length)
+
     side_length = config.full_size_side_length if final_side_length else config.time_evolution_side_length
     patient_idx_tensor = torch.tensor(trj.embedding_id).unsqueeze(0).to(config.device)
     patient_idx = patient_idx_tensor.item()
@@ -771,13 +806,43 @@ def plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=Fals
  
     def update(frame_idx):
         return _update_frame(frame_idx, data, artists, patient_idx)
- 
+
+    os.makedirs("tmp", exist_ok=True)
     output_path = (
-        f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_"
+        f"tmp/{epoch:04d}_epoch_lesion_heatmap_patient_"
         f"{trj.patient_id}_{patient_idx}_lesion_{trj.label_id}.gif"
     )
     _save_gif(artists.fig, update, len(data.heatmaps), output_path)
  
+    mlflow.log_artifact(output_path)
+    plt.close(artists.fig)
+
+
+def plot_lesion_time_evolution_lstm(model, epoch, trj, config, final_side_length=False):
+    """Render LSTM predictions in the original label volume coordinate frame."""
+    full_matrix_labels, affine = _load_full_matrix_with_affine(trj)
+    label_shape = np.array(full_matrix_labels[0][0].shape)
+    geometry = _compute_reference_geometry(label_shape, affine)
+    canonical_geom = CanonicalGridGeometry(
+        center=trj.canonical_center,
+        extent_mm=trj.canonical_extent_mm,
+        grid_size=config.lstm_grid_size,
+    )
+    data = _assemble_time_series_lstm(
+        model, trj, config, full_matrix_labels, label_shape, affine,
+        geometry, canonical_geom
+    )
+    artists = _build_figure(data, trj.embedding_id)
+
+    def update(frame_idx):
+        return _update_frame(frame_idx, data, artists, trj.embedding_id)
+
+    os.makedirs("tmp", exist_ok=True)
+    output_path = (
+        f"tmp/{epoch:04d}_epoch_lesion_heatmap_patient_"
+        f"{trj.patient_id}_{trj.embedding_id}_lesion_{trj.label_id}.gif"
+    )
+    _save_gif(artists.fig, update, len(data.heatmaps), output_path)
     mlflow.log_artifact(output_path)
     plt.close(artists.fig)
  

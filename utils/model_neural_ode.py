@@ -128,7 +128,11 @@ class FixedStepODESolver(nn.Module):
 
 
 class SpatialDecoder(nn.Module):
-    """Maps (encoded x, y, z) + z(t) -> occupancy logit."""
+    """Maps encoded spatial coordinates and z(t) to an occupancy logit.
+
+    FiLM conditioning lets the trajectory latent modulate every hidden layer,
+    rather than relying on a single concatenation at the input layer.
+    """
     def __init__(self, spatial_in_dim, latent_dim, hidden_dim=256, n_layers=4):
         super().__init__()
         layers = [nn.Linear(spatial_in_dim + latent_dim, hidden_dim), nn.ReLU()]
@@ -136,9 +140,24 @@ class SpatialDecoder(nn.Module):
             layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
         layers += [nn.Linear(hidden_dim, 1)]
         self.net = nn.Sequential(*layers)
+        self.film = nn.ModuleList(
+            nn.Linear(latent_dim, 2 * hidden_dim)
+            for _ in range(n_layers - 1)
+        )
+        for modulation in self.film:
+            nn.init.zeros_(modulation.weight)
+            nn.init.zeros_(modulation.bias)
 
     def forward(self, xyz_encoded, z_t):
-        return self.net(torch.cat([xyz_encoded, z_t], dim=-1))
+        hidden = torch.cat([xyz_encoded, z_t], dim=-1)
+        film_index = 0
+        for layer in self.net:
+            hidden = layer(hidden)
+            if isinstance(layer, nn.ReLU) and film_index < len(self.film):
+                scale, shift = self.film[film_index](z_t).chunk(2, dim=-1)
+                hidden = hidden * (1.0 + scale) + shift
+                film_index += 1
+        return hidden
 
 
 class NeuralODE_INR(nn.Module):
@@ -165,6 +184,7 @@ class NeuralODE_INR(nn.Module):
         ode_layers=2,
         ode_steps=16,
         ode_method="rk4",
+        max_t=3650.0,
         spatial_hidden_dim=256,
         spatial_layers=4,
         num_fourier_frequencies=6,
@@ -172,6 +192,7 @@ class NeuralODE_INR(nn.Module):
         super().__init__()
 
         self.patient_embedding = nn.Embedding(num_patients, patient_embed_dim)
+        self.max_t = max_t
 
         # z(0), derived from the patient embedding.
         self.initial_state_net = nn.Sequential(
@@ -205,7 +226,7 @@ class NeuralODE_INR(nn.Module):
 
     def forward(self, coords, patient_idx):
         xyz = coords[..., :3]                 # [B, N, 3]
-        t = self._shared_time(coords)          # [B, 1]
+        t = self._shared_time(coords) / self.max_t  # [B, 1], normalized to the training range
 
         patient_emb = self.patient_embedding(patient_idx)   # [B, E]
         z0 = self.initial_state_net(patient_emb)             # [B, latent_dim]

@@ -94,16 +94,14 @@ EOF
     # 8. Install the rest of the stack
     uv pip install --system --no-cache --constraint /opt/torch-constraints.txt \
         pandas numpy scipy scikit-image scikit-learn matplotlib \
-        nibabel plotly tqdm mlflow ipython notebook \
+        nibabel plotly tqdm mlflow==3.14.0 ipython notebook \
         opencv-python-headless pillow pydicom natsort sqlalchemy h5py \
         monai pytorch-lightning==2.4.0 pycm joblib \
         tables xlrd openpyxl concurrent-log-handler \
-        Wand
+        wand higher
 
 %startscript
-    tmux new-session -d -s mlflow_server 'mlflow server --host 0.0.0.0 --port 5000'
-    # Note: ensure code-server is installed if you want to use this
-    # tmux new-session -d -s code_server 'code-server --bind-addr 0.0.0.0:8080 --auth none'
+    tmux new-session -d -s mlflow_server 'mlflow server --host 127.0.0.1 --port 5000'
 
 %runscript
     # If a command is passed, run it. Otherwise, start zsh.

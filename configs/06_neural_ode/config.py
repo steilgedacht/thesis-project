@@ -34,7 +34,7 @@ class Config:
     max_grad_norm_clip = 1.0
     only_train = False
 
-    from utils.loss_bce_dice_tv import Loss_BCE_Dice_TV
+    from utils.loss_node import Loss_BCE_Dice_TV
     
     # Dynamic class weighting based on ground truth imbalance
     # Automatically adapts pos_weight per batch from label class ratio
@@ -47,7 +47,8 @@ class Config:
     # Instantiate loss with dynamic weighting
     loss_fn = Loss_BCE_Dice_TV(
         lambda_space=3e-3, 
-        lambda_time=0.01
+        lambda_time=0.01,
+        use_dynamic_pos_weight=use_dynamic_pos_weight,
     )
 
 
@@ -61,6 +62,7 @@ class Config:
         ode_layers=5,
         ode_steps=16,        # mehr = genauer, aber langsamer/mehr Speicher (Backprop through time)
         ode_method="rk4",    # oder "euler"
+        max_t=3650.0,
         spatial_hidden_dim=256,
         spatial_layers=8,
         num_fourier_frequencies=12,  # 0 = deaktiviert

@@ -10,13 +10,11 @@ import glob
 import os
 import json
 
-import cv2
 import numpy as np
 import pandas as pd
 import nibabel as nib
 from scipy import ndimage
 from scipy.ndimage import zoom, label, binary_fill_holes
-from scipy.spatial.distance import cdist
 from skimage.measure import find_contours
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -44,13 +42,8 @@ class DataSample:
         self.date = pre_post_path.split(os.path.sep)[-2]
         self.date_time = "_".join(self.pre_post_path.split("_")[-3:-1])
 
-        self.registered_transform_path = self.paths.registered_transform_path(self.patient_id, self.date)
-        if os.path.exists(self.registered_transform_path):
-            self.registered_transform = np.load(self.registered_transform_path)
-        else:
-            self.registered_transform = None
-
         self.lesion_prediction_nnUnet_path = self.paths.nnunet_prediction_path(self.patient_id, self.date)
+        self.lesion_prediction_nnUnet_path_2 = self.paths.nnunet_prediction_path(self.patient_id, self.date, model=2)
         self.lesion_segmentation_path = self.paths.lesion_segmentation_path(self.patient_id, self.date)
         self.lesion_trajectory_path = self.paths.lesion_trajectory_seg_path(self.patient_id, self.date)
         self.zoomed_segmentation_path = self.paths.zoomed_segmentation_path(self.patient_id, self.date)
@@ -129,12 +122,14 @@ class DataSample:
             return img.get_fdata(), img.affine
         return nib.load(path).get_fdata()
 
-    def load_nnUNet_prediction(self):
+    def load_nnUNet_prediction(self, model: int = 1):
         """Loads the output file from the nnUNet prediction"""
-        if os.path.exists(self.lesion_prediction_nnUnet_path):
-            return nib.load(self.lesion_prediction_nnUnet_path).get_fdata()
+        path = self.lesion_prediction_nnUnet_path if model == 1 else self.lesion_prediction_nnUnet_path_2
+
+        if os.path.exists(path):
+            return nib.load(path).get_fdata()
         else:
-            raise FileNotFoundError(f"nnUNet prediction file not found at {self.lesion_prediction_nnUnet_path}")
+            raise FileNotFoundError(f"nnUNet prediction file not found at {path}")
 
     def load_mri_segmentation(self, affine=False, zoomed=False):
         path = self.zoomed_segmentation_path if zoomed else self.lesion_segmentation_path
@@ -163,129 +158,14 @@ class DataSample:
         glob_path = self.paths.other_timepoint_glob(self.patient_id, date)
         return DataSample(glob.glob(glob_path, recursive=True)[0])
 
-
-    def _fillup_lesion_segmentation(
-            self,
-            slice_2d: np.ndarray, 
-            max_cluster_dist: int = 30,
-            max_kernel: int = 25,
-            solidity_thresh: float = 0.8
-        ) -> np.ndarray:
-        """
-        Groups nearby arcs into lesion clusters, then applies morphological closing 
-        with increasing kernel sizes until the filled shape achieves a Solidity 
-        (Filled Area / Convex Hull Area) >= solidity_thresh.
-
-        Parameters
-        ----------
-        slice_2d : np.ndarray
-            Single 2D image slice of shape (H, W).
-        max_cluster_dist : int, optional
-            Arcs closer than this distance are grouped into the same lesion cluster. Default is 30.
-        max_kernel : int, optional
-            Maximum morphological kernel size to attempt. Default is 25.
-        solidity_thresh : float, optional
-            Target ratio of (Filled Area / Convex Hull Area). Default is 0.75.
-
-        Returns
-        -------
-        solid_slice : np.ndarray (bool)
-            Solid 2D mask of shape (H, W).
-        """
-        binary_slice = (slice_2d > 0).astype(np.uint8)
-        solid_slice = np.zeros_like(binary_slice, dtype=bool)
-
-        if not np.any(binary_slice):
-            return solid_slice
-
-        # 1. Label all individual arcs/components
-        labeled, num_features = label(binary_slice)
-        if num_features == 0:
-            return solid_slice
-
-        # 2. Extract pixel coordinates per component
-        comp_coords = [np.argwhere(labeled == i) for i in range(1, num_features + 1)]
-
-        # 3. Build adjacency matrix for proximity clustering
-        adj_matrix = np.zeros((num_features, num_features), dtype=bool)
-        for i in range(num_features):
-            adj_matrix[i, i] = True
-            for j in range(i + 1, num_features):
-                min_d = np.min(cdist(comp_coords[i], comp_coords[j]))
-                if min_d <= max_cluster_dist:
-                    adj_matrix[i, j] = True
-                    adj_matrix[j, i] = True
-
-        # 4. Group adjacent arcs into Lesion Clusters
-        visited = np.zeros(num_features, dtype=bool)
-        clusters = []
-        for i in range(num_features):
-            if not visited[i]:
-                cluster = []
-                queue = [i]
-                visited[i] = True
-                while queue:
-                    curr = queue.pop(0)
-                    cluster.append(curr + 1)
-                    neighbors = np.where(adj_matrix[curr] & ~visited)[0]
-                    for n in neighbors:
-                        visited[n] = True
-                        queue.append(n)
-                clusters.append(cluster)
-
-        # 5. Process each cluster using Convex Hull Ratio (Solidity)
-        for cluster in clusters:
-            cluster_mask = np.isin(labeled, cluster).astype(np.uint8)
-
-            # Find boundary points to compute the 2D Convex Hull Area
-            contours, _ = cv2.findContours(cluster_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
-                
-            all_pts = np.vstack(contours)
-            hull = cv2.convexHull(all_pts)
-            hull_area = cv2.contourArea(hull)
-
-            # Fallback if hull area is invalid (e.g. single point or thin line)
-            if hull_area <= 0:
-                solid_slice = np.logical_or(solid_slice, binary_fill_holes(cluster_mask > 0))
-                continue
-
-            filled_cluster = None
-
-            # Dynamically test kernel sizes until Solidity >= solidity_thresh (0.75)
-            for k_size in range(3, max_kernel + 1, 2):
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-                closed = cv2.morphologyEx(cluster_mask, cv2.MORPH_CLOSE, kernel)
-                filled = binary_fill_holes(closed > 0)
-                
-                filled_area = np.sum(filled)
-                solidity = filled_area / hull_area
-
-                # If filled area covers at least 75% of the convex hull, stop!
-                if solidity >= solidity_thresh:
-                    filled_cluster = filled
-                    break
-
-            # Fallback if max_kernel is reached without hitting 0.75: use highest kernel attempt
-            if filled_cluster is None:
-                filled_cluster = filled if 'filled' in locals() else binary_fill_holes(cluster_mask > 0)
-
-            solid_slice = np.logical_or(solid_slice, filled_cluster)
-
-        return solid_slice
-
     def process_sample(self):
         mri_image, affine = self.load_mri(affine=True)
         nnUNet_prediction = self.load_nnUNet_prediction()
+        nnUNet_prediction2 = self.load_nnUNet_prediction(model=2)
 
         for z in range(nnUNet_prediction.shape[2]):
-            nnUNet_prediction[:, :, z] = self._fillup_lesion_segmentation(
-                nnUNet_prediction[:, :, z], 
-                max_cluster_dist=nnUNet_prediction.shape[0] // 6, 
-                max_kernel=nnUNet_prediction.shape[0] // 6, 
-                solidity_thresh=0.85
-            )
+            nnUNet_prediction[:, :, z] = binary_fill_holes(nnUNet_prediction[:, :, z] > 0) + binary_fill_holes(nnUNet_prediction2[:, :, z] > 0)
+
         # now we label connected lesions
         labeled_array, num_features = ndimage.label(nnUNet_prediction)
 
@@ -320,6 +200,72 @@ class DataSample:
         nib.save(img, self.lesion_segmentation_path)
 
         return labeled_array
+
+    def plot_seg_comparison(self,
+                            output_path='animation.gif',
+                            save_animation=False,
+                            plot_mri=True,
+                            plot_nnUNet_prediction=True,
+                            plot_lesion_segmentation=True,
+                            jupyter_mode=True
+                            ):
+
+        mri_image = self.load_mri()
+        nnUNet_prediction = self.load_nnUNet_prediction() > 0
+
+        tmp_path = self.lesion_prediction_nnUnet_path
+        self.lesion_prediction_nnUnet_path = self.lesion_prediction_nnUnet_path.replace("seg_nnUnet.nii.gz", "seg_nnUnet_2.nii.gz")
+        nnUNet_prediction2 = self.load_nnUNet_prediction() > 0
+        self.lesion_prediction_nnUnet_path = tmp_path
+
+        number_of_plots = sum([plot_mri, plot_nnUNet_prediction, plot_lesion_segmentation])
+        fig, axes = plt.subplots(1, number_of_plots, figsize=(6 * number_of_plots, 6))
+        fig.tight_layout()
+
+        plot_counter = 0
+
+        cmap = cm.get_cmap('Dark2', self.num_lesions + 1)
+        colors = cmap(np.linspace(0, 1, self.num_lesions + 1))
+        colors[0, -1] = 0
+        seg_cmap = ListedColormap(colors)
+
+        if plot_mri:
+            im_mri_1 = axes[plot_counter].imshow(mri_image[:, :, 0], cmap='gray', vmin=mri_image.min(), vmax=mri_image.max(), alpha=0.5)
+            im_seg_1 = axes[plot_counter].imshow(nnUNet_prediction[:, :, 0], cmap='Reds', alpha=0.3, vmin=0, vmax=1)
+
+            axes[plot_counter].set_title('MRI')
+            plot_counter += 1
+
+        if plot_nnUNet_prediction:
+            im_mri_2 = axes[plot_counter].imshow(mri_image[:, :, 0], cmap='gray', vmin=mri_image.min(), vmax=mri_image.max(), alpha=0.5)
+            im_seg_2 = axes[plot_counter].imshow(nnUNet_prediction2[:, :, 0], cmap='Reds', alpha=0.3, vmin=0, vmax=1)
+            axes[plot_counter].set_title('nnUNet Prediction')
+            plot_counter += 1
+
+        if plot_lesion_segmentation:
+            im_mri_3 = axes[plot_counter].imshow(mri_image[:, :, 0], cmap='gray', vmin=mri_image.min(), vmax=mri_image.max(), alpha=0.5)
+            im_seg_3 = axes[plot_counter].imshow(nnUNet_prediction[:, :, 0] ^ nnUNet_prediction2[:, :, 0], cmap="Reds", alpha=0.3, vmin=0, vmax=1)
+            axes[plot_counter].set_title('Lesion Segmentation')
+
+        def update(frame):
+            if plot_mri:
+                im_mri_1.set_data(mri_image[:, :, frame])
+                im_seg_1.set_data(nnUNet_prediction[:, :, frame])
+            if plot_nnUNet_prediction:
+                im_mri_2.set_data(mri_image[:, :, frame])
+                im_seg_2.set_data(nnUNet_prediction2[:, :, frame])
+            if plot_lesion_segmentation:
+                im_mri_3.set_data(mri_image[:, :, frame])
+                im_seg_3.set_data(nnUNet_prediction[:, :, frame] ^ nnUNet_prediction2[:, :, frame])
+
+        ani = animation.FuncAnimation(fig, update, frames=mri_image.shape[2], repeat=False)
+        if save_animation:
+            ani.save(output_path, fps=5)
+        plt.close()
+
+        if jupyter_mode:
+            return HTML(ani.to_jshtml())
+
 
     def plot_mri_animation(self,
                             output_path='animation.gif',
@@ -379,6 +325,7 @@ class DataSample:
         if jupyter_mode:
             return HTML(ani.to_jshtml())
 
+
     def __repr__(self):
         return f"MRI({self.patient_id}, {self.date}, {self.n_scans} scans)"
 
@@ -402,14 +349,6 @@ class DataSample:
     def save_registered_images(self):
         if self.registered_transform is not None:
             np.save(self.registered_transform_path, self.registered_transform)
-
-    def load_registered_transform(self):
-        if os.path.exists(self.registered_transform_path):
-            self.registered_transform = np.load(self.registered_transform_path)
-        else:
-            print(f"Registered transform file not found at {self.registered_transform_path}. Using identity transform.")
-            self.registered_transform = np.array([0, 0, 0, 0, 0, 0, 1.0, 1.0, 1.0])
-        return self.registered_transform
 
     def zoom(self, target_shape=(500, 500, 50)):
         image, affine = self.load_mri(affine=True)

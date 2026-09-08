@@ -7,8 +7,14 @@ import mlflow
 import mlflow.pytorch
 from tqdm import tqdm
 from utils.mri_dataloader import MRI_Dataloader
-from utils.dataloader_lstm import LesionSequenceDataset, Validation_Extrapolation_LesionSequenceDataset, Validation_Interpolation_LesionSequenceDataset, Plotting_LesionSequenceDataset
-from utils.train_plotting import *
+from utils.dataloader_lstm import (
+    LesionSequenceDataset,
+    Validation_Extrapolation_LesionSequenceDataset,
+    Validation_Interpolation_LesionSequenceDataset,
+    Plotting_LesionSequenceDataset,
+    sequence_collate_fn,
+)
+from utils.train_plotting_lstm import *
 import argparse
 import requests
 import json
@@ -20,7 +26,7 @@ def check_if_mlflow_is_running(config):
     except Exception as e:
         import shutil
         import time
-        shutil.os.system("tmux new-session -d -s mlflow_server 'mlflow server'")
+        shutil.os.system(f"tmux new-session -d -s mlflow_server 'mlflow server --host {config.mlflow_tracking_uri.split(':')[1].split('/')[2]} --port {config.mlflow_tracking_uri.split(':')[2]}'")
         print("Starting Mlflow in a new tmux session...")
         time.sleep(5)
 
@@ -152,19 +158,29 @@ def train_lstm(
 
         # ==== Training Loop ====
         model.train()
-        for i, (grids, times, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}/{config.epochs} [{phase}]"):
+        for i, (grids, times, patient_idx, lengths) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}/{config.epochs} [{phase}]"):
 
             grids = grids.to(config.device)          # [1, T, 1, D, H, W]
             times = times.to(config.device)          # [1, T]
             patient_idx = patient_idx.to(config.device)
+            lengths = lengths.to(config.device)
 
             if phase == "autoencoder" and supports_staged_training:
                 # No RNN involved: reconstruct every observed frame independently.
                 predictions = model.forward_autoencoder(grids)   # [1, T, 1, D, H, W]
                 targets = grids
+                valid_steps = torch.arange(
+                    predictions.shape[1], device=config.device
+                )[None, :] < lengths[:, None]
             else:
                 predictions = model(grids, times, patient_idx)   # [1, T-1, 1, D, H, W]
                 targets = grids[:, 1:]                            # ground-truth next-frame at each step
+                valid_steps = torch.arange(
+                    predictions.shape[1], device=config.device
+                )[None, :] < (lengths - 1).clamp_min(0)[:, None]
+
+            predictions = predictions[valid_steps]
+            targets = targets[valid_steps]
 
             loss = criterion(predictions, targets)
 
@@ -283,6 +299,7 @@ if __name__ == "__main__":
             train_dataset, 
             batch_size=config.batchsize, 
             shuffle=True, 
+            collate_fn=sequence_collate_fn,
             num_workers=config.num_workers, 
             prefetch_factor=config.prefetch_factor, 
             pin_memory=config.pin_memory, 

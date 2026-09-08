@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import mlflow
@@ -568,9 +569,10 @@ def plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=Fals
  
     def update(frame_idx):
         return _update_frame(frame_idx, data, artists, patient_idx)
- 
+
+    os.makedirs("tmp", exist_ok=True)
     output_path = (
-        f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_"
+        f"tmp/{epoch:04d}_epoch_lesion_heatmap_patient_"
         f"{trj.patient_id}_{patient_idx}_lesion_{trj.label_id}.gif"
     )
     _save_gif(artists.fig, update, len(data.heatmaps), output_path)
@@ -755,8 +757,9 @@ def plot_lesion_time_evolution_lstm(model, epoch, trj, config, final_side_length
     def update(frame_idx):
         return _update_frame(frame_idx, data, artists, patient_idx)
 
+    os.makedirs("tmp", exist_ok=True)
     output_path = (
-        f"/tmp/{epoch:04d}_epoch_lesion_heatmap_patient_"
+        f"tmp/{epoch:04d}_epoch_lesion_heatmap_patient_"
         f"{trj.patient_id}_{patient_idx}_lesion_{trj.label_id}.gif"
     )
     _save_gif(artists.fig, update, len(data.heatmaps), output_path)
