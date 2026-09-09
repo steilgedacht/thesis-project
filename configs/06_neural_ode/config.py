@@ -46,8 +46,8 @@ class Config:
     
     # Instantiate loss with dynamic weighting
     loss_fn = Loss_BCE_Dice_TV(
-        lambda_space=3e-3, 
-        lambda_time=0.01,
+        lambda_space=5e-3, 
+        lambda_time=0.1,
         use_dynamic_pos_weight=use_dynamic_pos_weight,
     )
 
@@ -56,16 +56,16 @@ class Config:
     from utils.model_neural_ode import NeuralODE_INR
     model = NeuralODE_INR
     model_params = dict(
-        patient_embed_dim=32,
-        latent_dim=256,
-        ode_hidden_dim=256,
+        patient_embed_dim=48,
+        latent_dim=512,
+        ode_hidden_dim=512,
         ode_layers=5,
         ode_steps=16,        # mehr = genauer, aber langsamer/mehr Speicher (Backprop through time)
         ode_method="rk4",    # oder "euler"
         max_t=3650.0,
-        spatial_hidden_dim=256,
-        spatial_layers=8,
-        num_fourier_frequencies=12,  # 0 = deaktiviert
+        spatial_hidden_dim=512,
+        spatial_layers=10,
+        num_fourier_frequencies=16,  # 0 = deaktiviert
     )
 
     model_save_name = "lesion_ode_model"
