@@ -85,7 +85,10 @@ class LatentODEFunc(nn.Module):
         layers = [nn.Linear(latent_dim + cond_dim, hidden_dim), nn.Tanh()]
         for _ in range(n_layers - 1):
             layers += [nn.Linear(hidden_dim, hidden_dim), nn.Tanh()]
-        layers += [nn.Linear(hidden_dim, latent_dim)]
+        output_layer = nn.Linear(hidden_dim, latent_dim)
+        nn.init.zeros_(output_layer.weight)
+        nn.init.zeros_(output_layer.bias)
+        layers += [output_layer]
         self.net = nn.Sequential(*layers)
 
     def forward(self, z, cond):
@@ -147,6 +150,7 @@ class SpatialDecoder(nn.Module):
         for modulation in self.film:
             nn.init.zeros_(modulation.weight)
             nn.init.zeros_(modulation.bias)
+        nn.init.constant_(self.net[-1].bias, -0.5)
 
     def forward(self, xyz_encoded, z_t):
         hidden = torch.cat([xyz_encoded, z_t], dim=-1)
