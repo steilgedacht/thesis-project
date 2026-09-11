@@ -52,10 +52,11 @@ import torch.nn as nn
 
 
 class FourierFeatures(nn.Module):
-    """Standard NeRF-style positional encoding for the spatial input.
-    Helps a coordinate-conditioned decoder represent sharp lesion
-    boundaries instead of only smooth/low-frequency shapes. Set
-    num_frequencies=0 to disable and fall back to raw (x, y, z).
+    """Mixed-direction Fourier encoding for spatial coordinates.
+
+    Several fixed directions are used at each frequency instead of encoding
+    x, y, and z independently. This reduces axis-aligned artifacts while
+    preserving the original feature width.
     """
     def __init__(self, in_dim=3, num_frequencies=6, include_input=True):
         super().__init__()
@@ -64,15 +65,29 @@ class FourierFeatures(nn.Module):
         if num_frequencies > 0:
             freq_bands = 2.0 ** torch.arange(num_frequencies)
             self.register_buffer("freq_bands", freq_bands)
+            generator = torch.Generator().manual_seed(0)
+            directions = torch.randn(
+                num_frequencies * in_dim,
+                in_dim,
+                generator=generator,
+            )
+            directions = directions / directions.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            self.register_buffer("directions", directions)
         self.out_dim = in_dim * (2 * num_frequencies + (1 if include_input else 0))
 
     def forward(self, x):
         if self.num_frequencies == 0:
             return x
         out = [x] if self.include_input else []
-        for freq in self.freq_bands:
-            out.append(torch.sin(x * freq * math.pi))
-            out.append(torch.cos(x * freq * math.pi))
+        projections = x @ self.directions.T
+        projections = projections.reshape(
+            *x.shape[:-1], self.num_frequencies, -1
+        )
+        projections = projections * self.freq_bands.view(
+            *((1,) * (x.ndim - 1)), self.num_frequencies, 1
+        ) * math.pi
+        out.append(torch.sin(projections).flatten(start_dim=-2))
+        out.append(torch.cos(projections).flatten(start_dim=-2))
         return torch.cat(out, dim=-1)
 
 

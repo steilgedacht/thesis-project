@@ -59,12 +59,12 @@ class Config:
         patient_embed_dim=32,
         latent_dim=512,
         ode_hidden_dim=512,
-        ode_layers=5,
+        ode_layers=8,
         ode_steps=16,        # mehr = genauer, aber langsamer/mehr Speicher (Backprop through time)
         ode_method="rk4",    # oder "euler"
         max_t=3650.0,
         spatial_hidden_dim=512,
-        spatial_layers=8,
+        spatial_layers=10,
         num_fourier_frequencies=12,  # 0 = deaktiviert
     )
 
