@@ -4,7 +4,7 @@ set -euo pipefail
 REMOTE_HOST="node"
 REMOTE_PROJECT_DIR="~/projects/thesis"
 LOCAL_SERVER_DIR="./server"
-MLFLOW_PORT=5001
+MLFLOW_PORT=5002
 MERGE_SCRIPT="utils/merge_dbs.py"
 
 # 2. Pull down only changed files
