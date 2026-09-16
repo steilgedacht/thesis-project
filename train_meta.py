@@ -14,7 +14,7 @@ import os
 
 # Utility imports (Assuming these are in your local directory)
 from utils.mri_dataloader import MRI_Dataloader
-from utils.dataloader import LesionDataset, Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset, Plotting_LesionDataset
+from utils.dataloader import MetaLesionDataset, Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset, Plotting_LesionDataset
 from utils.train_plotting_meta import *
 
 def check_if_mlflow_is_running(config):
@@ -51,16 +51,19 @@ def validate_polation(data_loader, text, global_step, criterion, model, config):
     inner_steps = getattr(config, 'inner_steps', 3)
     
     for v_coords, v_labels, v_p_idx in tqdm(data_loader, desc=text, total=len(data_loader)):
-        v_coords = v_coords.to(config.device)
+        v_coords = v_coords.to(config.device).requires_grad_(True)
         v_labels = v_labels.unsqueeze(-1).to(config.device)
         # v_p_idx is ignored; patient identity is learned via adaptation
 
         # Split into Support (for test-time adaptation) and Query (for evaluation)
-        split_idx = v_coords.shape[0] // 2
-        supp_coords, query_coords = v_coords[:split_idx], v_coords[split_idx:]
-        supp_labels, query_labels = v_labels[:split_idx], v_labels[split_idx:]
+        # Each dataset item is one task with shape [points, features]. DataLoader
+        # adds the task dimension, so support/query must be split along points.
+        split_idx = v_coords.shape[1] // 2
+        supp_coords = v_coords[:, :split_idx].clone().detach().requires_grad_(True)
+        query_coords = v_coords[:, split_idx:].clone().detach().requires_grad_(True)
+        supp_labels, query_labels = v_labels[:, :split_idx], v_labels[:, split_idx:]
 
-        if supp_coords.shape[0] == 0 or query_coords.shape[0] == 0:
+        if supp_coords.shape[1] == 0 or query_coords.shape[1] == 0:
             continue
 
         inner_optimizer = optim.SGD(model.parameters(), lr=inner_lr)
@@ -72,20 +75,20 @@ def validate_polation(data_loader, text, global_step, criterion, model, config):
             # Adapt to the patient's support scans using the full loss (BCE + Dice + TV)
             for _ in range(inner_steps):
                 supp_preds = fmodel(supp_coords)
-                inner_loss = criterion(supp_preds, supp_labels)
+                inner_loss = criterion(supp_preds, supp_labels, supp_coords)
                 diffopt.step(inner_loss)
 
             # Evaluate on the patient's query scans
-            with torch.no_grad():
-                query_preds = fmodel(query_coords)
-                # Use full loss for evaluation consistency with training
-                eval_loss = criterion(query_preds, query_labels)
-                
-                # Track individual components
-                bce_loss_total += criterion.loss_bce.item() if isinstance(criterion.loss_bce, torch.Tensor) else criterion.loss_bce
-                dice_loss_total += criterion.loss_dice.item() if isinstance(criterion.loss_dice, torch.Tensor) else criterion.loss_dice
-                tv_loss_total += (criterion.loss_tv.item() if isinstance(criterion.loss_tv, torch.Tensor) else criterion.loss_tv) if hasattr(criterion, 'loss_tv') else 0.0
-                num_batches += 1
+            query_preds = fmodel(query_coords)
+            # The TV term differentiates predictions with respect to coordinates, so
+            # query evaluation must retain autograd even though no model gradients are needed.
+            criterion(query_preds, query_labels, query_coords)
+
+            # Track individual components
+            bce_loss_total += criterion.loss_bce.item() if isinstance(criterion.loss_bce, torch.Tensor) else criterion.loss_bce
+            dice_loss_total += criterion.loss_dice.item() if isinstance(criterion.loss_dice, torch.Tensor) else criterion.loss_dice
+            tv_loss_total += (criterion.loss_tv.item() if isinstance(criterion.loss_tv, torch.Tensor) else criterion.loss_tv) if hasattr(criterion, 'loss_tv') else 0.0
+            num_batches += 1
 
     # Calculate averages
     num_batches = max(num_batches, 1)
@@ -151,6 +154,8 @@ def train_inr(
     # Meta-Learning specific config fallbacks
     inner_lr = getattr(config, 'inner_lr', 0.01)
     inner_steps = getattr(config, 'inner_steps', 3)
+    first_order = getattr(config, 'first_order', True)
+    meta_batch_size = getattr(config, 'meta_batch_size', 8)
     inner_optimizer = optim.SGD(model.parameters(), lr=inner_lr)
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -169,53 +174,76 @@ def train_inr(
 
         # ==== Meta-Training Loop ====
         model.train()
+        optimizer.zero_grad()
+
         for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}/{config.epochs}"):
-
-            coords = coords.to(config.device).requires_grad_(True)
+            coords = coords.to(config.device)
             labels = labels.to(config.device).unsqueeze(-1)
-            if coords.shape[1] == 0: continue
+            if coords.shape[1] == 0: 
+                continue
 
-            # SPLIT BATCH: Support Set (Inner Loop) & Query Set (Outer Loop)
-            split_idx = coords.shape[0] // 2
-            supp_coords, query_coords = coords[:split_idx], coords[split_idx:]
-            supp_labels, query_labels = labels[:split_idx], labels[split_idx:]
+            split_idx = coords.shape[1] // 2
+            supp_coords = coords[:, :split_idx]
+            query_coords = coords[:, split_idx:]
+            supp_labels, query_labels = labels[:, :split_idx], labels[:, split_idx:]
 
+            batch_size = coords.shape[0]
+            batch_outer_loss = 0.0
+
+            # Iterate through each task (patient) independently
+            for b in range(batch_size):
+                t_supp_coords = supp_coords[b:b+1].clone().detach().requires_grad_(True)
+                t_supp_labels = supp_labels[b:b+1]
+                t_query_coords = query_coords[b:b+1].clone().detach().requires_grad_(True)
+                t_query_labels = query_labels[b:b+1]
+
+                task_inner_opt = optim.SGD(model.parameters(), lr=inner_lr)
+
+                with higher.innerloop_ctx(
+                    model,
+                    task_inner_opt,
+                    copy_initial_weights=first_order,
+                    track_higher_grads=not first_order,
+                ) as (fmodel, diffopt):
+
+                    # Inner Loop: Patient-specific adaptation
+                    for _ in range(inner_steps):
+                        supp_preds = fmodel(t_supp_coords)
+                        inner_loss = criterion(supp_preds, t_supp_labels, t_supp_coords)
+                        diffopt.step(inner_loss)
+
+                    # Outer Loop: Query evaluation
+                    query_preds = fmodel(t_query_coords)
+                    outer_loss = criterion(query_preds, t_query_labels, t_query_coords)
+                    
+                    # Retain meta-gradients per task
+                    scaled_loss = outer_loss / batch_size
+                    scaled_loss.backward()
+
+                    if first_order:
+                        for meta_param, fast_param in zip(model.parameters(), fmodel.parameters()):
+                            if fast_param.grad is not None:
+                                task_grad = fast_param.grad.detach() / batch_size
+                                if meta_param.grad is None:
+                                    meta_param.grad = task_grad.clone()
+                                else:
+                                    meta_param.grad.add_(task_grad)
+
+                    batch_outer_loss += outer_loss.item()
+
+            # Meta-Optimizer update
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm_clip)
+            optimizer.step()
             optimizer.zero_grad()
 
-            # Create a fresh inner optimizer for each task to avoid reusing stale fast-weights state
-            inner_optimizer = optim.SGD(model.parameters(), lr=inner_lr)
-
-            # `copy_initial_weights=True` is the correct MAML behaviour: adapt a task-specific copy
-            # and only update the meta-weights via the query loss. In-place adaptation causes the
-            # shared model to drift toward trivial all-positive predictions across tasks.
-            with higher.innerloop_ctx(model, inner_optimizer, copy_initial_weights=True) as (fmodel, diffopt):
-
-                # --- INNER LOOP (Patient Adaptation) ---
-                for _ in range(inner_steps):
-                    supp_preds = fmodel(supp_coords)
-                    # Use full loss (BCE + Dice + TV) for inner loop adaptation
-                    inner_loss = criterion(supp_preds, supp_labels)
-                    diffopt.step(inner_loss)
-
-                # --- OUTER LOOP (Meta-Weight Update) ---
-                query_preds = fmodel(query_coords)
-                # Use full loss (BCE + Dice + TV) for meta-weight update
-                outer_loss = criterion(query_preds, query_labels)
-
-                if outer_loss.requires_grad:
-                    outer_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm_clip) 
-                    optimizer.step()
-            
-            total_loss += outer_loss.item()
-
+            total_loss += batch_outer_loss / batch_size
             if i % config.train_log_interval == 0:
                 mlflow.log_metrics(
                     {
                         "training_loss" : outer_loss.item(),
                         **criterion.loss_to_report,  # Includes BCE, Dice, TV, pos_weight components
                         # Approximation based on the query set predictions
-                        "wrongly_predicted_total_volume" : (query_preds > 0.5).sum().item() - (query_labels > 0.5).sum().item(),
+                        "wrongly_predicted_total_volume" : (torch.sigmoid(query_preds) > 0.5).sum().item() - (query_labels > 0.5).sum().item(),
                     },
                     step=global_step
                 )
@@ -243,11 +271,12 @@ def train_inr(
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
         scheduler.step()
         
-        avg_loss = total_loss / len(train_loader)
+        avg_loss = total_loss / max(len(train_loader), 1)
         losses.append(avg_loss)
+        mlflow.log_metric("epoch_train_loss", avg_loss, step=epoch)
         
-        if (epoch + 1) % config.print_loss_interval == 0:
-            print(f"Epoch {epoch+1}/{config.epochs}, Loss: {avg_loss:.6f}")
+        if epoch % config.print_loss_interval == 0 or epoch == 1:
+            print(f"Epoch {epoch}/{config.epochs}, Mean query loss: {avg_loss:.6f}")
 
     # ==== Final Logging and Visualization ====
     mlflow.pytorch.log_model(
@@ -293,7 +322,7 @@ if __name__ == "__main__":
             
         trajectories = mri_dataloader.cache_lesion_trajectories * config.training_dataset_samples_duplication_factor
         
-        train_dataset = LesionDataset(
+        train_dataset = MetaLesionDataset(
             trajectories, 
             dialation_iterations=config.dialation_iterations, 
             device=config.device, 

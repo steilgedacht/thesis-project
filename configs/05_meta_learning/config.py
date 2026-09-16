@@ -8,7 +8,9 @@ class Config:
 
 
     """ Dataloading parameters """
-    batchsize = 100
+    # One trajectory/sample is one MAML task. A larger batch would adapt one
+    # shared fast model to unrelated lesions simultaneously.
+    batchsize = 1
     num_workers = 7
     prefetch_factor = 2
     pin_memory = True
@@ -27,8 +29,8 @@ class Config:
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     epochs = 200
-    background_samples = 3000
-    lr = 1e-4
+    background_samples = 1000
+    lr = 3e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.0001
     max_grad_norm_clip = 1.0
@@ -40,21 +42,24 @@ class Config:
     # Automatically adapts pos_weight per batch from label class ratio
     use_dynamic_pos_weight = True
     
-    # Total Variation regularization for spatial smoothness
-    use_total_variation_loss = True
+    # Start with first-order MAML and BCE+Dice on small GPUs. TV can be enabled
+    # after the meta-updates are confirmed stable.
+    use_total_variation_loss = False
     tv_loss_weight = 0.01
     
     # Instantiate loss with dynamic weighting
     loss_fn = Loss_BCE_Dice_TV(
-        lambda_space=2e-2,
-        lambda_time=0.6,
+        lambda_space=2e-2 if use_total_variation_loss else 0.0,
+        lambda_time=0.6 if use_total_variation_loss else 0.0,
         use_dynamic_pos_weight=use_dynamic_pos_weight,
     )
 
     """ Meta-Learning specific parameters """
     # Inner loop (patient adaptation) hyperparameters
-    inner_lr = 0.01                # Learning rate for inner loop SGD
-    inner_steps = 3                # Number of inner loop update steps per task
+    inner_lr = 0.001               # Small adaptation steps for SIREN weights
+    inner_steps = 1                # Keep the first-order task update stable
+    first_order = True             # Avoid the very large second-order MAML graph
+    meta_batch_size = 8            # Average independent task gradients before AdamW
 
     """ Model parameters """
     from utils.model_inr_meta import LesionINR
