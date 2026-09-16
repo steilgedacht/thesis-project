@@ -1,0 +1,39 @@
+// High-Level NeuralODE_INR Architecture
+digraph NeuralODE_INR_Normal {
+	fontname=Helvetica nodesep=0.5 rankdir=TB ranksep=0.6
+	node [fontname=Helvetica fontsize=10 shape=rect style="filled,rounded"]
+	edge [color="#333333" fontname=Helvetica fontsize=9]
+	coords_in [label="Input Coords
+coords: [B, N, 4]
+(x, y, z, t)" fillcolor="#E1F5FE"]
+	p_idx [label="Patient Index
+patient_idx: [B]" fillcolor="#E1F5FE"]
+	p_embed [label="nn.Embedding
+patient_emb: [B, patient_embed_dim]" fillcolor="#FFF3E0"]
+	z0_net [label="initial_state_net (MLP)
+z0: [B, latent_dim]" fillcolor="#FFF3E0"]
+	time_norm [label="Shared Time Normalization
+t = mean(coords[..., 3]) / max_t
+Shape: [B, 1]" fillcolor="#FFEBEE"]
+	ode_solver [label="FixedStepODESolver (RK4/Euler)
+Integrator over n_steps
+z_t = ODESolve(z0, f_theta, 0 -> t)
+Shape: [B, latent_dim]" fillcolor="#FFEBEE"]
+	fourier [label="FourierFeatures
+3D Spatial Encoding
+xyz_encoded: [B, N, spatial_in_dim]" fillcolor="#E8F5E9"]
+	decoder [label="SpatialDecoder (FiLM MLPs)
+Modulated by z_t expanded to [B, N, latent_dim]" fillcolor="#F3E5F5"]
+	output [label="Occupancy Logits
+logits: [B, N, 1]" fillcolor="#ECEFF1" shape=doubleoctagon]
+	p_idx -> p_embed
+	p_embed -> z0_net
+	coords_in -> time_norm [label="Time Channel [..., 3]"]
+	z0_net -> ode_solver [label=z0]
+	time_norm -> ode_solver [label=t]
+	p_embed -> ode_solver [label=Conditioning]
+	coords_in -> fourier [label="Spatial Coords [..., :3]"]
+	fourier -> decoder [label=xyz_encoded]
+	ode_solver -> decoder [label="z_t (expanded)"]
+	decoder -> output
+}

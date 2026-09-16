@@ -1,0 +1,94 @@
+// Detailed NeuralODE_INR Architecture
+digraph NeuralODE_INR_Detailed {
+	fontname=Helvetica nodesep=0.4 rankdir=TB ranksep=0.5 splines=ortho
+	node [fontname=Helvetica fontsize=9 shape=rect style="filled,rounded"]
+	edge [color="#444444" fontname=Helvetica fontsize=8]
+	subgraph cluster_inputs {
+		color="#888888" fontcolor="#555555" label="Input Tensors [Batch Size B, N Points]" style=dashed
+		coords_in [label="Coords Input
+[B, N, 4]" fillcolor="#E1F5FE"]
+		p_idx [label="Patient Index
+[B]" fillcolor="#E1F5FE"]
+	}
+	subgraph cluster_patient_prep {
+		color="#E65100" fontcolor="#E65100" label="Patient Trajectory Initialization" style=dashed
+		p_embed [label="nn.Embedding(num_patients, patient_embed_dim)
+patient_emb: [B, patient_embed_dim]" fillcolor="#FFF3E0"]
+		z0_net [label="initial_state_net
+Linear(embed_dim, latent_dim) -> Tanh -> Linear
+z0: [B, latent_dim]" fillcolor="#FFF3E0"]
+	}
+	subgraph cluster_ode {
+		color="#C62828" fontcolor="#C62828" label="Latent Neural ODE Trajectory (FixedStepODESolver)" style=dashed
+		shared_time [label="_shared_time: coords[..., 3].mean(dim=1, keepdim=True)
+t = time / max_t -> [B, 1]" fillcolor="#FFEBEE"]
+		dt_calc [label="Step Size Calculation
+dt = t / n_steps" fillcolor="#FFEBEE"]
+		ode_func [label="LatentODEFunc f_theta(z, cond)
+Linear(latent+cond, 128) -> Tanh
+-> Linear(128, 128) -> Tanh -> Linear(128, latent)
+dz/dt: [B, latent_dim]" fillcolor="#FFEBEE"]
+		rk4_loop [label="RK4 Numerical Integration Loop (n_steps)
+k1 = f(z, cond)
+k2 = f(z + 0.5*dt*k1, cond)
+k3 = f(z + 0.5*dt*k2, cond)
+k4 = f(z + dt*k3, cond)
+z_{next} = z + (dt/6)*(k1 + 2k2 + 2k3 + k4)" fillcolor="#FFEBEE"]
+		z_t [label="Evaluated Latent State at Target Time
+z_t: [B, latent_dim]" fillcolor="#FFFFFF" shape=ellipse]
+	}
+	subgraph cluster_fourier {
+		color="#2E7D32" fontcolor="#2E7D32" label="Mixed-Direction Spatial Fourier Encoding" style=dashed
+		xyz_slice [label="Spatial Coordinates
+coords[..., :3]: [B, N, 3]" fillcolor="#E8F5E9"]
+		directions [label="Random Spherical Direction Projections
+x @ directions.T" fillcolor="#E8F5E9"]
+		freq_mult [label="Harmonic Scaling & Pi Scaling
+projections * 2^[0..num_freqs-1] * pi" fillcolor="#E8F5E9"]
+		sincos_cat [label="Concat [x, sin(proj), cos(proj)]
+xyz_encoded: [B, N, spatial_in_dim]" fillcolor="#E8F5E9"]
+	}
+	subgraph cluster_decoder {
+		color="#6A1B9A" fontcolor="#6A1B9A" label="Spatial Decoder (SpatialDecoder with FiLM)" style=dashed
+		expand_zt [label="Expand Latent State over N points
+z_t_expanded: [B, N, latent_dim]" fillcolor="#F3E5F5"]
+		concat_in [label="torch.cat([xyz_encoded, z_t_expanded], dim=-1)
+Shape: [B, N, spatial_in_dim + latent_dim]" fillcolor="#FFFFFF" shape=ellipse]
+		film_proj [label="FiLM Linear Layers (self.film[i])
+Linear(latent_dim, 2*hidden_dim)
+Chunk -> scale (gamma), shift (beta)" fillcolor="#F3E5F5"]
+		dec_layer1 [label="Linear(spatial_in + latent, hidden_dim)
+-> ReLU
+-> FiLM: hidden * (1 + gamma) + beta" fillcolor="#F3E5F5"]
+		dec_layer_mid [label="Hidden Layers (x2)
+Linear(hidden_dim, hidden_dim) -> ReLU -> FiLM" fillcolor="#F3E5F5"]
+		dec_final [label="Final Linear Projection
+Linear(hidden_dim, 1)
+(bias initialized to -0.5)" fillcolor="#F3E5F5"]
+	}
+	output [label="Occupancy Prediction Logits
+logits: [B, N, 1]" fillcolor="#ECEFF1" shape=doubleoctagon]
+	p_idx -> p_embed
+	p_embed -> z0_net
+	coords_in -> shared_time [label="coords[..., 3]"]
+	shared_time -> dt_calc
+	z0_net -> rk4_loop [label=z0]
+	dt_calc -> rk4_loop [label=dt]
+	p_embed -> ode_func [label=cond]
+	ode_func -> rk4_loop [label="Evaluates dz/dt"]
+	rk4_loop -> z_t
+	coords_in -> xyz_slice [label="coords[..., :3]"]
+	xyz_slice -> directions
+	directions -> freq_mult
+	freq_mult -> sincos_cat
+	z_t -> expand_zt
+	sincos_cat -> concat_in [label=xyz_encoded]
+	expand_zt -> concat_in
+	z_t -> film_proj [label="z_t [B, latent_dim]"]
+	concat_in -> dec_layer1
+	film_proj -> dec_layer1 [label="(gamma_0, beta_0)"]
+	dec_layer1 -> dec_layer_mid
+	film_proj -> dec_layer_mid [label="(gamma_i, beta_i)"]
+	dec_layer_mid -> dec_final
+	dec_final -> output
+}

@@ -1,0 +1,75 @@
+// Detailed LesionINR Architecture
+digraph LesionINR_Detailed {
+	fontname=Helvetica nodesep=0.4 rankdir=TB ranksep=0.6 splines=ortho
+	node [fontname=Helvetica fontsize=10 shape=rect style="filled,rounded"]
+	edge [color="#444444" fontname=Helvetica fontsize=9]
+	subgraph cluster_inputs {
+		color="#888888" fontcolor="#555555" label="Input Tensors [Batch Size N]" style=dashed
+		x_spatial [label="Spatial Coordinates (x)
+Shape: [B, 3]" fillcolor="#E1F5FE"]
+		x_time [label="Raw Time Scalar (t)
+Shape: [B, 1]" fillcolor="#E1F5FE"]
+		p_idx [label="Patient Index
+Shape: [B, 1]" fillcolor="#E1F5FE"]
+	}
+	subgraph cluster_encoding {
+		color="#888888" fontcolor="#555555" label="Feature Preparation & Concatenation" style=dashed
+		t_norm [label="Time Normalization
+t_norm = t / max_t" fillcolor="#E8F5E9"]
+		t_harm [label="Harmonic Expansion
+[2^0, 2^1, ..., 2^(freqs-1)] * pi" fillcolor="#E8F5E9"]
+		t_sincos [label="Sine/Cosine Concat
+[sin(angles), cos(angles)]
+Shape: [B, 2 * time_freqs]" fillcolor="#E8F5E9"]
+		p_embed [label="nn.Embedding Table
+[Bum_patients, latent_dim]
+Shape: [B, latent_dim]" fillcolor="#FFF3E0"]
+		cat_z [label="torch.cat([z_patient, t_encoded])
+Shape: [B, latent_dim + (2 * time_freqs)]" fillcolor="#FFFFFF" shape=ellipse]
+	}
+	subgraph cluster_latent_adapt {
+		color="#888888" fontcolor="#555555" label="Latent Adapt Pipeline (self.latent_adapt)" style=dashed
+		adapt_l1 [label="Linear(latent_dim + 2*freqs, latent_dim)
++ LeakyReLU" fillcolor="#FFF3E0"]
+		adapt_l2 [label="Linear(latent_dim, latent_dim)
++ LeakyReLU" fillcolor="#FFF3E0"]
+		adapt_norm [label="LayerNorm(latent_dim)
+Modulation Vector z: [B, latent_dim]" fillcolor="#FFF3E0"]
+	}
+	subgraph cluster_siren_trunk {
+		color="#888888" fontcolor="#555555" label="SIREN Trunk Architecture (self.first_layer & self.layers)" style=dashed
+		film_0 [label="First Layer FiLM Projection
+conditioning_lin(z) -> [B, 1, 2*hidden_dim]
+Chunk -> (gamma_0, beta_0)" fillcolor="#F3E5F5"]
+		siren_0 [label="First SirenLayer (omega_0 = 45.0)
+sin( 45.0 * (gamma_0 * Linear(3, hidden_dim) + beta_0) )
+Shape: [B, hidden_dim]" fillcolor="#FFEBEE"]
+		film_k [label="Layer k FiLM Projection
+conditioning_lin(z) -> [B, 1, 2*hidden_dim]
+Chunk -> (gamma_k, beta_k)" fillcolor="#F3E5F5"]
+		siren_k [label="SirenLayer k x N (omega_0 = 30.0)
+sin( 30.0 * (gamma_k * Linear(hidden_dim, hidden_dim) + beta_k) )
+Shape: [B, hidden_dim]" fillcolor="#FFEBEE"]
+	}
+	final_linear [label="final_layer (nn.Linear)
+[hidden_dim -> output_dim]" fillcolor="#ECEFF1"]
+	output [label="Lesion Prediction Output
+Shape: [B, output_dim]" fillcolor="#FFFFFF" shape=doubleoctagon]
+	x_time -> t_norm [label=raw_time]
+	t_norm -> t_harm
+	t_harm -> t_sincos
+	p_idx -> p_embed [label=patient_idx]
+	t_sincos -> cat_z [label=t_encoded]
+	p_embed -> cat_z [label=z_patient]
+	cat_z -> adapt_l1
+	adapt_l1 -> adapt_l2
+	adapt_l2 -> adapt_norm
+	adapt_norm -> film_0 [label=z]
+	adapt_norm -> film_k [label=z]
+	x_spatial -> siren_0 [label="spatial_coords [B, 3]"]
+	film_0 -> siren_0 [label="(gamma_0, beta_0)"]
+	siren_0 -> siren_k [label="x_out [B, hidden_dim]"]
+	film_k -> siren_k [label="(gamma_k, beta_k)"]
+	siren_k -> final_linear [label="x_out [B, hidden_dim]"]
+	final_linear -> output
+}

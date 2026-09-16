@@ -94,3 +94,8 @@ Download the seg files
 ```sh
 rsync -avm --include='*/' --include='seg_nnUnet.nii.gz' --exclude='*' node:~/projects/entire_yale_dataset/predictions ./data/entire_yale_dataset/predictions
 ```
+
+Delete delted runs of mlflow
+```sh
+mlflow gc --backend-store-uri sqlite:///mlflow.db
+```

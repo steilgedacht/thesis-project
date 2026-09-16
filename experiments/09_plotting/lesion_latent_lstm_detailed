@@ -1,0 +1,97 @@
+// Detailed LesionLatentLSTM Architecture
+digraph LesionLatentLSTM_Detailed {
+	fontname=Helvetica nodesep=0.4 rankdir=TB ranksep=0.5 splines=ortho
+	node [fontname=Helvetica fontsize=9 shape=rect style="filled,rounded"]
+	edge [color="#444444" fontname=Helvetica fontsize=8]
+	subgraph cluster_inputs {
+		color="#888888" fontcolor="#555555" label="Model Inputs" style=dashed
+		grids_in [label="Observed Occupancy Grids
+[B, T, 1, 64, 64, 64]" fillcolor="#E1F5FE"]
+		times_in [label="Target Visit Timestamps
+[B, Steps + 1]" fillcolor="#E1F5FE"]
+		p_idx [label="Patient Index (Optional)
+[B, 1]" fillcolor="#E1F5FE"]
+	}
+	subgraph cluster_encoder {
+		color="#00695C" fontcolor="#00695C" label="3D Conv Encoder (Encoder3D)" style=dashed
+		enc_conv1 [label="Conv3d(1, 32, k=3, p=1) + LeakyReLU" fillcolor="#E0F2F1"]
+		enc_down1 [label="Conv3d(32, 32, k=4, s=2, p=1) [1/2] + LeakyReLU" fillcolor="#E0F2F1"]
+		enc_down2 [label="Conv3d(32, 64, k=4, s=2, p=1) [1/4] + LeakyReLU" fillcolor="#E0F2F1"]
+		enc_down3 [label="Conv3d(64, 128, k=4, s=2, p=1) [1/8] + LeakyReLU" fillcolor="#E0F2F1"]
+		enc_down4 [label="Conv3d(128, 128, k=4, s=2, p=1) [1/16] + LeakyReLU" fillcolor="#E0F2F1"]
+		enc_pool [label="AdaptiveAvgPool3d((4,4,4))
+Shape: [B, 128, 4, 4, 4]" fillcolor="#E0F2F1"]
+		enc_fc [label="Linear(128*4*4*4 -> latent_dim)
+Shape: [B, latent_dim]" fillcolor="#E0F2F1"]
+	}
+	subgraph cluster_conditioning {
+		color="#2E7D32" fontcolor="#2E7D32" label="Temporal & Patient Conditioning" style=dashed
+		t_norm [label="Time Normalization
+t / max_t" fillcolor="#E8F5E9"]
+		t_harm [label="Harmonic Frequencies
+2^[0..freqs-1] * pi" fillcolor="#E8F5E9"]
+		t_concat [label="Sin/Cos Encoding
+Shape: [B, 2 * time_freqs]" fillcolor="#E8F5E9"]
+		p_embed [label="nn.Embedding
+Shape: [B, latent_dim]" fillcolor="#FFF3E0"]
+		cat_rnn_in [label="torch.cat([z_curr, t_enc, (p_emb)])
+Shape: [B, total_steps, input_dim]" fillcolor="#FFFFFF" shape=ellipse]
+	}
+	subgraph cluster_lstm {
+		color="#C62828" fontcolor="#C62828" label="Recurrent Latent Core" style=dashed
+		rnn_layer [label="nn.LSTM(input_dim, hidden_dim, num_layers=2)
+Batch First = True
+Output Shape: [B, total_steps, hidden_dim]" fillcolor="#FFEBEE"]
+		fc_out [label="Linear(hidden_dim -> latent_dim)
+Shape: [B, total_steps, latent_dim]" fillcolor="#FFEBEE"]
+	}
+	subgraph cluster_decoder {
+		color="#6A1B9A" fontcolor="#6A1B9A" label="3D Conv Decoder (Decoder3D)" style=dashed
+		dec_fc [label="Linear(latent_dim -> 128*4*4*4)" fillcolor="#F3E5F5"]
+		dec_unflatten [label="Unflatten -> [B, 128, 4, 4, 4]" fillcolor="#F3E5F5"]
+		dec_up1 [label="UpResBlock3D 1 (x2)
+Interpolate + Conv3d(128, 128) + ResBlock3D
+Shape: [B, 128, 8, 8, 8]" fillcolor="#F3E5F5"]
+		dec_up2 [label="UpResBlock3D 2 (x4)
+Interpolate + Conv3d(128, 64) + ResBlock3D
+Shape: [B, 64, 16, 16, 16]" fillcolor="#F3E5F5"]
+		dec_up3 [label="UpResBlock3D 3 (x8)
+Interpolate + Conv3d(64, 32) + ResBlock3D
+Shape: [B, 32, 32, 32, 32]" fillcolor="#F3E5F5"]
+		dec_up4 [label="UpResBlock3D 4 (x16)
+Interpolate + Conv3d(32, 32) + ResBlock3D
+Shape: [B, 32, 64, 64, 64]" fillcolor="#F3E5F5"]
+		dec_refine [label="full_resolution_refine
+Residual Refinement (Conv3d + LeakyReLU)
+Shape: [B, 32, 64, 64, 64]" fillcolor="#F3E5F5"]
+		dec_final [label="final_conv: Conv3d(32, 1, k=3, p=1)
+Target Spatial Res Interpolation (if needed)" fillcolor="#F3E5F5"]
+	}
+	output [label="Predicted Occupancy Grid Logits
+preds: [B, total_steps, 1, 64, 64, 64]" fillcolor="#ECEFF1" shape=doubleoctagon]
+	grids_in -> enc_conv1
+	enc_conv1 -> enc_down1
+	enc_down1 -> enc_down2
+	enc_down2 -> enc_down3
+	enc_down3 -> enc_down4
+	enc_down4 -> enc_pool
+	enc_pool -> enc_fc [label=Flatten]
+	times_in -> t_norm
+	t_norm -> t_harm
+	t_harm -> t_concat
+	p_idx -> p_embed
+	enc_fc -> cat_rnn_in [label=z_curr]
+	t_concat -> cat_rnn_in [label=t_enc]
+	p_embed -> cat_rnn_in [label=p_emb]
+	cat_rnn_in -> rnn_layer
+	rnn_layer -> fc_out
+	fc_out -> dec_fc [label="z_pred [per step]"]
+	dec_fc -> dec_unflatten
+	dec_unflatten -> dec_up1
+	dec_up1 -> dec_up2
+	dec_up2 -> dec_up3
+	dec_up3 -> dec_up4
+	dec_up4 -> dec_refine
+	dec_refine -> dec_final
+	dec_final -> output
+}
