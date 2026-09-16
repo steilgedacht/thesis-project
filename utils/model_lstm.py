@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from pathlib import Path
 
 
 class TimeEncoder(nn.Module):
@@ -215,7 +216,7 @@ class ResBlock3D(nn.Module):
 
 
 class UpResBlock3D(nn.Module):
-    """Upsampling Block: Nearest-Neighbor Interpolation -> Conv (Channel Change) -> ResBlock."""
+    """Upsampling block with smooth interpolation and residual refinement."""
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
@@ -223,7 +224,7 @@ class UpResBlock3D(nn.Module):
         self.res_block = ResBlock3D(out_channels)
 
     def forward(self, x):
-        x = self.upsample(x)
+        x = F.interpolate(x, scale_factor=2, mode='trilinear', align_corners=False)
         x = self.conv_match(x)
         x = self.res_block(x)
         return x
@@ -278,6 +279,15 @@ class Decoder3D(nn.Module):
         self.layer3 = UpResBlock3D(base_channels * 2, base_channels)      # x8
         self.layer4 = UpResBlock3D(base_channels, base_channels)          # x16
         
+        # Extra full-resolution capacity helps recover boundaries lost in the
+        # low-resolution latent bottleneck.
+        self.full_resolution_refine = nn.Sequential(
+            nn.Conv3d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
         # Final projection to target channels (output logits or probabilities)
         self.final_conv = nn.Conv3d(base_channels, out_channels, kernel_size=3, padding=1)
 
@@ -289,6 +299,7 @@ class Decoder3D(nn.Module):
         h = self.layer2(h)
         h = self.layer3(h)
         h = self.layer4(h)
+        h = h + self.full_resolution_refine(h)
         
         out = self.final_conv(h)
         
@@ -372,6 +383,26 @@ class LesionLatentLSTM(nn.Module):
         self._set_requires_grad(self.fc_out, True)
         if self.use_patient_embedding:
             self._set_requires_grad(self.patient_emb, True)
+
+    def save_autoencoder_weights(self, path):
+        """Save only encoder/decoder weights for reuse in later runs."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "encoder": self.encoder.state_dict(),
+            "decoder": self.decoder.state_dict(),
+            "grid_size": self.decoder.out_size,
+        }, path)
+
+    def load_autoencoder_weights(self, path, map_location=None):
+        """Load encoder/decoder weights without touching temporal parameters."""
+        checkpoint = torch.load(path, map_location=map_location)
+        if "encoder" not in checkpoint or "decoder" not in checkpoint:
+            raise ValueError(
+                f"Autoencoder checkpoint {path} must contain 'encoder' and 'decoder' weights"
+            )
+        self.encoder.load_state_dict(checkpoint["encoder"])
+        self.decoder.load_state_dict(checkpoint["decoder"])
 
     def forward_autoencoder(self, grids):
         """

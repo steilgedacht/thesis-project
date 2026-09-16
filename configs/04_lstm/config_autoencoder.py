@@ -24,6 +24,10 @@ class Config:
     # Both default to 0 in train_lstm.py if omitted, i.e. pure joint training (old behaviour).
     autoencoder_pretrain_epochs = 210
     lstm_only_epochs = 2
+    # Set save path when pretraining; set load path for later LSTM runs.
+    load_autoencoder_weights_path = None
+    save_autoencoder_weights_path = None
+    freeze_loaded_autoencoder = True
 
     from utils.loss_bce_dice import Loss_BCE_Dice
 
@@ -37,12 +41,14 @@ class Config:
     # Reduces noise and promotes coherent lesion regions
     use_total_variation_loss = False
     tv_loss_weight = 0.01  # Scale relative to BCE+Dice (try 0.001-0.05)
+    edge_loss_weight = 4.0  # Upweight BCE in a one-voxel band around lesion edges
 
     # Instantiate loss with dynamic weighting
     loss_fn = Loss_BCE_Dice(
         use_dynamic_pos_weight=use_dynamic_pos_weight,
         use_tv_loss=use_total_variation_loss,
         tv_weight=tv_loss_weight,
+        edge_weight=edge_loss_weight,
     )
 
     """ Dataloading parameters """

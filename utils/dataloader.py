@@ -103,6 +103,31 @@ class LesionDataset(Dataset):
         return coords.astype(np.float32), labels_sampled.astype(np.float32)
 
 
+class MetaLesionDataset(LesionDataset):
+    """Create temporal support/query tasks for meta-learning."""
+
+    def __getitem__(self, idx):
+        trj = self.trajectories[idx]
+        dates_list = list(trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates)
+
+        if f"{trj.patient_id}_{trj.label_id}" in self.validation_patients:
+            dates_list = dates_list[:-1]
+
+        if len(dates_list) < 2:
+            raise ValueError("Meta-learning requires at least two scans per trajectory")
+
+        query_idx = np.random.randint(1, len(dates_list))
+        support_idx = np.random.randint(0, query_idx)
+        support_coords, support_labels = self.prepare_data(str(dates_list[support_idx]), trj)
+        query_coords, query_labels = self.prepare_data(str(dates_list[query_idx]), trj)
+
+        return (
+            np.concatenate([support_coords, query_coords], axis=0),
+            np.concatenate([support_labels, query_labels], axis=0),
+            self.get_embedding_id(trj),
+        )
+
+
 class Validation_Extrapolation_LesionDataset(LesionDataset):
     def __init__(self, 
                  trajectories, 

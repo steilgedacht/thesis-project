@@ -91,6 +91,30 @@ def apply_training_phase(model, phase):
         model.unfreeze_temporal()
 
 
+def load_autoencoder_weights(model, config):
+    """Load configured encoder/decoder weights and report whether used."""
+    checkpoint_path = getattr(config, "load_autoencoder_weights_path", None)
+    if not checkpoint_path:
+        return False
+    if not hasattr(model, "load_autoencoder_weights"):
+        raise ValueError("Configured autoencoder weights require an autoencoder LSTM model")
+    model.load_autoencoder_weights(checkpoint_path, map_location=config.device)
+    print(f"Loaded encoder and decoder weights from {checkpoint_path}")
+    return True
+
+
+def save_autoencoder_weights(model, config):
+    """Save configured encoder/decoder weights, if requested."""
+    checkpoint_path = getattr(config, "save_autoencoder_weights_path", None)
+    if not checkpoint_path:
+        return
+    if not hasattr(model, "save_autoencoder_weights"):
+        raise ValueError("Configured autoencoder weights require an autoencoder LSTM model")
+    model.save_autoencoder_weights(checkpoint_path)
+    mlflow.log_artifact(checkpoint_path)
+    print(f"Saved encoder and decoder weights to {checkpoint_path}")
+
+
 def validate_polation(data_loader, text, global_step, criterion):
     bce_loss = 0
     dice_loss = 0
@@ -131,6 +155,12 @@ def train_lstm(
         plotting_LesionDataset, 
         config,
     ):
+    model.to(config.device)
+    autoencoder_loaded = load_autoencoder_weights(model, config)
+    freeze_loaded_autoencoder = (
+        autoencoder_loaded and getattr(config, "freeze_loaded_autoencoder", True)
+    )
+
     optimizer = optim.AdamW(
         model.parameters(), 
         lr=config.lr, 
@@ -143,7 +173,6 @@ def train_lstm(
     )
     criterion = config.loss_fn
 
-    model.to(config.device)
     losses = []
     
     global_step = epoch = 0
@@ -153,7 +182,13 @@ def train_lstm(
 
         # ==== Decide / apply this epoch's training phase ====
         phase = get_training_phase(epoch, config)
+        if phase != get_training_phase(epoch - 1, config):
+            save_autoencoder_weights(model, config)
+        if freeze_loaded_autoencoder:
+            phase = "lstm_only"
         apply_training_phase(model, phase)
+        if freeze_loaded_autoencoder:
+            model.freeze_autoencoder()
         supports_staged_training = hasattr(model, "forward_autoencoder")
 
         # ==== Training Loop ====
@@ -253,6 +288,8 @@ def train_lstm(
         name=config.model_save_name, 
         serialization_format="pickle"
     )
+
+    save_autoencoder_weights(model, config)
 
     with torch.no_grad():
         for trj in plotting_LesionDataset:  

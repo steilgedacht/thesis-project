@@ -12,12 +12,13 @@ loading.
 """
 
 import os
+import io
 import numpy as np
 import nibabel as nib
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.ticker import FuncFormatter
-from IPython.display import HTML
+from IPython.display import HTML, Image, display
 from datetime import datetime
 
 from .paths import DatasetPaths, DEFAULT_DATA_PATH
@@ -291,3 +292,189 @@ class Lesion_Trajectory:
         plt.ylabel('Lesion Size (log-scale)')
         plt.tight_layout()
         plt.show()
+
+    def plot_lesion_mri_trajectory(
+            self, mode="animation", output_path=None, n_cols=4, fps=5,
+            zoomed=True, alpha=0.45, jupyter_mode=True):
+        """Plot the lesion trajectory over the corresponding MRI scans.
+
+        Args:
+            mode: ``"animation"`` for an animated GIF/HTML result or
+                ``"contact_sheet"`` for a print-friendly grid of panels.
+            output_path: Optional path for saving the animated GIF. It is
+                ignored in ``"contact_sheet"`` mode.
+            n_cols: Number of columns in the contact sheet.
+            fps: Frames per second when saving an animation.
+            zoomed: Use the registered, cropped MRI volumes when true.
+            alpha: Transparency of the lesion edge.
+            jupyter_mode: Return HTML for animations when true; otherwise
+                return the Matplotlib animation object.
+
+        Returns:
+            An ``IPython.display.HTML`` object or animation in animation
+            mode, and the Matplotlib figure in contact-sheet mode.
+        """
+        if mode not in {"animation", "contact_sheet"}:
+            raise ValueError("mode must be 'animation' or 'contact_sheet'")
+        if n_cols < 1:
+            raise ValueError("n_cols must be at least 1")
+
+        from .patient import Patient
+
+        patient = Patient(self.patient_id)
+        samples_by_date = {sample.date: sample for sample in patient.samples}
+        dates = self.allowed_dates if hasattr(self, "allowed_dates") else self.dates
+
+        frames = []
+        lesion_z_positions = []
+        for date in dates:
+            sample = samples_by_date.get(date)
+            if sample is None:
+                raise FileNotFoundError(
+                    f"No MRI sample found for patient {self.patient_id} on {date}"
+                )
+
+            mri, affine = sample.load_mri(zoomed=zoomed, affine=True)
+            segmentation = nib.load(
+                self.paths.lesion_trajectory_seg_path(self.patient_id, date)
+            ).get_fdata()
+            if mri.shape != segmentation.shape:
+                raise ValueError(
+                    f"MRI and trajectory shapes differ for {date}: "
+                    f"{mri.shape} != {segmentation.shape}. "
+                    "Use matching registered volumes."
+                )
+
+            lesion_mask = segmentation == self.label_id
+            lesion_z_positions.extend(np.argwhere(lesion_mask)[:, 2].tolist())
+            horizontal_spacing_mm = float(np.linalg.norm(affine[:3, 1]))
+            frames.append((date, mri, lesion_mask, horizontal_spacing_mm))
+
+        if not frames:
+            raise ValueError("The lesion trajectory contains no dates")
+
+        if lesion_z_positions:
+            z_slice = int(round(float(np.mean(lesion_z_positions))))
+        else:
+            z_slice = frames[0][1].shape[2] // 2
+        z_slice = int(np.clip(z_slice, 0, frames[0][1].shape[2] - 1))
+
+        def choose_scale_bar_length(pixel_extent_mm):
+            target = pixel_extent_mm / 4
+            magnitude = 10 ** np.floor(np.log10(target))
+            for multiplier in (1, 2, 2.5, 5, 10):
+                length = multiplier * magnitude
+                if length >= target:
+                    return length
+            return 10 * magnitude
+
+        image_width = frames[0][1].shape[1]
+        scale_length_mm = choose_scale_bar_length(
+            image_width * frames[0][3]
+        )
+        scale_color = "#b8aa62"
+
+        def draw_frame(ax, frame):
+            date, mri, lesion_mask, horizontal_spacing_mm = frame
+            mri_slice = mri[:, :, z_slice]
+            ax.imshow(
+                mri_slice, cmap="gray", vmin=float(np.min(mri_slice)),
+                vmax=float(np.max(mri_slice)),
+            )
+            ax.contour(
+                lesion_mask[:, :, z_slice].astype(float), levels=[0.5],
+                colors="red", linewidths=1.5, alpha=alpha,
+            )
+            bar_length_px = scale_length_mm / horizontal_spacing_mm
+            bar_x = mri_slice.shape[1] * 0.06
+            bar_y = mri_slice.shape[0] * 0.92
+            ax.plot(
+                [bar_x, bar_x + bar_length_px], [bar_y, bar_y],
+                color=scale_color, linewidth=3, solid_capstyle="butt",
+            )
+            ax.text(
+                bar_x + bar_length_px / 2, bar_y - mri_slice.shape[0] * 0.03,
+                f"{scale_length_mm:g} mm", color=scale_color, ha="center",
+                va="bottom", fontsize=9, weight="bold",
+            )
+            ax.set_title(date)
+            ax.axis("off")
+
+        if mode == "contact_sheet":
+            n_rows = int(np.ceil(len(frames) / n_cols))
+            fig, axes = plt.subplots(
+                n_rows, n_cols, squeeze=False,
+                figsize=(4 * n_cols, 4 * n_rows),
+            )
+            for ax, frame in zip(axes.flat, frames):
+                draw_frame(ax, frame)
+            for ax in axes.flat[len(frames):]:
+                ax.axis("off")
+            fig.suptitle(
+                f"Patient {self.patient_id}, lesion {self.label_id} "
+                f"(z slice {z_slice})"
+            )
+            fig.tight_layout()
+            if jupyter_mode:
+                buffer = io.BytesIO()
+                fig.savefig(buffer, format="png", dpi=150, bbox_inches="tight")
+                display(Image(data=buffer.getvalue(), format="png"))
+                buffer.close()
+                plt.close(fig)
+                return None
+            return fig
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        date, mri, lesion_mask, horizontal_spacing_mm = frames[0]
+        mri_slice = mri[:, :, z_slice]
+        im_mri = ax.imshow(
+            mri_slice, cmap="gray", vmin=float(np.min(mri_slice)),
+            vmax=float(np.max(mri_slice)),
+        )
+        lesion_contour = ax.contour(
+            lesion_mask[:, :, z_slice].astype(float), levels=[0.5],
+            colors="red", linewidths=1.5, alpha=alpha,
+        )
+        bar_length_px = scale_length_mm / horizontal_spacing_mm
+        bar_x = mri_slice.shape[1] * 0.06
+        bar_y = mri_slice.shape[0] * 0.92
+        scale_line, = ax.plot(
+            [bar_x, bar_x + bar_length_px], [bar_y, bar_y],
+            color=scale_color, linewidth=3, solid_capstyle="butt",
+        )
+        scale_text = ax.text(
+            bar_x + bar_length_px / 2, bar_y - mri_slice.shape[0] * 0.03,
+            f"{scale_length_mm:g} mm", color=scale_color, ha="center",
+            va="bottom", fontsize=9, weight="bold",
+        )
+        ax.axis("off")
+
+        def update(frame_idx):
+            nonlocal lesion_contour
+            date, mri, lesion_mask, _ = frames[frame_idx]
+            mri_slice = mri[:, :, z_slice]
+            im_mri.set_data(mri_slice)
+            im_mri.set_clim(float(np.min(mri_slice)), float(np.max(mri_slice)))
+            lesion_contour.remove()
+            lesion_contour = ax.contour(
+                lesion_mask[:, :, z_slice].astype(float), levels=[0.5],
+                colors="red", linewidths=1.5, alpha=alpha,
+            )
+            ax.set_title(
+                f"Patient {self.patient_id}, lesion {self.label_id} - "
+                f"{date} (z slice {z_slice})"
+            )
+            return im_mri, lesion_contour, scale_line, scale_text
+
+        ani = animation.FuncAnimation(
+            fig, update, frames=len(frames), interval=1000 / max(fps, 1),
+            repeat=False,
+        )
+        if output_path is not None:
+            ani.save(output_path, writer="pillow", fps=fps)
+        plt.show()
+        plt.close(fig)
+
+        if jupyter_mode:
+            return HTML(ani.to_jshtml())
+        return ani
