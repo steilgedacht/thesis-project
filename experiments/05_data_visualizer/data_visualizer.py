@@ -6,7 +6,7 @@ import mlflow
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, ImageMagickWriter
 import numpy as np
-from train import load_config
+from train_inr import load_config
 import tqdm
 import gc
 from scipy import ndimage

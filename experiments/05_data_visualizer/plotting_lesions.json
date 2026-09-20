@@ -3,36 +3,48 @@
     "idx": "1",
     "Patient": "YG_NRSFSRTTONBY",
     "Lesion": "3",
-    "n_scans": "24"
+    "n_scans": "21"
   },
   {
     "idx": "2",
     "Patient": "YG_NRSFSRTTONBY",
     "Lesion": "1",
-    "n_scans": "11"
+    "n_scans": "10"
   },
   {
     "idx": "3",
     "Patient": "YG_DFS01ZHF1G5R",
     "Lesion": "2",
-    "n_scans": "11"
+    "n_scans": "12"
   },
   {
     "idx": "4",
-    "Patient": "YG_2Y6EF2NHHNMC",
+    "Patient": "YG_DDHY5HW3GJIP",
     "Lesion": "2",
-    "n_scans": "6"
+    "n_scans": "11"
   },
   {
     "idx": "5",
-    "Patient": "YG_ZT0QDSINY8YF",
-    "Lesion": "1",
-    "n_scans": "5"
+    "Patient": "YG_UEM7VTVQNC1M",
+    "Lesion": "3",
+    "n_scans": "10"
   },
   {
     "idx": "6",
-    "Patient": "YG_Q9ZG0HF6NHH8",
+    "Patient": "YG_R4Z3IXHG01L2",
     "Lesion": "1",
-    "n_scans": "7"
+    "n_scans": "10"
+  },
+  {
+    "idx": "7",
+    "Patient": "YG_Q1FS2D6EVG3E",
+    "Lesion": "9",
+    "n_scans": "10"
+  },
+  {
+    "idx": "8",
+    "Patient": "YG_MTO9K0JU7M07",
+    "Lesion": "11",
+    "n_scans": "9"
   }
 ]

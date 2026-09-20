@@ -1,35 +1,34 @@
 // High-Level LesionLatentLSTM Flow
 digraph LesionLatentLSTM_Normal {
-	fontname=Helvetica nodesep=0.5 rankdir=TB ranksep=0.6
-	node [fontname=Helvetica fontsize=10 shape=rect style="filled,rounded"]
+	fontname=Helvetica rankdir=TB
+	node [fontname=Helvetica fontsize=10 shape=rect style=filled]
 	edge [color="#333333" fontname=Helvetica fontsize=9]
 	grids_in [label="Input Grids
 [B, T, 1, D, H, W]" fillcolor="#E1F5FE"]
-	times_in [label="Target Timestamps (times)
-[B, T + n_future]" fillcolor="#E8F5E9"]
-	p_idx [label="Patient Index
-[B, 1]" fillcolor="#E8F5E9"]
+	times_in [label="Target Time
+[B, T + Δt]" fillcolor="#E1F5FE"]
+	p_idx [label="Lesion ID
+[B, 1]" fillcolor="#E1F5FE"]
+	embed [label="Embedding
+[B, latent_dim]" fillcolor="#FFF3E0" shape=box style=filled]
 	encoder [label="3D Conv Encoder
-Encoder3D" fillcolor="#FFF3E0"]
-	z_obs [label="Observed Latent Vectors
-z_obs: [B, T, latent_dim]" fillcolor="#FFFFFF" shape=ellipse]
+[B, T, latent_dim]" fillcolor="#FFF3E0"]
 	t_enc [label="TimeEncoder
+Fourier/Harmonic
 [B, 2 * time_freqs]" fillcolor="#E8F5E9"]
-	lstm [label="Recurrent Core (nn.LSTM)
-& Projection (fc_out)" fillcolor="#FFEBEE"]
-	z_pred [label="Predicted Latent Vectors
-z_pred: [B, Steps, latent_dim]" fillcolor="#FFFFFF" shape=ellipse]
+	lstm [label="LSTM
+Predicted Latent Vectors
+[B, Steps, hidden_dim]" fillcolor="#FFEBEE"]
+	z_pred [label="MLP
+[B, Steps, latent_dim]" fillcolor="#FFEBEE"]
 	decoder [label="3D Conv Decoder
-Decoder3D" fillcolor="#FFF3E0"]
-	preds_out [label="Predicted Grids
-preds: [B, Steps, 1, D, H, W]" fillcolor="#F3E5F5" shape=doubleoctagon]
-	grids_in -> encoder [label="Per Frame"]
-	encoder -> z_obs [label="[B, latent_dim]"]
+[B, Steps, 1, D, H, W]" fillcolor="#FFF3E0"]
+	grids_in -> encoder
+	encoder -> lstm [label="Latent Vector     "]
 	times_in -> t_enc
-	z_obs -> lstm [label=z_curr]
-	t_enc -> lstm [label=t_enc]
-	p_idx -> lstm [label="p_emb (if enabled)"]
-	lstm -> z_pred [label="Hidden -> fc_out"]
-	z_pred -> decoder [label="Per Step"]
-	decoder -> preds_out
+	t_enc -> lstm
+	p_idx -> embed
+	embed -> lstm
+	lstm -> z_pred [label=" hidden_dim -> latent_dim"]
+	z_pred -> decoder
 }

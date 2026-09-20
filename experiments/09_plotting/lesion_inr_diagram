@@ -1,31 +1,36 @@
 // LesionINR Model Flow
 digraph LesionINR {
-	rankdir=TB size="10,10"
-	coords [label="Spatial Coords (x)
-[B, 3]" fillcolor="#E1F5FE" shape=box style=filled]
-	time [label="Raw Time (t)
+	fontname=Helvetica rankdir=TB size="10,10"
+	node [fontname=Helvetica fontsize=10 shape=rect style=filled]
+	edge [color="#333333" fontname=Helvetica fontsize=9]
+	coords [label="Spatial Coordinates (xyz)
+[B, N, 3]" fillcolor="#E1F5FE" shape=box style=filled]
+	time [label="Time [days]
 [B, 1]" fillcolor="#E1F5FE" shape=box style=filled]
-	patient [label="Patient ID
+	patient [label="Lesion ID
 [B, 1]" fillcolor="#E1F5FE" shape=box style=filled]
 	time_enc [label="TimeEncoder
+Fourier/Harmonic
 [B, 2*time_freqs]" fillcolor="#E8F5E9" shape=box style=filled]
-	embed [label="nn.Embedding
+	embed [label="Embedding
 [B, latent_dim]" fillcolor="#FFF3E0" shape=box style=filled]
-	adapt [label="latent_adapt (MLP)
+	adapt [label="MLP for latent_adapation
 [B, latent_dim]" fillcolor="#FFF3E0" shape=box style=filled]
-	siren_first [label="First SirenLayer
-(omega_0=45)" fillcolor="#FFEBEE" shape=box style=filled]
-	siren_mid [label="SirenLayers x N
-(omega_0=30)" fillcolor="#FFEBEE" shape=box style=filled]
+	siren_first [label="Higher frequency SirenLayer
+(ω_0=45)
+[B, N, hidden_dim]" fillcolor="#FFEBEE" shape=box style=filled]
+	siren_mid [label="SirenLayers x N times
+Layer-wise FiLM (ω_0=30)
+[B, N, hidden_dim]" fillcolor="#FFEBEE" shape=box style=filled]
 	out [label="Final Linear Layer
-[B, output_dim]" fillcolor="#F3E5F5" shape=box style=filled]
+[B, N, output_dim]" fillcolor="#F3E5F5" shape=box style=filled]
 	time -> time_enc
 	patient -> embed
 	time_enc -> adapt
 	embed -> adapt
 	coords -> siren_first
-	adapt -> siren_first [label="z modulation"]
-	adapt -> siren_mid [label="z modulation"]
+	adapt -> siren_first [label="latent vector modulation"]
+	adapt -> siren_mid [label="latent vector modulation"]
 	siren_first -> siren_mid
 	siren_mid -> out
 }
