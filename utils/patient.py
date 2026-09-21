@@ -5,18 +5,12 @@ tracking across time, and trajectory building/merging.
 Two things changed from the original monolithic version, on top of the
 module split:
 
-1. `dataloader` and `registrator` used to default to `MRI_Dataloader()` /
-   `Registrator()` evaluated once at *function-definition* time (a classic
-   Python mutable-default-argument bug). That meant every Patient created
-   without explicit args shared the exact same dataloader instance, and
-   simply importing this module would eagerly glob the entire dataset.
-   Both now default to `None` and are lazily constructed inside `__init__`.
+1. `dataloader` used to default to `MRI_Dataloader()` /
 
 2. `MRI_Dataloader` and `Lesion_Trajectory` are imported lazily (inside
    `__init__` / the methods that use them) because those modules import
    `Patient` back -- a genuine mutual dependency, not just a shared path
-   string. `Registrator` has no such cycle, so it's imported normally at
-   module level.
+   string. 
 """
 
 import os
@@ -38,24 +32,19 @@ from skimage.measure import find_contours, marching_cubes
 import plotly.express as px
 import plotly.graph_objects as go
 
-from .registrator import Registrator
-
 
 class Patient:
-    def __init__(self, patient_id, dataloader=None, registrator=None):
+    def __init__(self, patient_id, dataloader=None):
         self.patient_id = patient_id
 
         if dataloader is None:
             from .mri_dataloader import MRI_Dataloader  # lazy: see module docstring
             dataloader = MRI_Dataloader()
-        if registrator is None:
-            registrator = Registrator()
 
         self.dataloader = dataloader
         self.samples = self.dataloader.find_by_patient_id(patient_id)
         self.dates = [sample.date for sample in self.samples]
         self.path = self.dataloader.paths.sample_dir(patient_id)
-        self.registrator = registrator
         self.patient_trajectory_paths = glob.glob(self.dataloader.paths.lesion_trajectory_glob(patient_id))
 
     def register_all_to_first(self):
@@ -758,73 +747,3 @@ class Patient:
             trajectories.append(Lesion_Trajectory(load_from_trajectory_path=path))
         return trajectories
 
-    def plot_lesion_shape_trajectory(self):
-        fig = go.Figure()
-
-        colors = px.colors.sequential.Agsunset
-
-        vol_shape = self.samples[0].load_mri().shape
-
-        for i, sample in enumerate(self.samples):
-            labeled_mask = sample.load_mri_segmentation()
-            params = self.registered_transforms[i]
-            labeled_mask = self.registrator.rigid_transform(labeled_mask, params, vol_shape)
-
-            color_idx = int((i / len(self.samples)) * (len(colors) - 1))
-            time_color = colors[color_idx]
-
-            unique_labels = np.unique(labeled_mask)
-            for label in unique_labels:
-                if label == 0:
-                    continue
-
-                lesion_mask = (labeled_mask == label).astype(np.uint8)
-
-                try:
-                    verts, faces, _, _ = marching_cubes(lesion_mask, step_size=2, allow_degenerate=True, method="lewiner")
-
-                    n_samples = 10
-                    sampled_points = []
-
-                    for _ in range(n_samples):
-                        face_idx = np.random.randint(0, len(faces))
-                        face = faces[face_idx]
-
-                        r1, r2 = np.random.random(2)
-                        if r1 + r2 > 1:
-                            r1 = 1 - r1
-                            r2 = 1 - r2
-
-                        point = (1 - r1 - r2) * verts[face[0]] + r1 * verts[face[1]] + r2 * verts[face[2]]
-                        sampled_points.append(point)
-
-                    sampled_points = np.array(sampled_points)
-
-                    fig.add_trace(go.Scatter3d(
-                        x=sampled_points[:, 1],
-                        y=vol_shape[0] - sampled_points[:, 0],
-                        z=sampled_points[:, 2],
-                        mode="markers",
-                        marker=dict(size=5, color=time_color, opacity=0.3),
-                        showlegend=False,
-                        hoverinfo='skip'
-                    ))
-                except RuntimeError:
-                    continue
-
-        for x, y, z in self.samples[0].calculate_contours():
-            fig.add_trace(go.Scatter3d(
-                x=x, y=y, z=z,
-                mode="lines",
-                line=dict(width=1, color="rgba(50,50,50,1)"),
-                showlegend=False,
-                hoverinfo='skip'
-            ))
-
-        fig.update_layout(
-            title=f"3D Lesion Shape Trajectory for Patient {self.patient_id}",
-            width=1000,
-            height=800
-        )
-
-        fig.show()

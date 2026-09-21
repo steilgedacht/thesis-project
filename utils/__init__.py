@@ -6,7 +6,6 @@ so it works correctly when nested inside another project, e.g.:
     utils/
         __init__.py   <- this file
         paths.py
-        registrator.py
         data_sample.py
         lesion_trajectory.py
         mri_dataloader.py
@@ -22,7 +21,6 @@ method bodies (lazy imports), never at module load time.
 """
 
 from .paths import DatasetPaths, DEFAULT_DATA_PATH
-from .registrator import Registrator
 from .data_sample import DataSample
 from .lesion_trajectory import Lesion_Trajectory
 from .mri_dataloader import MRI_Dataloader
@@ -31,7 +29,6 @@ from .patient import Patient
 __all__ = [
     "DatasetPaths",
     "DEFAULT_DATA_PATH",
-    "Registrator",
     "DataSample",
     "Lesion_Trajectory",
     "MRI_Dataloader",

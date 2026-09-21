@@ -1,122 +1,400 @@
 [
-  {
-    "idx": "1",
-    "Patient": "YG_NRSFSRTTONBY",
-    "Lesion": "3",
-    "n_scans": "21"
-  },
-  {
-    "idx": "2",
-    "Patient": "YG_NRSFSRTTONBY",
-    "Lesion": "1",
-    "n_scans": "10"
-  },
-  {
-    "idx": "3",
-    "Patient": "YG_DFS01ZHF1G5R",
-    "Lesion": "2",
-    "n_scans": "12"
-  },
-  {
-    "idx": "4",
-    "Patient": "YG_DDHY5HW3GJIP",
-    "Lesion": "2",
-    "n_scans": "11"
-  },
-  {
-    "idx": "5",
-    "Patient": "YG_UEM7VTVQNC1M",
-    "Lesion": "3",
-    "n_scans": "10"
-  },
-  {
-    "idx": "6",
-    "Patient": "YG_R4Z3IXHG01L2",
-    "Lesion": "1",
-    "n_scans": "10"
-  },
-  {
-    "idx": "7",
-    "Patient": "YG_Q1FS2D6EVG3E",
-    "Lesion": "9",
-    "n_scans": "10"
-  },
-  {
-    "idx": "8",
-    "Patient": "YG_MTO9K0JU7M07",
-    "Lesion": "11",
-    "n_scans": "9"
-  },
-  {
-    "idx": "9",
-    "Patient": "YG_04YGLO8ATWRL",
-    "Lesion": "2",
-    "n_scans": "6"
-  },
-  {
-    "idx": "10",
-    "Patient": "YG_3I6CQJCTAUAS",
-    "Lesion": "1",
-    "n_scans": "9"
-  },
-  {
-    "idx": "11",
-    "Patient": "YG_85UM3OTXRUXH",
-    "Lesion": "3",
-    "n_scans": "6"
-  },
-  {
-    "idx": "12",
-    "Patient": "YG_8HW12P6TPDBB",
-    "Lesion": "1",
-    "n_scans": "7"
-  },
-  {
-    "idx": "13",
-    "Patient": "YG_85UM3OTXRUXH",
-    "Lesion": "4",
-    "n_scans": "8"
-  },
-  {
-    "idx": "14",
-    "Patient": "YG_H19ZB9NMLHLJ",
-    "Lesion": "2",
-    "n_scans": "7"
-  },
-  {
-    "idx": "15",
-    "Patient": "YG_BSZ8HDFDH8G9",
-    "Lesion": "3",
-    "n_scans": "6"
-  },
-  {
-    "idx": "16",
-    "Patient": "YG_B3IQ5SB5YX54",
-    "Lesion": "1",
-    "n_scans": "6"
-  },
-  {
-    "idx": "17",
-    "Patient": "YG_DDHY5HW3GJIP",
-    "Lesion": "5",
-    "n_scans": "6"
-  },
-  {
-    "idx": "18",
-    "Patient": "YG_K5SXG4URBIX0",
-    "Lesion": "1",
-    "n_scans": "6"
-  },
-  {
-    "idx": "19",
-    "Patient": "YG_69FMUN9PHHKE",
-    "Lesion": "2",
-    "n_scans": "6"
-  },
-  {
-    "idx": "20",
-    "Patient": "YG_0Y74OO0HCJZA",
-    "Lesion": "1",
-    "n_scans": "8"
-  }
+    {
+        "idx": "1",
+        "Patient": "YG_NRSFSRTTONBY",
+        "Lesion": "3",
+        "n_scans": "21",
+        "interpolation": "6",
+        "extrapolation_T_minus": [
+            166,
+            79,
+            0
+        ],
+        "extrapolation_dates": [
+            "2018-02-26",
+            "2018-04-09",
+            "2018-07-05"
+        ],
+        "extrapolation_indices": [
+            18,
+            19,
+            20
+        ]
+    },
+    {
+        "idx": "2",
+        "Patient": "YG_NRSFSRTTONBY",
+        "Lesion": "1",
+        "n_scans": "10",
+        "interpolation": "6",
+        "extrapolation_T_minus": [
+            148,
+            106,
+            0
+        ],
+        "extrapolation_dates": [
+            "2013-04-26",
+            "2013-06-08",
+            "2013-07-23"
+        ],
+        "extrapolation_indices": [
+            7,
+            8,
+            9
+        ]
+    },
+    {
+        "idx": "3",
+        "Patient": "YG_DFS01ZHF1G5R",
+        "Lesion": "2",
+        "n_scans": "12",
+        "interpolation": "7",
+        "extrapolation_T_minus": [
+            118,
+            0
+        ],
+        "extrapolation_dates": [
+            "2017-10-25",
+            "2022-07-20"
+        ],
+        "extrapolation_indices": [
+            10,
+            11
+        ]
+    },
+    {
+        "idx": "4",
+        "Patient": "YG_DDHY5HW3GJIP",
+        "Lesion": "2",
+        "n_scans": "11",
+        "interpolation": "3",
+        "extrapolation_T_minus": [
+            168,
+            113,
+            57,
+            0
+        ],
+        "extrapolation_dates": [
+            "2014-01-25",
+            "2014-03-21",
+            "2014-05-16",
+            "2014-07-12"
+        ],
+        "extrapolation_indices": [
+            7,
+            8,
+            9,
+            10
+        ]
+    },
+    {
+        "idx": "5",
+        "Patient": "YG_UEM7VTVQNC1M",
+        "Lesion": "3",
+        "n_scans": "10",
+        "interpolation": "5",
+        "extrapolation_T_minus": [
+            112,
+            0
+        ],
+        "extrapolation_dates": [
+            "2021-11-23",
+            "2022-01-04"
+        ],
+        "extrapolation_indices": [
+            8,
+            9
+        ]
+    },
+    {
+        "idx": "6",
+        "Patient": "YG_R4Z3IXHG01L2",
+        "Lesion": "1",
+        "n_scans": "10",
+        "interpolation": "2",
+        "extrapolation_T_minus": [
+            0
+        ],
+        "extrapolation_dates": [
+            "2015-04-19"
+        ],
+        "extrapolation_indices": [
+            9
+        ]
+    },
+    {
+        "idx": "7",
+        "Patient": "YG_Q1FS2D6EVG3E",
+        "Lesion": "9",
+        "n_scans": "10",
+        "interpolation": "5",
+        "extrapolation_T_minus": [
+            140,
+            62,
+            0
+        ],
+        "extrapolation_dates": [
+            "2012-03-04",
+            "2012-05-22",
+            "2012-07-02"
+        ],
+        "extrapolation_indices": [
+            8,
+            9,
+            10
+        ]
+    },
+    {
+        "idx": "8",
+        "Patient": "YG_MTO9K0JU7M07",
+        "Lesion": "11",
+        "n_scans": "9",
+        "interpolation": "4",
+        "extrapolation_T_minus": [
+            0
+        ],
+        "extrapolation_dates": [
+            "2013-07-08"
+        ],
+        "extrapolation_indices": [
+            8
+        ]
+    },
+    {
+        "idx": "9",
+        "Patient": "YG_04YGLO8ATWRL",
+        "Lesion": "2",
+        "n_scans": "6",
+        "interpolation": "3",
+        "extrapolation_T_minus": [
+            0
+        ],
+        "extrapolation_dates": [
+            "2017-04-24"
+        ],
+        "extrapolation_indices": [
+            5
+        ]
+    },
+    {
+        "idx": "10",
+        "Patient": "YG_3I6CQJCTAUAS",
+        "Lesion": "1",
+        "n_scans": "9",
+        "interpolation": "2",
+        "extrapolation_T_minus": [
+            148,
+            105,
+            0
+        ],
+        "extrapolation_dates": [
+            "2012-11-27",
+            "2013-01-29",
+            "2013-06-17"
+        ],
+        "extrapolation_indices": [
+            6,
+            7,
+            8
+        ]
+    },
+    {
+        "idx": "11",
+        "Patient": "YG_85UM3OTXRUXH",
+        "Lesion": "3",
+        "n_scans": "6",
+        "interpolation": "3",
+        "extrapolation_T_minus": [
+            0
+        ],
+        "extrapolation_dates": [
+            "2012-12-29"
+        ],
+        "extrapolation_indices": [
+            5
+        ]
+    },
+    {
+        "idx": "12",
+        "Patient": "YG_8HW12P6TPDBB",
+        "Lesion": "1",
+        "n_scans": "7",
+        "interpolation": "2",
+        "extrapolation_T_minus": [
+            155,
+            98,
+            0
+        ],
+        "extrapolation_dates": [
+            "2022-07-09",
+            "2022-09-04",
+            "2022-12-11"
+        ],
+        "extrapolation_indices": [
+            4,
+            5,
+            6
+        ]
+    },
+    {
+        "idx": "13",
+        "Patient": "YG_85UM3OTXRUXH",
+        "Lesion": "4",
+        "n_scans": "8",
+        "interpolation": "4",
+        "extrapolation_T_minus": [
+            155,
+            0
+        ],
+        "extrapolation_dates": [
+            "2013-06-26",
+            "2013-08-07"
+        ],
+        "extrapolation_indices": [
+            6,
+            7
+        ]
+    },
+    {
+        "idx": "14",
+        "Patient": "YG_H19ZB9NMLHLJ",
+        "Lesion": "2",
+        "n_scans": "7",
+        "interpolation": "2",
+        "extrapolation_T_minus": [
+            113,
+            74,
+            0
+        ],
+        "extrapolation_dates": [
+            "2015-05-17",
+            "2015-07-15",
+            "2015-08-22"
+        ],
+        "extrapolation_indices": [
+            4,
+            5,
+            6
+        ]
+    },
+    {
+        "idx": "15",
+        "Patient": "YG_BSZ8HDFDH8G9",
+        "Lesion": "3",
+        "n_scans": "6",
+        "interpolation": "2",
+        "extrapolation_T_minus": [
+            42,
+            0
+        ],
+        "extrapolation_dates": [
+            "2012-06-04",
+            "2012-07-16"
+        ],
+        "extrapolation_indices": [
+            4,
+            5
+        ]
+    },
+    {
+        "idx": "16",
+        "Patient": "YG_B3IQ5SB5YX54",
+        "Lesion": "1",
+        "n_scans": "6",
+        "interpolation": "3",
+        "extrapolation_T_minus": [
+            0
+        ],
+        "extrapolation_dates": [
+            "2019-09-20"
+        ],
+        "extrapolation_indices": [
+            5
+        ]
+    },
+    {
+        "idx": "17",
+        "Patient": "YG_DDHY5HW3GJIP",
+        "Lesion": "5",
+        "n_scans": "6",
+        "interpolation": "3",
+        "extrapolation_T_minus": [
+            168,
+            113,
+            57,
+            0
+        ],
+        "extrapolation_dates": [
+            "2014-01-25",
+            "2014-03-21",
+            "2014-05-16",
+            "2014-07-12"
+        ],
+        "extrapolation_indices": [
+            7,
+            8,
+            9,
+            10
+        ]
+    },
+    {
+        "idx": "18",
+        "Patient": "YG_K5SXG4URBIX0",
+        "Lesion": "1",
+        "n_scans": "6",
+        "interpolation": "1",
+        "extrapolation_T_minus": [
+            0
+        ],
+        "extrapolation_dates": [
+            "2021-09-28"
+        ],
+        "extrapolation_indices": [
+            4
+        ]
+    },
+    {
+        "idx": "19",
+        "Patient": "YG_69FMUN9PHHKE",
+        "Lesion": "2",
+        "n_scans": "6",
+        "interpolation": "3",
+        "extrapolation_T_minus": [
+            119,
+            50,
+            0
+        ],
+        "extrapolation_dates": [
+            "2016-02-28",
+            "2016-05-10",
+            "2016-07-18"
+        ],
+        "extrapolation_indices": [
+            5,
+            6,
+            7
+        ]
+    },
+    {
+        "idx": "20",
+        "Patient": "YG_0Y74OO0HCJZA",
+        "Lesion": "1",
+        "n_scans": "8",
+        "interpolation": "3",
+        "extrapolation_T_minus": [
+            94,
+            58,
+            0
+        ],
+        "extrapolation_dates": [
+            "2013-09-24",
+            "2013-10-30",
+            "2013-12-27"
+        ],
+        "extrapolation_indices": [
+            5,
+            6,
+            7
+        ]
+    }
 ]
