@@ -31,18 +31,85 @@ def load_config(config_path: str):
     spec.loader.exec_module(config_module)
     return config_module.Config()
 
+def _dataset_item_to_trajectory_and_date(item):
+    """Return the trajectory object and the date used for that dataset item."""
+    if isinstance(item, tuple) and len(item) == 3:
+        _, date, trj = item
+        return trj, str(date)
+    return item, None
+
+
+def _voxel_volume_cm3_from_trajectory(trj, selected_date=None):
+    """Compute the physical voxel volume for the given trajectory at one date."""
+    if selected_date is None:
+        selected_date = str(trj.allowed_dates[0] if hasattr(trj, 'allowed_dates') else trj.dates[0])
+    _, affine = trj.load_labels_for_inr(selected_date=selected_date, absolute_day_number=True, affine=True)
+    voxel_volume_mm3 = float(np.prod(np.abs(np.diag(affine)[:3])))
+    return voxel_volume_mm3 / 1000.0
+
+def plot_extrapolation_time(loss_T_pairs, global_step):
+    loss_np = np.array([[l[0], l[1].item()] for l in loss_T_pairs])
+
+    x = 180 - loss_np[:, 1]
+    y = 1 - loss_np[:, 0]
+
+    # Calculate linear regression slope (m) and intercept (b)
+    m, b = np.polyfit(x, y, 1)
+
+    plt.scatter(x, y, label="Extrapolation Scan")
+    x_line = np.linspace(1, 180, 200)
+    plt.plot(x_line, m * x_line + b, color="red", linestyle="--", label=f"Linear Fit (Slope = {m:.6f})")
+
+    plt.title("Extrapolation Dice Score after t_days in the last 180 days")
+    plt.ylabel("Dice Score")
+    plt.ylim(0, 1)
+    plt.xlabel("t [days]")
+    plt.xlim(1, 183)
+    plt.xticks(list(range(0, 181, 20)))
+    plt.legend()
+    output_path = f"/tmp/Extrapolation_Dice_Score_Distribution_Step{global_step}.png"
+    plt.savefig(output_path)
+    mlflow.log_artifact(output_path)
+    plt.close()
 
 def validate_polation(data_loader, text, global_step, criterion):
-    loss = 0
-    for v_coords, v_labels, v_p_idx in tqdm(data_loader, desc=text, total=len(data_loader)):
+    loss = 0.0
+    volume_error_cm3 = 0.0
+
+    batch_size = getattr(data_loader, 'batch_size', 1) or 1
+
+    loss_T_pairs = []
+
+    for batch_idx, (v_coords, v_labels, v_p_idx, T) in enumerate(tqdm(data_loader, desc=text, total=len(data_loader))):
         v_coords, v_labels, v_p_idx = v_coords.to(config.device), v_labels.unsqueeze(-1).to(config.device), v_p_idx.to(config.device)
         v_preds = model(v_coords, v_p_idx)
-        loss += criterion.dice_loss(v_preds, v_labels).item()
+        l = criterion.dice_loss(v_preds, v_labels).item()
+        loss += l 
+
+        loss_T_pairs.append((l, T))
+
+        dataset_start = batch_idx * batch_size
+        dataset_end = dataset_start + v_coords.shape[0]
+        for local_idx, sample_p_idx in enumerate(v_p_idx.cpu().tolist()):
+            data_idx = dataset_start + local_idx
+            if data_idx >= len(data_loader.dataset.trajectories):
+                break
+            dataset_item = data_loader.dataset.trajectories[data_idx]
+            trj, date = _dataset_item_to_trajectory_and_date(dataset_item)
+            voxel_volume_cm3 = _voxel_volume_cm3_from_trajectory(trj, date)
+
+            pred_count = (torch.sigmoid(v_preds[local_idx]).squeeze(-1) > 0.5).sum().item()
+            true_count = (v_labels[local_idx].squeeze(-1) > 0.5).sum().item()
+            volume_error_cm3 += abs(pred_count - true_count) * voxel_volume_cm3
+
     mlflow.log_metrics({
         text.lower().replace(" ", "_") + "_dice_loss"  : loss / len(data_loader),
-        text.lower().replace(" ", "_") + "_dice_score" : 1 - loss / len(data_loader)
+        text.lower().replace(" ", "_") + "_dice_score" : 1 - loss / len(data_loader),
+        text.lower().replace(" ", "_") + "_wrongly_predicted_volume_cm3" : volume_error_cm3,
     }, step=global_step)
 
+    if text == "Valid Extrapolation":
+        plot_extrapolation_time(loss_T_pairs, global_step)
 
 def train_inr(
         model, 
@@ -117,11 +184,10 @@ def train_inr(
 
         if epoch % config.validation_interval == 0:
             with torch.no_grad():
-                # visualize_samples(model, epoch, monitoring_samples, train_loader, "train", config)
-                # visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid", config)
                 validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
                 validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
                 for trj in plotting_LesionDataset:
+                    plot_contanct_sheet(model, epoch, trj, config, final_side_length=True)
                     plot_lesion_time_evolution(model, epoch, trj, config)
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
@@ -144,7 +210,6 @@ def train_inr(
     with torch.no_grad():
         for trj in plotting_LesionDataset:  
             plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=True)
-
     return losses
 
 def add_base_configurations(config):

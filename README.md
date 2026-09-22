@@ -30,6 +30,24 @@ python -m pip install -r requirements.txt
 
 ## Training Commands & Examples
 
+### Commands to reproduce the Papers results
+
+```bash
+# Global Dilation Model
+python3 train_dilation.py --config configs/01_dialation/config.py
+
+# Patient specific dilation Model 
+python3 train_dilation.py --config configs/01_dialation/config_patient_specific.py
+
+# LSTM
+python3 train_lstm.py --config configs/04_lstm/config.py
+
+# INR
+python3 train_inr.py --config configs/02_tv_regulation/config.py
+
+# NODE
+python3 train_ode.py --config configs/06_neural_ode/config.py
+```
 
 ### Example 1, starting the training locally:
 

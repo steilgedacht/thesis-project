@@ -766,3 +766,204 @@ def plot_lesion_time_evolution_lstm(model, epoch, trj, config, final_side_length
 
     mlflow.log_artifact(output_path)
     plt.close(artists.fig)
+
+def plot_contanct_sheet(model, epoch, trj, config, final_side_length=False,
+                        n_cols=4, jupyter_mode=True, output_path=None,
+                        zoomed=True, alpha=0.45):
+    """Render a contact-sheet of model predictions (heatmaps) and labels.
+
+    Args mirror `plot_lesion_time_evolution` to keep call-site compatibility:
+        model, epoch, trj, config, final_side_length: same semantics.
+    Additional args:
+        n_cols: number of columns in the contact-sheet.
+        jupyter_mode: if True display inline (IPython); otherwise return Figure.
+        output_path: optional path to save the rendered PNG.
+    """
+    import io
+    from math import ceil
+    from IPython.display import Image, display
+
+    side_length = config.full_size_side_length if final_side_length else config.time_evolution_side_length
+
+    # Load labels and geometry
+    full_matrix_labels, affine = _load_full_matrix_with_affine(trj)
+    label_shape = np.array(full_matrix_labels[0][0].shape)
+    geometry = _compute_reference_geometry(label_shape, affine)
+
+    # Build time-series data (try INR-style assembler, fallback to LSTM)
+    patient_idx_tensor = torch.tensor(trj.embedding_id).unsqueeze(0).to(config.device)
+    try:
+        data = _assemble_time_series(model, patient_idx_tensor, config, full_matrix_labels, label_shape, affine, geometry, side_length)
+    except Exception:
+        canonical_geom = CanonicalGridGeometry(
+            center=getattr(trj, 'canonical_center', None),
+            extent_mm=getattr(trj, 'canonical_extent_mm', None),
+            grid_size=getattr(config, 'lstm_grid_size', None),
+        )
+        data = _assemble_lstm_time_series(model, trj, config, full_matrix_labels, label_shape, affine, geometry, canonical_geom)
+
+    n_frames = len(data.heatmaps)
+    if n_frames == 0:
+        raise ValueError("No frames available for contact sheet")
+
+    # Limit trajectory to at most 12 evenly spaced timepoints
+    max_timepoints = 12
+    n_display = min(max_timepoints, n_frames)
+    indices = np.unique(np.round(np.linspace(0, n_frames - 1, n_display)).astype(int))
+    n_display = len(indices)
+
+    n_cols = max(1, int(n_cols))
+    n_rows = int(ceil(n_display / n_cols))
+
+    # Create grid: one row per displayed frame (MRI background + overlay)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows))
+    axes = np.array(axes).reshape((n_rows, n_cols))
+
+    # Prepare patient/sample mapping for MRI loading (mirrors Lesion_Trajectory)
+    patient = Patient(trj.patient_id)
+    samples_by_date = {s.date: s for s in patient.samples}
+
+    # Prepare a patient-level fallback MRI slice (first available sample),
+    # resized to the label grid shape so we can show an MRI behind every subplot.
+    fallback_mri_resized = None
+    for s in patient.samples:
+        try:
+            mri_vol = s.load_mri(zoomed=zoomed, affine=False)
+        except Exception:
+            try:
+                mri_vol = s.load_mri(zoomed=False, affine=False)
+            except Exception:
+                mri_vol = None
+        if mri_vol is None:
+            continue
+        z_slice = int(np.clip(round(data.lesion_z_voxel), 0, mri_vol.shape[2] - 1))
+        mri_slice_candidate = mri_vol[:, :, z_slice]
+        # resize using linear interpolation for MRI intensity
+        fallback_mri_resized = _resize_2d(mri_slice_candidate, label_shape[:2], order=1)
+        break
+
+    for disp_idx, idx in enumerate(indices):
+        col = disp_idx % n_cols
+        row_block = disp_idx // n_cols
+
+        label_slice = data.label_slices[idx]
+        heatmap = data.heatmaps[idx]
+        heatmap_resized = _resize_2d(heatmap, label_slice.shape)
+
+        # Load MRI background if available for this trajectory index's date
+        mri_slice = None
+        trj.get_absolute_dates()
+        mri_scan_timepoints = np.round(np.array(trj.absolute_dates) * 100)
+        for date_i, i in enumerate(mri_scan_timepoints):
+            if idx > i: continue
+            date = trj.allowed_dates[date_i]
+            sample = samples_by_date.get(date)
+            if sample is not None:
+                # follow the same logic as `Lesion_Trajectory.plot_lesion_mri_trajectory`
+                try:
+                    mri_vol, affine_m = sample.load_mri(zoomed=zoomed, affine=True)
+                    z_slice = int(np.clip(round(data.lesion_z_voxel), 0, mri_vol.shape[2] - 1))
+                    mri_slice = mri_vol[:, :, z_slice]
+                except Exception:
+                    try:
+                        # fallback to non-zoomed MRI like the lesion_trajectory code
+                        mri_vol, affine_m = sample.load_mri(zoomed=False, affine=True)
+                        z_slice = int(np.clip(round(data.lesion_z_voxel), 0, mri_vol.shape[2] - 1))
+                        mri_slice = mri_vol[:, :, z_slice]
+                    except Exception:
+                        mri_slice = None
+            break
+
+        ax = axes[row_block, col]
+
+        if mri_slice is not None:
+            vmin = float(np.min(mri_slice))
+            vmax = float(np.max(mri_slice))
+            ax.imshow(mri_slice, cmap='gray', vmin=vmin, vmax=vmax, aspect=data.geometry.label_aspect, zorder=0)
+        else:
+            # fallback: use patient-level MRI if available, otherwise black background
+            if fallback_mri_resized is not None:
+                ax.imshow(fallback_mri_resized, cmap='gray', vmin=float(fallback_mri_resized.min()), vmax=float(fallback_mri_resized.max()), aspect=data.geometry.label_aspect, zorder=0)
+            else:
+                ax.imshow(np.zeros_like(label_slice), cmap='gray', vmin=0, vmax=1, aspect=data.geometry.label_aspect, zorder=0)
+
+        # draw label contour as red edge (no filled face) using skimage find_contours
+        try:
+            from skimage.measure import find_contours
+            contours = find_contours((label_slice > 0.5).astype(float), 0.5)
+            for c in contours:
+                ax.plot(c[:, 1], c[:, 0], color=(1.0, 0.0, 0.0, alpha), linewidth=1.5, zorder=2)
+        except Exception:
+            ax.contour((label_slice > 0.5).astype(float), levels=[0.5], colors=(1.0, 0.0, 0.0, alpha), linewidths=1.5, zorder=2)
+
+        # Build an RGBA overlay where low (near-zero) values are transparent
+        cmap = plt.get_cmap('copper')
+        rgba = cmap(heatmap_resized)
+        # Make low-probability pixels fully transparent, scale alpha by prediction strength
+        alpha_base = 0.65
+        threshold = 0.02
+        rgba[..., 3] = (heatmap_resized.clip(0, 1) * alpha_base)
+        rgba[heatmap_resized < threshold, 3] = 0.0
+
+        ax.imshow(rgba, aspect=data.geometry.label_aspect, zorder=1, interpolation='nearest')
+
+        # Title for this subplot and hide axis ticks
+        ax.set_title(f"t={data.time_points[idx]:.0f} days")
+        ax.axis('off')
+
+    # Add legend (label contour + prediction overlay)
+    try:
+        import matplotlib.patches as mpatches
+        import matplotlib.lines as mlines
+        legend_handles = []
+        legend_handles.append(mlines.Line2D([], [], color=(1.0, 0.0, 0.0, alpha), lw=2, label='Label contour'))
+        patch_color = cmap(0.6)
+        patch = mpatches.Patch(color=(patch_color[0], patch_color[1], patch_color[2], 0.6), label='Prediction heatmap')
+        legend_handles.append(patch)
+        fig.legend(handles=legend_handles, loc='lower right', fontsize=9, framealpha=0.9)
+    except Exception:
+        # If the legend fails for any reason, continue silently; per-subplot titles/axes are already set.
+        pass
+
+    # Turn off any unused axes
+    used_axes = n_display
+    total_axes = axes.size
+    for unused_idx in range(used_axes, total_axes):
+        r = unused_idx // n_cols
+        c = unused_idx % n_cols
+        axes[r, c].axis('off')
+
+    fig.tight_layout()
+
+    # Determine a file path to save and log to MLflow
+    if output_path is None:
+        patient_idx = getattr(trj, 'embedding_id', getattr(trj, 'patient_id', 'unknown'))
+        out_path = (
+            f"/tmp/{epoch:04d}_epoch_lesion_contact_patient1_"
+            f"{trj.patient_id}_{patient_idx}_lesion_{trj.label_id}.png"
+        )
+    else:
+        out_path = output_path
+
+    # Save file and log as MLflow artifact
+    try:
+        fig.savefig(out_path, dpi=150, bbox_inches='tight')
+        try:
+            mlflow.log_artifact(out_path)
+        except Exception:
+            # Don't block on mlflow logging; image is still saved locally
+            pass
+    except Exception:
+        # If saving fails, proceed to display in jupyter (if requested)
+        out_path = None
+
+    if jupyter_mode:
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        buf.seek(0)
+        display(Image(data=buf.getvalue(), format='png'))
+        buf.close()
+        plt.close(fig)
+        return None
+
+    return fig

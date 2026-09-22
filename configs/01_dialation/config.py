@@ -18,7 +18,7 @@ class Config:
     use_only_growing_lesions = True
 
     # with that the same lesions can be in the same training batch
-    training_dataset_samples_duplication_factor = 1
+    training_dataset_samples_duplication_factor = 100
 
     dialation_iterations = 1
     background_samples_proportion = 1
@@ -27,7 +27,7 @@ class Config:
 
 
     """ Training parameters """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = "cpu"
     epochs = 1
     background_samples = 1000
     lr = 1e-4

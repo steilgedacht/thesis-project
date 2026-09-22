@@ -12,7 +12,7 @@ Lesion_Trajectory used to build one). Same pattern as lesion_trajectory.py.
 
 import glob
 import os
-
+from tqdm import tqdm
 import numpy as np
 import plotly.express as px
 
@@ -69,10 +69,15 @@ class MRI_Dataloader:
         for patient_id in self.patient_ids:
             yield Patient(patient_id, dataloader=self)
 
-    def iterate_trajectories(self):
-        from .lesion_trajectory import Lesion_Trajectory  # lazy: see module docstring
-        for trajectory_path in self.lesion_trajectory_paths:
-            yield Lesion_Trajectory(load_from_trajectory_path=trajectory_path)
+    def iterate_trajectories(self, enable_tqdm=False):
+        from .lesion_trajectory import Lesion_Trajectory
+        if enable_tqdm:
+            for trajectory_path in tqdm(self.lesion_trajectory_paths, total=len(self.lesion_trajectory_paths)):
+                yield Lesion_Trajectory(load_from_trajectory_path=trajectory_path)
+        else:
+            for trajectory_path in self.lesion_trajectory_paths:
+                yield Lesion_Trajectory(load_from_trajectory_path=trajectory_path)
+
 
     def cache_lesion_trajectories_from_n_scans(self, n_scans: int = 8, only_growing: bool = False):
         trajectories = []

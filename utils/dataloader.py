@@ -20,6 +20,7 @@ class LesionDataset(Dataset):
         with open(DatasetPaths().validation_samples(), "r") as f:
             self.validation_samples = json.load(f)
             self.validation_patients = [sample["Patient"] + "_" + sample["Lesion"]  for sample in self.validation_samples]
+            self.validation_samples = {sample["Patient"] + "_" + sample["Lesion"] : sample for sample in self.validation_samples}
 
         self.dialation_iterations = dialation_iterations
         self.max_samples = background_samples
@@ -35,10 +36,12 @@ class LesionDataset(Dataset):
             
         dates_list = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
 
-        if f"{trj.patient_id}_{trj.label_id}" in self.validation_patients:
-            dates_list = dates_list[:-1]
-            half_of_the_list = len(dates_list) // 2
-            del dates_list[half_of_the_list]
+        if (l_id := f"{trj.patient_id}_{trj.label_id}") in self.validation_patients:
+            extrapolation_time = self.validation_samples[l_id]["extrapolation_dates"]
+            interpolation_index = int(self.validation_samples[l_id]["interpolation"])
+
+            dates_list = [date for date in dates_list if date not in extrapolation_time]
+            dates_list.pop(interpolation_index)
 
         random_time_point = str(np.random.choice(dates_list))
 
@@ -135,16 +138,25 @@ class Validation_Extrapolation_LesionDataset(LesionDataset):
                  dialation_iterations=5, 
                  background_samples=3000):
         super().__init__(trajectories, device=device, dialation_iterations=dialation_iterations, background_samples=background_samples)
-        self.trajectories = [trj for trj in self.trajectories if f"{trj.patient_id}_{trj.label_id}" in self.validation_patients]
+        trajectories = [trj for trj in self.trajectories if f"{trj.patient_id}_{trj.label_id}" in self.validation_patients]
+
+        self.trajectories = []
+        for trj in trajectories: # we need to duplicate the samples that have multiple extrapolation steps in the last 180 days
+            l_id = f"{trj.patient_id}_{trj.label_id}"
+            for T, date in zip(self.validation_samples[l_id]["extrapolation_T_minus"], self.validation_samples[l_id]["extrapolation_dates"]):
+                self.trajectories.append((T, date, trj))
 
     def __getitem__(self, idx):
-        trj = self.trajectories[idx]
+        T, extrapolation_timestep, trj = self.trajectories[idx]
 
         dates_list = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
-        extrapolation_timestep = dates_list[-1]
+
+        p_id = f"{trj.patient_id}_{trj.label_id}"
+        extrapolation_time = self.validation_samples[p_id]["extrapolation_dates"]
+        dates_list = [date for date in dates_list if date not in extrapolation_time]
 
         coords, labels_sampled = self.prepare_data(extrapolation_timestep, trj)
-        return coords, labels_sampled, self.get_embedding_id(trj)
+        return coords, labels_sampled, self.get_embedding_id(trj), T
 
 class Validation_Interpolation_LesionDataset(LesionDataset):
     def __init__(self, 
@@ -160,10 +172,11 @@ class Validation_Interpolation_LesionDataset(LesionDataset):
 
         dates_list = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
 
-        half_of_the_list = len(dates_list[-1]) // 2
-        interpolation_timestep = dates_list[half_of_the_list]
+        p_id = f"{trj.patient_id}_{trj.label_id}"
+        interpolation_timestep = dates_list[int(self.validation_samples[p_id]["interpolation"])]
+
         coords, labels_sampled = self.prepare_data(interpolation_timestep, trj)
-        return coords, labels_sampled, self.get_embedding_id(trj)
+        return coords, labels_sampled, self.get_embedding_id(trj), -1
 
 
 class Plotting_LesionDataset(LesionDataset):

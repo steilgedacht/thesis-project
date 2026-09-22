@@ -151,8 +151,8 @@ class DataSample:
         return segmentation.get_fdata()
 
     def load_lesion_trajectory_segmentation(self):
-        data = np.load(self.lesion_trajectory_path)
-        return data["labeled_array"], data["num_features"]
+        data = nib.load(self.lesion_trajectory_path).get_fdata()
+        return data
 
     def get_other_timepoint(self, date):
         glob_path = self.paths.other_timepoint_glob(self.patient_id, date)

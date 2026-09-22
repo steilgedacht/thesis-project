@@ -3,12 +3,12 @@ sys.path.insert(1, '/home/benjaminb/Dokumente/JKU/Semester_9/Practical_Work')
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import mlflow
 import mlflow.pytorch
-from mri_dataloader import MRI_Dataloader
+from utils.loss_bce_dice import Loss_BCE_Dice
+from utils.mri_dataloader import MRI_Dataloader
 from scipy.ndimage import binary_dilation
 from tqdm import tqdm
 import matplotlib
@@ -17,8 +17,8 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, ImageMagickWriter
 
 
-mlflow.set_tracking_uri("http://127.0.0.1:5001")
-mlflow.set_experiment("Lesion_INR_Training")
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_experiment("Lesion_Dialation")
 
 
 class NaiveDilationBaseline(nn.Module):
@@ -37,7 +37,7 @@ class NaiveDilationBaseline(nn.Module):
             label_key = (idx * 100) + trj.label_id
             
             # Lade den absolut ersten verfügbaren Scan des Patienten
-            first_date = str(trj.dates[0])
+            first_date = str(trj.allowed_dates[0])
             labels, time_point = trj.load_labels_for_inr(selected_date=first_date, absolute_day_number=True)
             
             self.base_masks[label_key] = torch.tensor(labels, dtype=torch.float32)
@@ -101,23 +101,6 @@ class NaiveDilationBaseline(nn.Module):
             out[b, :, 0] = logits
             
         return out
-
-
-class Loss_BCE_Dice():
-    def __init__(self, loss_fn_1=nn.BCEWithLogitsLoss()):
-        self.loss_fn_1 = loss_fn_1
-        self.loss_bce = 0
-        self.loss_dice = 0
-    
-    def __call__(self, pred, target):
-        self.loss_bce = self.loss_fn_1(pred, target)
-        self.loss_dice = self.dice_loss(pred, target)
-        return self.loss_bce + self.loss_dice
-
-    def dice_loss(self, pred, target, smooth=1e-6):
-        pred = torch.sigmoid(pred)
-        intersection = (pred * target).sum()
-        return 1 - ((2. * intersection + smooth) / (pred.sum() + target.sum() + smooth))
 
 class LesionDataset(Dataset):
     def __init__(self, trajectories, device='cuda', context_radius=5, background_samples_proportion=1, mode='train', val_date_idx=None, val_end_date_idx=None):
@@ -209,35 +192,6 @@ class LesionDataset(Dataset):
 
         return coords.astype(np.float32), labels_sampled.astype(np.float32), np.int64((patient_idx * 100) + self.trajectories[idx].label_id)
 
-def plot_predictions(v_preds, v_labels, v_coords, epoch, title=""):
-    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-
-    # Get 3D prediction volume by reshaping predictions
-    pred_volume = v_preds[0].squeeze().detach().cpu().numpy()
-    label_volume = v_labels[0].squeeze().detach().cpu().numpy()
-    pred_coords = v_coords[0,:,:3].squeeze().detach().cpu().numpy()
-
-    # Top view (XY plane, max projection along Z)
-    axes[1,0].scatter(pred_coords[:,0], pred_coords[:,1], c=pred_volume, s=5, alpha=0.5, cmap='copper', vmin=0, vmax=1)
-    axes[1,0].set_title('Prediction - Top View')
-    axes[1,0].axis('off')
-
-    # Side view (XZ plane, max projection along Y)
-    axes[0,0].scatter(pred_coords[:,0], pred_coords[:,2], c=pred_volume, s=5, alpha=0.5, cmap='copper', vmin=0, vmax=1)
-    axes[0,0].set_title('Prediction - Front View')
-    axes[0,0].axis('off')
-
-    axes[0,1].scatter(pred_coords[:,1], pred_coords[:,2], c=pred_volume, s=5, alpha=0.5, cmap='copper', vmin=0, vmax=1)
-    axes[0,1].set_title('Prediction - Side View')
-    axes[0,1].axis('off')
-
-    axes[1,1].scatter(pred_coords[:,0], pred_coords[:,1], c=label_volume, s=5, alpha=0.5, cmap='copper', vmin=0, vmax=1)
-    axes[1,1].set_title('Labels')
-    axes[1,1].axis('off')
-
-    plt.tight_layout()
-    mlflow.log_figure(fig, f"{epoch:04d}_epoch_predictions_{title}.png")
-    plt.close(fig)
 
 def plot_heatmap(model, labels, coords, patient_idx, epoch, sample_id, time_point=None):
     # get the height where the lesion is located
@@ -417,76 +371,68 @@ def plot_lesion_time_evolution(model, epoch, sample_idx, data_loader, steps=100,
 
 
 
-def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=100, lr=1e-3, device='cuda'):
+def train_dilation(model, valid_interpolation_loader, valid_extrapolation_loader, device='cuda'):
     criterion = Loss_BCE_Dice()
 
     model.to(device)
     losses = []
-    
-    mlflow.log_params({
-        "epochs": epochs,
-        "batch_size": train_loader.batch_size
-    })
-    
+        
     global_step = 0
 
-    monitoring_samples = np.random.choice(len(train_loader), size=5, replace=False)
     model.eval()
 
     with torch.no_grad():
-        for epoch in range(epochs):
-            total_loss = 0
-            for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
+        total_loss = 0
+        for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
 
-                coords = coords.to(device)
-                labels = labels.to(device).unsqueeze(-1)
-                patient_idx = patient_idx.to(device)
+            coords = coords.to(device)
+            labels = labels.to(device).unsqueeze(-1)
+            patient_idx = patient_idx.to(device)
 
-                if coords.shape[1] == 0:
-                    continue
+            if coords.shape[1] == 0:
+                continue
 
-                predictions = model(coords, patient_idx)
+            predictions = model(coords, patient_idx)
 
-                loss = criterion(predictions, labels)
-                
-                total_loss += loss.item()
-
-                mlflow.log_metrics(
-                    {
-                        "training_loss" : loss.item(),
-                        "training_loss_bce" : criterion.loss_bce.item(),
-                        "training_loss_dice" : criterion.loss_dice.item(),
-                        "number_of_correctly_predicted_1_labels" : (predictions>0.5).sum().item() / (labels > 0.5).sum().item(),
-                        "number_of_correctly_predicted_0_labels" : (predictions<=0.5).sum().item() / (labels <= 0.5).sum().item()
-                    },
-                    step=global_step
-                )
-
-                global_step += 1
-
-                if i % 10 == 0:
-                    del coords, labels, patient_idx, predictions, loss
-                    torch.cuda.empty_cache()
-
-            torch.cuda.empty_cache()
-
-            if epoch % 20 == 0 and epoch != 0:
-                with torch.no_grad():
-                    visualize_samples(model, epoch, monitoring_samples, train_loader, "train")
-                    visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid")
-                    validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
-                    validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
-                    for m in monitoring_samples:
-                        plot_lesion_time_evolution(model, epoch, m, train_loader)
-
+            loss = criterion(predictions, labels)
             
-            avg_loss = total_loss / len(train_loader)
-            losses.append(avg_loss)
-            
-            if (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+            total_loss += loss.item()
+
+            mlflow.log_metrics(
+                {
+                    "training_loss" : loss.item(),
+                    "training_loss_bce" : criterion.loss_bce.item(),
+                    "training_loss_dice" : criterion.loss_dice.item(),
+                    "number_of_correctly_predicted_1_labels" : (predictions>0.5).sum().item() / (labels > 0.5).sum().item(),
+                    "number_of_correctly_predicted_0_labels" : (predictions<=0.5).sum().item() / (labels <= 0.5).sum().item()
+                },
+                step=global_step
+            )
+
+            global_step += 1
+
+            if i % 10 == 0:
+                del coords, labels, patient_idx, predictions, loss
+                torch.cuda.empty_cache()
+
+        torch.cuda.empty_cache()
+
+        if epoch % 20 == 0 and epoch != 0:
+            with torch.no_grad():
+                visualize_samples(model, epoch, monitoring_samples, train_loader, "train")
+                visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid")
+                validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
+                validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
+                for m in monitoring_samples:
+                    plot_lesion_time_evolution(model, epoch, m, train_loader)
+
         
-    mlflow.pytorch.log_model(model, name="lesion_inr_model")
+        avg_loss = total_loss / len(train_loader)
+        losses.append(avg_loss)
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+    
     
     for m in monitoring_samples:
         plot_lesion_time_evolution(model, epoch, m, train_loader, side_length=500)
@@ -495,33 +441,22 @@ def train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolati
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-with mlflow.start_run():
+with mlflow.start_run(run_name="NaiveDilationBaseline"):
     mri_dataloader = MRI_Dataloader()
-    mri_dataloader.cache_lesion_trajectories_from_n_scans(n_scans=6, only_growing=True)
-    trajectories = mri_dataloader.cache_lesion_trajectories * 4
+    mri_dataloader.cache_lesion_trajectories_from_n_scans(n_scans=3, only_growing=True)
+    trajectories = mri_dataloader.cache_lesion_trajectories * 10
 
-    batchsize = 100
-    epochs = 200
-    
-    train_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='train')
-    train_loader = DataLoader(train_dataset, batch_size=batchsize, shuffle=True, num_workers=7, prefetch_factor=2, pin_memory=True, persistent_workers=True)
-    
-    valid_interpolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_interpolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
+    batchsize = 1
+        
+    valid_interpolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_interpolation')
     valid_interpolation_loader = DataLoader(valid_interpolation_dataset, batch_size=batchsize, shuffle=False)
 
     valid_extrapolation_dataset = LesionDataset(trajectories, context_radius=5, background_samples_proportion=1, device=device, mode='valid_extrapolation', val_date_idx=train_dataset.val_date_idx, val_end_date_idx=train_dataset.val_end_date_idx)
     valid_extrapolation_loader = DataLoader(valid_extrapolation_dataset, batch_size=batchsize, shuffle=False)
 
     model = NaiveDilationBaseline(trajectories, shape=(500, 500, 50), pixels_per_day=0.08)
-    mlflow.log_params({
-        "dataset_size": len(train_dataset), 
-        "batch_size": batchsize,
-        "device": device,
-        "epochs": epochs
-    })
-    mlflow.log_artifact("inr.py")
 
-    losses = train_inr(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, epochs=epochs, lr=1e-4, device=device)
+    losses = train_dilation(model, valid_interpolation_loader, valid_extrapolation_loader, device=device)
     
     final_loss = losses[-1]
     mlflow.log_metric("final_train_loss", final_loss)

@@ -53,6 +53,7 @@ class Lesion_Trajectory:
             self.n_scans = len(sample_ids)
             self.sizes = sizes
             self.extract_growth_phase()
+            self.get_absolute_dates()
 
     def save_lesion_trajectory(self):
         export = {
@@ -77,21 +78,28 @@ class Lesion_Trajectory:
         else:
             print(f"Lesion trajectory file not found at {self.path}. Cannot load trajectory.")
 
-    def load_sizes(self):
+    def load_sizes(self, allowed_dates=False):
         sizes = []
 
-        from .patient import Patient  # lazy: see module docstring
-        patient = Patient(self.patient_id)
-        for i, date in enumerate(patient.dates):
-            if date not in self.dates:
-                continue
+        dates = self.dates if not allowed_dates else self.allowed_dates
 
+        from .patient import Patient
+        patient = Patient(self.patient_id)
+        for i in range(len(dates)):
             sample = patient.samples[i]
-            data, num_features = sample.load_lesion_trajectory_segmentation()
+            data = sample.load_lesion_trajectory_segmentation()
             size = np.sum(data == self.label_id)
             sizes.append(size)
         self.sizes = sizes
         return sizes
+
+    def get_absolute_dates(self):
+        dates = [datetime.strptime(d, "%Y-%m-%d") for d in self.allowed_dates]
+        first_date = dates[0]
+        total_days = (dates[-1] - first_date).days
+        days_since_first = [((d - first_date).days / total_days) for d in dates]
+        self.absolute_dates = days_since_first
+        return days_since_first
 
     def load_labels_for_inr(self, selected_date=None, absolute_day_number=False, affine=False):
         """

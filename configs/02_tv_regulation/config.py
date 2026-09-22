@@ -8,7 +8,7 @@ class Config:
 
 
     """ Dataloading parameters """
-    batchsize = 200
+    batchsize = 250
     num_workers = 7
     prefetch_factor = 2
     pin_memory = True
@@ -37,7 +37,7 @@ class Config:
     from utils.loss_bce_dice_tv import Loss_BCE_Dice_TV
     loss_fn = Loss_BCE_Dice_TV(
         lambda_space=3e-2, 
-        lambda_time=3
+        lambda_time=0.6
     )
     use_total_variation_loss = True
     
@@ -51,7 +51,7 @@ class Config:
         "input_dim" : 4,
         "hidden_dim" : 512,
         "output_dim" : 1,
-        "omega_0" : 15.0,
+        "omega_0" : 30.0,
         "n_layers" : 8,
         "time_freqs" : 6,
         "max_t" : 3650.0,

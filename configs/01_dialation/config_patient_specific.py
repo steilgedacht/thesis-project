@@ -14,11 +14,11 @@ class Config:
     pin_memory = True
     persistent_workers = True
 
-    lesion_trajectories_with_more_than_n_scans = 6
+    lesion_trajectories_with_more_than_n_scans = 3
     use_only_growing_lesions = True
 
     # with that the same lesions can be in the same training batch
-    training_dataset_samples_duplication_factor = 1
+    training_dataset_samples_duplication_factor = 100
 
     dialation_iterations = 1
     background_samples_proportion = 1

@@ -96,7 +96,7 @@ rsync -avm --include='*/' --include='seg_nnUnet.nii.gz' --exclude='*' node:~/pro
 rsync -avm --include='*/' --include='seg_nnUnet.nii_2.gz' --exclude='*' node:~/projects/entire_yale_dataset/predictions/ ./data/entire_yale_dataset/predictions
 ```
 
-Delete delted runs of mlflow
+Delete trashed runs of mlflow
 ```sh
 mlflow gc --backend-store-uri sqlite:///mlflow.db
 ```
