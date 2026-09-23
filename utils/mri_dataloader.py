@@ -82,6 +82,9 @@ class MRI_Dataloader:
     def cache_lesion_trajectories_from_n_scans(self, n_scans: int = 8, only_growing: bool = False):
         trajectories = []
         for trj in self.iterate_trajectories():
+            # embedding learning patient
+            if trj.patient_id == "YG_69FMUN9PHHKE" and trj.label_id == 2: 
+                continue
             sizes = len(trj.dates)
             if only_growing:
                 _, _, sample_ids = trj.extract_growth_phase(trj.sizes)

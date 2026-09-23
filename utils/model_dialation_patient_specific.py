@@ -23,11 +23,8 @@ class Patient_Specific_Dilation_Model(nn.Module):
             label_key = (self.patient_to_idx[trj.patient_id] * 100) + trj.label_id
             self.trajectories_map[label_key] = trj
             
-            t_first_str = str(trj.dates[0] if not hasattr(trj, 'allowed_dates') else trj.allowed_dates[0])
-            t_last_str = str(trj.dates[-1] if not hasattr(trj, 'allowed_dates') else trj.allowed_dates[-1])
-            
-            mask_first, t0 = trj.load_labels_for_inr(selected_date=t_first_str, absolute_day_number=True)
-            mask_last, tT = trj.load_labels_for_inr(selected_date=t_last_str, absolute_day_number=True)
+            mask_first, t0 = trj.load_labels_for_inr(selected_date=trj.allowed_dates[0], absolute_day_number=True)
+            mask_last, tT = trj.load_labels_for_inr(selected_date=trj.allowed_dates[-1], absolute_day_number=True)
             
             dt = max(1.0, tT - t0)
             

@@ -897,15 +897,15 @@ def plot_contanct_sheet(model, epoch, trj, config, final_side_length=False,
             ax.contour((label_slice > 0.5).astype(float), levels=[0.5], colors=(1.0, 0.0, 0.0, alpha), linewidths=1.5, zorder=2)
 
         # Build an RGBA overlay where low (near-zero) values are transparent
-        cmap = plt.get_cmap('copper')
-        rgba = cmap(heatmap_resized)
-        # Make low-probability pixels fully transparent, scale alpha by prediction strength
-        alpha_base = 0.65
-        threshold = 0.02
-        rgba[..., 3] = (heatmap_resized.clip(0, 1) * alpha_base)
-        rgba[heatmap_resized < threshold, 3] = 0.0
+        ax.set_aspect(data.geometry.label_aspect)
 
-        ax.imshow(rgba, aspect=data.geometry.label_aspect, zorder=1, interpolation='nearest')
+        cs = ax.contour(
+            heatmap_resized, 
+            levels=[0.5], 
+            cmap='Greens',       # Uses the 'copper' colormap for the line
+            linewidths=1.5, 
+            zorder=1
+        )
 
         # Title for this subplot and hide axis ticks
         ax.set_title(f"t={data.time_points[idx]:.0f} days")

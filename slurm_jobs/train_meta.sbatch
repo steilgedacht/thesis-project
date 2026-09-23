@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -n 8
 #SBATCH --gres=gpu:1
-#SBATCH -J inr_meta
+#SBATCH -J meta_train
 #SBATCH --partition=full_optima
 #SBATCH --mem=64G
 #SBATCH --exclude=cn1,cn2,cn5,on1,vn1,cn6,on2,on3,vn2

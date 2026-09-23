@@ -8,7 +8,7 @@ class Config:
 
 
     """ Dataloading parameters """
-    batchsize = 250
+    batchsize = 150
     num_workers = 7
     prefetch_factor = 2
     pin_memory = True
