@@ -9,8 +9,8 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 51
-    background_samples = 1500
+    epochs = 2
+    background_samples = 200
     lr = 1e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.0001
@@ -22,8 +22,8 @@ class Config:
     # autoencoder_pretrain_epochs < epoch <= autoencoder_pretrain_epochs+lstm_only_epochs -> LSTM-only (encoder+decoder frozen)
     # epoch beyond that                                                     -> joint training (everything trainable)
     # Both default to 0 in train_lstm.py if omitted, i.e. pure joint training (old behaviour).
-    autoencoder_pretrain_epochs = 10
-    lstm_only_epochs = 10
+    autoencoder_pretrain_epochs = 1
+    lstm_only_epochs = 0
     # Set save path when pretraining; set load path for later LSTM runs.
     load_autoencoder_weights_path = False
     save_autoencoder_weights_path = "autoencoder_weights.pth"
@@ -53,22 +53,22 @@ class Config:
 
     """ Dataloading parameters """
     batchsize = 1
-    gradient_accumulation_steps = 128
-    num_workers = 7
-    prefetch_factor = 2
-    pin_memory = True
-    persistent_workers = True
+    gradient_accumulation_steps = 2
+    num_workers = 1
+    prefetch_factor = 1
+    pin_memory = False
+    persistent_workers = False
 
-    lesion_trajectories_with_more_than_n_scans = 4
+    lesion_trajectories_with_more_than_n_scans = 5
     use_only_growing_lesions = True
 
     # with that the same lesions can be in the same training batch
-    training_dataset_samples_duplication_factor = 20
+    training_dataset_samples_duplication_factor = 2
 
     dialation_iterations = 1
     background_samples_proportion = 1
 
-    lstm_grid_size = (64, 64, 64)
+    lstm_grid_size = (16, 16, 16)
     max_sequence_len = 6  # Max observation history for plotting
     dataset_params = {
         "grid_size": lstm_grid_size,
@@ -90,16 +90,16 @@ class Config:
         model = LesionLatentLSTM
         model_params = {
             "grid_size": lstm_grid_size,
-            "latent_dim": 256,
-            "hidden_dim": 256,
+            "latent_dim": 32,
+            "hidden_dim": 32,
             "n_layers": 2,
-            "time_freqs": 6,
+            "time_freqs": 4,
             "max_t": 3650.0,
             # encoder/decoder params: base_channels controls capacity; the
             # spatial downsample/upsample depth (4 stages, /16 total) is
             # fixed by the grid_size in model_lstm.py.
-            "encoder_params": {"base_channels": 32},
-            "decoder_params": {"base_channels": 32},
+            "encoder_params": {"base_channels": 8},
+            "decoder_params": {"base_channels": 8},
             "use_patient_embedding": True,
         }
         model_save_name = "lesion_lstm_autoencoder"
@@ -120,7 +120,7 @@ class Config:
     train_log_interval = 10
     train_delete_cache_interval = 10
     n_monitoring_samples_to_visualize = 5
-    validation_interval = 10
+    validation_interval = 1
     print_loss_interval = 10
     time_evolution_steps = 100
     time_evolution_side_length = 100

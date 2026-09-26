@@ -337,7 +337,7 @@ class LesionLatentLSTM(nn.Module):
         self.n_layers = n_layers
         self.use_patient_embedding = use_patient_embedding
 
-        num_patients = len(trajectories) * 100
+        num_patients = 1362 * 100
         if use_patient_embedding:
             self.patient_emb = nn.Embedding(num_patients, latent_dim)
             torch.nn.init.normal_(self.patient_emb.weight, std=1.0 / np.sqrt(latent_dim))

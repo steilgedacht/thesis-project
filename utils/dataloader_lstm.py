@@ -56,7 +56,8 @@ class LesionSequenceDataset(Dataset):
             self.validation_patients = [
                 sample["Patient"] + "_" + sample["Lesion"] for sample in self.validation_samples
             ]
- 
+            self.validation_samples = {sample["Patient"] + "_" + sample["Lesion"] : sample for sample in self.validation_samples}
+
     def __len__(self):
         return len(self.trajectories)
  
@@ -243,25 +244,51 @@ class Validation_Extrapolation_LesionSequenceDataset(LesionSequenceDataset):
     """
     def __init__(self, trajectories, **kwargs):
         super().__init__(trajectories, **kwargs)
-        self.trajectories = [
-            trj for trj in self.trajectories
-            if f"{trj.patient_id}_{trj.label_id}" in self.validation_patients
-        ]
+        # Expand trajectories so each extrapolation step becomes its own
+        # dataset entry: (original_index, T_minus, extrapolation_date)
+        base_trajs = self.trajectories
+        expanded = []
+        for i, trj in enumerate(base_trajs):
+            l_id = f"{trj.patient_id}_{trj.label_id}"
+            if l_id in self.validation_patients:
+                for T, date in zip(self.validation_samples[l_id]["extrapolation_T_minus"], self.validation_samples[l_id]["extrapolation_dates"]):
+                    expanded.append((i, T, date))
+
+
+        # expanded = []
+        # for k, v in self.validation_samples.items():
+        #     for T, date in zip(v["extrapolation_T_minus"], v["extrapolation_dates"]):
+        #         expanded.append((i, T, date))
+
+
+        # keep a copy of the original trajectories for indexing in resampling
+        self._base_trajectories = base_trajs
+        self.trajectories_expanded = expanded
 
     def __getitem__(self, idx):
-        trj = self.trajectories[idx]
+        # expanded entry: (orig_idx, T_minus, extrapolation_date)
+        orig_idx, T, extrapolation_date = self.trajectories_expanded[idx]
+        trj = self._base_trajectories[orig_idx]
+
         full_dates = list(trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates)
-        history_dates = self._train_dates(trj)
-        target_date = full_dates[-1]  # held-out extrapolation target
 
-        cached = self._load_and_resample_trajectory(idx, history_dates + [target_date])
+        p_id = f"{trj.patient_id}_{trj.label_id}"
+        extrapolation_time = self.validation_samples[p_id]["extrapolation_dates"]
+        # history is all dates excluding any extrapolation-held-out dates
+        history_dates = [d for d in full_dates if d not in extrapolation_time]
 
-        history_grids = np.stack([cached["grids"][d] for d in history_dates], axis=0)[:, None]
-        history_times = np.array([cached["times"][d] for d in history_dates], dtype=np.float32)
-        target_grid = cached["grids"][target_date][None]
-        target_time = np.float32(cached["times"][target_date])
+        # ensure we load the target extrapolation date as well
+        cached = self._load_and_resample_trajectory(orig_idx, history_dates + [extrapolation_date])
 
-        return history_grids, history_times, target_grid, target_time, self.get_embedding_id(trj)
+        history_grids = np.stack([cached["grids"][d] for d in history_dates], axis=0)[:, None] if len(history_dates) > 0 else np.zeros((0, 1) + self.grid_size, dtype=np.float32)
+        history_times = np.array([cached["times"][d] for d in history_dates], dtype=np.float32) if len(history_dates) > 0 else np.array([], dtype=np.float32)
+        target_grid = cached["grids"][extrapolation_date][None]
+        target_time = np.float32(cached["times"][extrapolation_date])
+
+        return history_grids, history_times, target_grid, target_time, self.get_embedding_id(trj), T
+
+    def __len__(self):
+        return len(self.trajectories_expanded)
 
 
 class Validation_Interpolation_LesionSequenceDataset(LesionSequenceDataset):
@@ -286,28 +313,22 @@ class Validation_Interpolation_LesionSequenceDataset(LesionSequenceDataset):
         trj = self.trajectories[idx]
         full_dates = list(trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates)
 
-        # NOTE: the original Validation_Interpolation_LesionDataset computed
-        # `half_of_the_list = len(dates_list[-1]) // 2`, where dates_list[-1]
-        # is a single date, not a list -- that looks like a typo for
-        # `len(dates_list) // 2`. Using the corrected version here; flag if
-        # the original was intentional for a reason not visible from this
-        # file alone.
-        dates_minus_last = full_dates[:-1]
-        half_of_the_list = len(dates_minus_last) // 2
-        target_date = dates_minus_last[half_of_the_list]
+        p_id = f"{trj.patient_id}_{trj.label_id}"
+        # use the interpolation index from the validation_samples (consistent
+        # with the INR dataset behavior)
+        interpolation_timestep = full_dates[int(self.validation_samples[p_id]["interpolation"]) ]
 
-        target_pos = full_dates.index(target_date)
+        target_pos = full_dates.index(interpolation_timestep)
         history_dates = full_dates[:target_pos]
         if len(history_dates) == 0:
-            # target is the first visit: no history available, degenerate case
-            history_dates = [target_date]
+            history_dates = [interpolation_timestep]
 
-        cached = self._load_and_resample_trajectory(idx, history_dates + [target_date])
+        cached = self._load_and_resample_trajectory(idx, history_dates + [interpolation_timestep])
 
         history_grids = np.stack([cached["grids"][d] for d in history_dates], axis=0)[:, None]
         history_times = np.array([cached["times"][d] for d in history_dates], dtype=np.float32)
-        target_grid = cached["grids"][target_date][None]
-        target_time = np.float32(cached["times"][target_date])
+        target_grid = cached["grids"][interpolation_timestep][None]
+        target_time = np.float32(cached["times"][interpolation_timestep])
 
         return history_grids, history_times, target_grid, target_time, self.get_embedding_id(trj)
 

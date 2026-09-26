@@ -116,36 +116,87 @@ def save_autoencoder_weights(model, config):
 
 
 def validate_polation(data_loader, text, global_step, criterion):
-    bce_loss = 0
-    dice_loss = 0
+    # Support both dataset item formats:
+    # (history_grids, history_times, target_grid, target_time, patient_idx)
+    # and
+    # (history_grids, history_times, target_grid, target_time, patient_idx, T)
+    bce_loss = 0.0
+    dice_loss = 0.0
+    loss_T_pairs = []
+
+    def plot_extrapolation_time(loss_T_pairs, global_step):
+        import numpy as _np
+        import matplotlib.pyplot as _plt
+
+        if len(loss_T_pairs) == 0:
+            return
+        loss_np = _np.array([[l[0], l[1].item()] for l in loss_T_pairs])
+
+        x = 180 - loss_np[:, 1]
+        y = 1 - loss_np[:, 0]
+
+        m, b = _np.polyfit(x, y, 1)
+
+        _plt.scatter(x, y, label="Extrapolation Scan")
+        x_line = _np.linspace(1, 180, 200)
+        _plt.plot(x_line, m * x_line + b, color="red", linestyle="--", label=f"Linear Fit (Slope = {m:.6f})")
+
+        _plt.title("Extrapolation Dice Score after t_days in the last 180 days")
+        _plt.ylabel("Dice Score")
+        _plt.ylim(0, 1)
+        _plt.xlabel("t [days]")
+        _plt.xlim(1, 183)
+        _plt.xticks(list(range(0, 181, 20)))
+        _plt.legend()
+        output_path = f"/tmp/Extrapolation_Dice_Score_Distribution_Step{global_step}.png"
+        _plt.savefig(output_path)
+        mlflow.log_artifact(output_path)
+        _plt.close()
+
     with torch.no_grad():
-        for history_grids, history_times, target_grid, target_time, patient_idx in tqdm(
-            data_loader, desc=text, total=len(data_loader)
-        ):
-            history_grids = history_grids.to(config.device)            # [1, T, 1, D, H, W]
-            history_times = history_times.to(config.device)            # [1, T]
-            target_grid = target_grid.to(config.device)                # [1, 1, D, H, W]
-            target_time = target_time.to(config.device).view(1, 1)     # [1, 1]
+        for batch in tqdm(data_loader, desc=text, total=len(data_loader)):
+            # unpack batch of either length 5 or 6
+            if len(batch) == 6:
+                history_grids, history_times, target_grid, target_time, patient_idx, T = batch
+                has_T = True
+            else:
+                history_grids, history_times, target_grid, target_time, patient_idx = batch
+                T = None
+                has_T = False
+
+            history_grids = history_grids.to(config.device)
+            history_times = history_times.to(config.device)
+            target_grid = target_grid.to(config.device)
+            target_time = target_time.to(config.device).view(-1, 1)
             patient_idx = patient_idx.to(config.device)
 
-            full_times = torch.cat([history_times, target_time], dim=1)  # [1, T+1]
+            full_times = torch.cat([history_times, target_time], dim=1)
 
             preds = model(history_grids, full_times, patient_idx=patient_idx, n_future=1)
-            target_pred = preds[:, -1]  # [1, 1, D, H, W] logits for the held-out step
+            target_pred = preds[:, -1]
 
             # Use the same loss as training (BCE + Dice) for consistent monitoring
-            bce_loss += criterion.loss_fn_1(target_pred, target_grid).mean().item()
-            dice_loss += criterion.dice_loss(target_pred, target_grid).mean().item()
+            batch_bce = criterion.loss_fn_1(target_pred, target_grid).mean().item()
+            batch_dice = criterion.dice_loss(target_pred, target_grid).mean().item()
 
-    avg_bce = bce_loss / len(data_loader)
-    avg_dice = dice_loss / len(data_loader)
-    
+            bce_loss += batch_bce
+            dice_loss += batch_dice
+
+            if has_T and text == "Valid Extrapolation":
+                loss_T_pairs.append((batch_dice, T))
+
+    avg_bce = bce_loss / len(data_loader) if len(data_loader) > 0 else 0.0
+    avg_dice = dice_loss / len(data_loader) if len(data_loader) > 0 else 0.0
+
     mlflow.log_metrics({
-        text.lower().replace(" ", "_") + "_bce_loss"  : avg_bce,
-        text.lower().replace(" ", "_") + "_dice_loss" : avg_dice,
+        text.lower().replace(" ", "_") + "_bce_loss": avg_bce,
+        text.lower().replace(" ", "_") + "_dice_loss": avg_dice,
         text.lower().replace(" ", "_") + "_total_loss": avg_bce + avg_dice,
         text.lower().replace(" ", "_") + "_dice_score": 1 - avg_dice,
     }, step=global_step)
+
+    if text == "Valid Extrapolation":
+        plot_extrapolation_time(loss_T_pairs, global_step)
 
 def train_lstm(
         model, 
@@ -253,6 +304,11 @@ def train_lstm(
 
             global_step += 1
 
+            with torch.no_grad():
+                for trj in plotting_LesionDataset:  
+                    plot_contanct_sheet(model, epoch, trj, config, final_side_length=True)
+
+
             if i % config.train_delete_cache_interval == 0:
                 del grids, times, patient_idx, targets, predictions, loss
                 torch.cuda.empty_cache()
@@ -265,12 +321,10 @@ def train_lstm(
         # meaningless (frozen/untrained) during the pure autoencoder phase, so skip it then.
         if epoch % config.validation_interval == 0 and phase != "autoencoder":
             with torch.no_grad():
-                # visualize_samples(model, epoch, monitoring_samples, train_loader, "train", config)
-                # visualize_samples(model, epoch, monitoring_samples, valid_interpolation_loader, "valid", config)
                 validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
                 validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
-                for trj in plotting_LesionDataset:
-                    plot_lesion_time_evolution_lstm(model, epoch, trj, config)
+                # for trj in plotting_LesionDataset:
+                #     plot_lesion_time_evolution_lstm(model, epoch, trj, config)
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
         scheduler.step()
@@ -293,6 +347,7 @@ def train_lstm(
 
     with torch.no_grad():
         for trj in plotting_LesionDataset:  
+            plot_contanct_sheet(model, epoch, trj, config, final_side_length=True)
             plot_lesion_time_evolution_lstm(model, epoch, trj, config, final_side_length=True)
 
     return losses
