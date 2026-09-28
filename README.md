@@ -4,22 +4,22 @@ This repository contains a research and training pipeline for modeling lesion ev
 
 ## Installation
 
-The 150 GB of data has to be downloaded from this [Website](https://www.cancerimagingarchive.net/collection/yale-brain-mets-longitudinal/) and saved in the following folder structure:
+The 43 GB of data has to be downloaded from this [Website](https://www.cancerimagingarchive.net/collection/yale-brain-mets-longitudinal/). Alternatively as this setup is a little bit complex, one can also download all the data that is necessary for training from this [Google Drive Folder](https://drive.google.com/drive/folders/1MC1VjQRGqh2NnRhTz3jpdIb_dgkn73gM?usp=sharing). After that the data has to be saved in the following folder structure:
 
-`data/entire_yale_dataset/PRE_POST_YBML`
+Create the directories
 
-The lesion segmentations have then to be in 
+`data/entire_yale_dataset/YBML/`   
+`data/entire_yale_dataset/PRE_POST_YBML`  
+`data/entire_yale_dataset/predictions`  
+
+YBML will contain the 43 GB of data, but it is not necessary to start training. To get the other to folder simply unpack the `data.tar.gz` which can be found on the Drive. The `PRE_POST_YBML` will contain all the PRE and POST modalities of the patients and the `predictions` will contain all the lesion segmentations, registered and processed data which is necessary for training.
 `data/entire_yale_dataset/predictions`.
-
-To test out the training, only the ready-processed trajectories is needed which can be downloaded via this drive: 
-
-TODO
 
 As they only contain the filled segmentation masks in a binary datatype, the files can be nicely compressed and shrink down to below 200MB. Once the zip is downloaded, extract the file into the folder `data/entire_yale_dataset/predictions` and extract it there so that you have the following structue:
 
 `data/entire_yale_dataset/predictions/YG_**`
 
-Afterwards, create a virtual environment and install the packages listed in [requirements.txt](requirements.txt):
+Afterwards, create a virtual environment with python3.11 and install the packages listed in [requirements.txt](requirements.txt):
 
 ```bash
 python3.11 -m venv .venv
@@ -29,6 +29,8 @@ python -m pip install -r requirements.txt
 ```
 
 ## Training Commands & Examples
+
+To execute training, up to 48GB of VRAM are necessary. All the results are logged via MLFlow, a local Open-Source Weights-and-Biases alternative.
 
 ### Commands to reproduce the Papers results
 

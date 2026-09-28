@@ -1,3 +1,12 @@
+# For CUDA 12.4:
+--find-links https://data.pyg.org/whl/torch-2.5.1+cu124.html
+
+# For CUDA 12.1:
+# --find-links https://data.pyg.org/whl/torch-2.5.1+cu121.html
+
+# For CPU only:
+# --find-links https://data.pyg.org/whl/torch-2.5.1+cpu.html
+
 torch==2.5.1
 torchvision==0.20.1
 torchaudio==2.5.1

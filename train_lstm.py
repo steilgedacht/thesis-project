@@ -304,11 +304,6 @@ def train_lstm(
 
             global_step += 1
 
-            with torch.no_grad():
-                for trj in plotting_LesionDataset:  
-                    plot_contanct_sheet(model, epoch, trj, config, final_side_length=True)
-
-
             if i % config.train_delete_cache_interval == 0:
                 del grids, times, patient_idx, targets, predictions, loss
                 torch.cuda.empty_cache()
