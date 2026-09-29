@@ -21,7 +21,7 @@ from utils.train_plotting import plot_lesion_time_evolution, plot_contanct_sheet
 from utils.loss_bce_dice import Loss_BCE_Dice
 from umap import UMAP
 
-mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_tracking_uri("http://127.0.0.1:5002")
 mlflow.set_experiment("Lesion_INR_Training")
 
 def load_config(config_path: str):
@@ -152,11 +152,11 @@ def fit_trajectory_to_model(model, train_loader, plotting_LesionDataset, config,
     for epoch in range(epochs):
         total_loss = 0
         model.train()
-        for i, (coords, labels, _) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
+        for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
 
             coords = coords.to(device)
             labels = labels.to(device).unsqueeze(-1)
-            patient_idx = torch.tensor([0], device="cuda")
+            patient_idx = torch.zeros_like(patient_idx, device=device)
 
             if coords.shape[1] == 0:
                 continue
@@ -216,23 +216,23 @@ def fit_trajectory_to_model(model, train_loader, plotting_LesionDataset, config,
         plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=True)
 
 
-    with torch.no_grad():
-        embedding_history = np.array(embedding_history)
-        umap = UMAP(n_components=2, random_state=42)
-        trajectory_umap = umap.fit_transform(embedding_history)
+    # with torch.no_grad():
+    #     embedding_history = np.array(embedding_history)
+    #     umap = UMAP(n_components=2, random_state=42)
+    #     trajectory_umap = umap.fit_transform(embedding_history)
 
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.plot(trajectory_umap[:, 0], trajectory_umap[:, 1], 'o-', markersize=5)
-        ax.scatter(trajectory_umap[0, 0], trajectory_umap[0, 1], color='green', s=200, marker='o', label='Start')
-        ax.scatter(trajectory_umap[-1, 0], trajectory_umap[-1, 1], color='red', s=200, marker='*', label='End')
-        ax.set_xlabel('UMAP 1')
-        ax.set_ylabel('UMAP 2')
-        ax.set_title('Embedding Trajectory During Fine-tuning')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        mlflow.log_figure(fig, "embedding_trajectory.png")
-        plt.close(fig)
-        visualize_embedding_change(model, torch.tensor([0]).to(device), train_loader)
+    #     fig, ax = plt.subplots(figsize=(8, 8))
+    #     ax.plot(trajectory_umap[:, 0], trajectory_umap[:, 1], 'o-', markersize=5)
+    #     ax.scatter(trajectory_umap[0, 0], trajectory_umap[0, 1], color='green', s=200, marker='o', label='Start')
+    #     ax.scatter(trajectory_umap[-1, 0], trajectory_umap[-1, 1], color='red', s=200, marker='*', label='End')
+    #     ax.set_xlabel('UMAP 1')
+    #     ax.set_ylabel('UMAP 2')
+    #     ax.set_title('Embedding Trajectory During Fine-tuning')
+    #     ax.legend()
+    #     ax.grid(True, alpha=0.3)
+    #     mlflow.log_figure(fig, "embedding_trajectory.png")
+    #     plt.close(fig)
+    #     visualize_embedding_change(model, torch.tensor([0]).to(device), train_loader)
         
     return losses
 
@@ -252,8 +252,8 @@ with mlflow.start_run(run_name="embedding learning", tags={"type" : "new_patient
     train_loader = DataLoader(train_dataset, batch_size=5, shuffle=True, num_workers=7, prefetch_factor=2, pin_memory=True, persistent_workers=True)
     plotting_LesionDataset = Plotting_LesionDataset(trj)
 
-    run_id = "8fe747bb5b064f70be27b66dcb418617"
+    run_id = "925cd9aa6a3144e3b23b695a9f1dd9a1"
     model_uri = f"runs:/{run_id}/lesion_inr_model"
     model = mlflow.pytorch.load_model(model_uri)
 
-    losses = fit_trajectory_to_model(model, train_loader, plotting_LesionDataset, config=config,  epochs=100, lr=100., device=device)
+    losses = fit_trajectory_to_model(model, train_loader, plotting_LesionDataset, config=config,  epochs=100, lr=10., device=device)

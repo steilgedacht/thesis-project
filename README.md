@@ -12,7 +12,7 @@ Create the directories
 `data/entire_yale_dataset/PRE_POST_YBML`  
 `data/entire_yale_dataset/predictions`  
 
-YBML will contain the 43 GB of data, but it is not necessary to start training. To get the other to folder simply unpack the `data.tar.gz` which can be found on the Drive. The `PRE_POST_YBML` will contain all the PRE and POST modalities of the patients and the `predictions` will contain all the lesion segmentations, registered and processed data which is necessary for training.
+YBML will contain the 43 GB of data, but it is not necessary to start training. To get the other to folders simply unpack the `data.tar.gz` which can be found on the Drive. The `PRE_POST_YBML` will contain all the PRE and POST modalities of the patients and the `predictions` will contain all the lesion segmentations, registered and processed data which is necessary for training.
 `data/entire_yale_dataset/predictions`.
 
 As they only contain the filled segmentation masks in a binary datatype, the files can be nicely compressed and shrink down to below 200MB. Once the zip is downloaded, extract the file into the folder `data/entire_yale_dataset/predictions` and extract it there so that you have the following structue:
@@ -28,9 +28,27 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+If you plan to run the segmentation, you also have to install nnUnet via
+
+```bash
+git clone https://github.com/MIC-DKFZ/nnUNet.git
+cd nnUNet
+pip install -e .
+```
+
+or simply 
+
+```bash
+pip install nnunetv2
+```
+
+You find the weights for the model also on the [Google Drive Folder](https://drive.google.com/drive/folders/1MC1VjQRGqh2NnRhTz3jpdIb_dgkn73gM?usp=sharing) and you have to store them into  
+`data/thomas_model_data/BratsMets`  
+`data/thomas_model_data/nnunet`  
+
 ## Training Commands & Examples
 
-To execute training, up to 48GB of VRAM are necessary. All the results are logged via MLFlow, a local Open-Source Weights-and-Biases alternative.
+To execute training, up to 48GB of VRAM are necessary and one training run will take up to 2 days. All the results are logged via MLFlow, a local Open-Source Weights-and-Biases alternative.
 
 ### Commands to reproduce the Papers results
 
@@ -142,6 +160,8 @@ These files are the main entry points for running experiments.
   Additional model/training entry point for finite-element-like or PDE-inspired experiments.
 - `peak_server.sh`, `start_mlflow.sh`, `sync_server.sh`  
   Helper scripts for starting MLflow, syncing data between local machines and remote servers, and keeping the server environment ready.
+- `new_patient_fit.py`
+  Take a model and fit a new patient to the model by just adjusting the embedding. 
 
 ### `experiments/`
 

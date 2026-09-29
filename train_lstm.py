@@ -19,6 +19,7 @@ import argparse
 import requests
 import json
 import os
+import numpy as np
 
 def check_if_mlflow_is_running(config):
     try:
@@ -115,6 +116,33 @@ def save_autoencoder_weights(model, config):
     print(f"Saved encoder and decoder weights to {checkpoint_path}")
 
 
+def _validation_sample_resampling_extent(dataset, sample_idx, text):
+    if text == "Valid Interpolation":
+        trajectory = dataset.trajectories[sample_idx]
+        trajectory_idx = sample_idx
+        full_dates = list(
+            trajectory.allowed_dates if hasattr(trajectory, "allowed_dates") else trajectory.dates
+        )
+        sample_id = f"{trajectory.patient_id}_{trajectory.label_id}"
+        target_date = full_dates[int(dataset.validation_samples[sample_id]["interpolation"])]
+        target_idx = full_dates.index(target_date)
+        history_dates = full_dates[:target_idx] or [target_date]
+    else:
+        trajectory_idx, _, target_date = dataset.trajectories_expanded[sample_idx]
+        trajectory = dataset._base_trajectories[trajectory_idx]
+        full_dates = list(
+            trajectory.allowed_dates if hasattr(trajectory, "allowed_dates") else trajectory.dates
+        )
+        sample_id = f"{trajectory.patient_id}_{trajectory.label_id}"
+        held_out_dates = dataset.validation_samples[sample_id]["extrapolation_dates"]
+        history_dates = [date for date in full_dates if date not in held_out_dates]
+
+    resampled = dataset._load_and_resample_trajectory(
+        trajectory_idx, history_dates + [target_date]
+    )
+    return float(resampled["extent"])
+
+
 def validate_polation(data_loader, text, global_step, criterion):
     # Support both dataset item formats:
     # (history_grids, history_times, target_grid, target_time, patient_idx)
@@ -122,6 +150,9 @@ def validate_polation(data_loader, text, global_step, criterion):
     # (history_grids, history_times, target_grid, target_time, patient_idx, T)
     bce_loss = 0.0
     dice_loss = 0.0
+    volume_error_cm3 = 0.0
+    dataset_batch_size = getattr(data_loader, "batch_size", 1) or 1
+    grid_size = np.asarray(data_loader.dataset.grid_size, dtype=np.float64)
     loss_T_pairs = []
 
     def plot_extrapolation_time(loss_T_pairs, global_step):
@@ -154,7 +185,7 @@ def validate_polation(data_loader, text, global_step, criterion):
         _plt.close()
 
     with torch.no_grad():
-        for batch in tqdm(data_loader, desc=text, total=len(data_loader)):
+        for batch_idx, batch in enumerate(tqdm(data_loader, desc=text, total=len(data_loader))):
             # unpack batch of either length 5 or 6
             if len(batch) == 6:
                 history_grids, history_times, target_grid, target_time, patient_idx, T = batch
@@ -182,6 +213,19 @@ def validate_polation(data_loader, text, global_step, criterion):
             bce_loss += batch_bce
             dice_loss += batch_dice
 
+            dataset_start = batch_idx * dataset_batch_size
+            for local_idx in range(target_pred.shape[0]):
+                sample_idx = dataset_start + local_idx
+                extent_mm = _validation_sample_resampling_extent(
+                    data_loader.dataset, sample_idx, text
+                )
+                voxel_volume_cm3 = np.prod(extent_mm / (grid_size - 1)) / 1000.0
+                predicted_voxels = (
+                    torch.sigmoid(target_pred[local_idx]) > 0.5
+                ).sum().item()
+                target_voxels = (target_grid[local_idx] > 0.5).sum().item()
+                volume_error_cm3 += abs(predicted_voxels - target_voxels) * voxel_volume_cm3
+
             if has_T and text == "Valid Extrapolation":
                 loss_T_pairs.append((batch_dice, T))
 
@@ -193,7 +237,10 @@ def validate_polation(data_loader, text, global_step, criterion):
         text.lower().replace(" ", "_") + "_dice_loss": avg_dice,
         text.lower().replace(" ", "_") + "_total_loss": avg_bce + avg_dice,
         text.lower().replace(" ", "_") + "_dice_score": 1 - avg_dice,
+        text.lower().replace(" ", "_") + "_wrongly_predicted_volume_cm3": volume_error_cm3,
     }, step=global_step)
+
+    print(f"{text} wrongly predicted volume: {volume_error_cm3:.6f} cm^3")
 
     if text == "Valid Extrapolation":
         plot_extrapolation_time(loss_T_pairs, global_step)
