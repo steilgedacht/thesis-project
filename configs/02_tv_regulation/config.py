@@ -26,7 +26,7 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 101
+    epochs = 151
     background_samples = 1500
     lr = 1e-4
     weight_decay = 1e-6
@@ -37,7 +37,7 @@ class Config:
     from utils.loss_bce_dice_tv import Loss_BCE_Dice_TV
     loss_fn = Loss_BCE_Dice_TV(
         lambda_space=3e-2, 
-        lambda_time=0.6
+        lambda_time=10
     )
     use_total_variation_loss = True
     
@@ -49,7 +49,7 @@ class Config:
     model_params = {
         "latent_dim" : 128,
         "input_dim" : 4,
-        "hidden_dim" : 512,
+        "hidden_dim" : 1024,
         "output_dim" : 1,
         "omega_0" : 30.0,
         "n_layers" : 8,

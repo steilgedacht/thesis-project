@@ -2,14 +2,15 @@ import torch
 
 
 class Config:
-    """ Tracking parameters """
+    """Tracking parameters"""
+
     mlflow_tracking_uri = "http://127.0.0.1:5000"
     mlflow_experiment_name = "Lesion_INR_Training"
     mlflow_run_name = "LSTM"
 
     """ Training parameters """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 51
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    epochs = 101
     background_samples = 1500
     lr = 1e-4
     weight_decay = 1e-6
@@ -126,3 +127,4 @@ class Config:
     time_evolution_side_length = 100
 
     full_size_side_length = 500
+
