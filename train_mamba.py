@@ -23,6 +23,7 @@ from utils.dataloader_lstm import (
     sequence_collate_fn,
 )
 from utils.mri_dataloader import MRI_Dataloader
+from utils.gradient_logging import gradient_statistics
 from utils.train_plotting_lstm import (
     plot_contanct_sheet,
     plot_lesion_time_evolution_lstm,
@@ -309,6 +310,11 @@ def train_mamba(
             loss = criterion(predictions, targets)
             unscaled_loss = loss.detach().item()
             (loss / accumulation_steps).backward()
+            grad_metrics = (
+                gradient_statistics(model)
+                if batch_idx % config.train_log_interval == 0
+                else {}
+            )
             total_loss += unscaled_loss
 
             should_step = (
@@ -325,6 +331,7 @@ def train_mamba(
 
             if batch_idx % config.train_log_interval == 0:
                 metrics = {
+                    **grad_metrics,
                     "training_loss": unscaled_loss,
                     "wrongly_predicted_total_volume": (
                         (predictions > 0).sum().item()

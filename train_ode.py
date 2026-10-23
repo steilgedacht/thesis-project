@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+from django.db.migrations import optimizer
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -136,7 +137,7 @@ def train_inr(
     model.to(config.device)
     losses = []
     
-    global_step = epoch = 0
+    global_step = epoch = grads = 0
 
     for epoch in range(1, config.epochs + 1):
         total_loss = 0
@@ -158,12 +159,23 @@ def train_inr(
 
             if loss.requires_grad: # only used for baseline models with no parameters
                 loss.backward()
+                grads = [ p.grad.detach().flatten() for p in model.parameters() if p.grad is not None]
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm_clip) 
                 optimizer.step()
             
             total_loss += loss.item()
 
             if i % config.train_log_interval == 0:
+                if grads:
+                    all_grads = torch.cat(grads)
+
+                    # Log statistical distribution metrics
+                    mlflow.log_metric(
+                        "grad_mean", all_grads.mean().item(), step=global_step
+                    )
+                    mlflow.log_metric("grad_max", all_grads.max().item(), step=global_step)
+                    mlflow.log_metric("grad_min", all_grads.min().item(), step=global_step)
+                    mlflow.log_metric("grad_std", all_grads.std().item(), step=global_step)
                 mlflow.log_metrics(
                     {
                         "training_loss" : loss.item(),

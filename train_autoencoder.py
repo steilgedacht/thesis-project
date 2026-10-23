@@ -9,6 +9,7 @@ from tqdm import tqdm
 from utils.mri_dataloader import MRI_Dataloader
 from utils.dataloader_lstm import LesionSequenceDataset, Validation_Extrapolation_LesionSequenceDataset, Validation_Interpolation_LesionSequenceDataset, Plotting_LesionSequenceDataset
 from utils.train_plotting import *
+from utils.gradient_logging import gradient_statistics
 import argparse
 import requests
 import json
@@ -219,6 +220,7 @@ def train_lstm(
                 targets = grids[:, 1:]                            # ground-truth next-frame at each step
 
             loss = criterion(predictions, targets)
+            grad_metrics = {}
 
             if loss.requires_grad:  
                 # 1. Scale the loss to average the gradients over the accumulation steps
@@ -226,6 +228,8 @@ def train_lstm(
                 
                 # 2. Accumulate gradients (adds to existing .grad instead of overwriting)
                 loss.backward()
+                if i % config.train_log_interval == 0:
+                    grad_metrics = gradient_statistics(model)
 
             total_loss += loss.item() * config.gradient_accumulation_steps # Scale back up for logging
 
@@ -243,6 +247,7 @@ def train_lstm(
                 # not 0.5, since these are raw logits not probabilities.
                 mlflow.log_metrics(
                     {
+                        **grad_metrics,
                         # Report unscaled loss for accurate tracking
                         "training_loss": loss.item() * config.gradient_accumulation_steps,
                         **criterion.loss_to_report,

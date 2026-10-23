@@ -9,6 +9,7 @@ from tqdm import tqdm
 from utils.mri_dataloader import MRI_Dataloader
 from utils.dataloader import LesionDataset, Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset, Plotting_LesionDataset
 from utils.train_plotting import *
+from utils.gradient_logging import gradient_statistics
 import argparse
 import requests
 import json
@@ -153,9 +154,12 @@ def train_inr(
             predictions = model(coords, patient_idx)
 
             loss = criterion(predictions, labels, coords=coords if config.use_total_variation_loss else None)
+            grad_metrics = {}
 
             if loss.requires_grad: # only used for baseline models with no parameters
                 loss.backward()
+                if i % config.train_log_interval == 0:
+                    grad_metrics = gradient_statistics(model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm_clip) 
                 optimizer.step()
             
@@ -164,6 +168,7 @@ def train_inr(
             if i % config.train_log_interval == 0:
                 mlflow.log_metrics(
                     {
+                        **grad_metrics,
                         "training_loss" : loss.item(),
                         **criterion.loss_to_report,
                         "wrongly_predicted_total_volume" : (predictions > 0.5).sum().item() - (labels > 0.5).sum().item(),

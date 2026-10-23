@@ -14,6 +14,7 @@ import os
 
 # Utility imports (Assuming these are in your local directory)
 from utils.mri_dataloader import MRI_Dataloader
+from utils.gradient_logging import gradient_statistics
 from utils.dataloader import MetaLesionDataset, Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset, Plotting_LesionDataset
 from utils.train_plotting_meta import *
 
@@ -232,6 +233,11 @@ def train_inr(
                     batch_outer_loss += outer_loss.item()
 
             # Meta-Optimizer update
+            grad_metrics = (
+                gradient_statistics(model)
+                if i % config.train_log_interval == 0
+                else {}
+            )
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm_clip)
             optimizer.step()
             optimizer.zero_grad()
@@ -240,6 +246,7 @@ def train_inr(
             if i % config.train_log_interval == 0:
                 mlflow.log_metrics(
                     {
+                        **grad_metrics,
                         "training_loss" : outer_loss.item(),
                         **criterion.loss_to_report,  # Includes BCE, Dice, TV, pos_weight components
                         # Approximation based on the query set predictions
