@@ -35,9 +35,13 @@ def _nice_scale_length_mm(pixel_extent_mm):
     return 10 * magnitude
 
 def _is_lstm_model(model):
-    """Detect if model is LesionLSTM/LesionLatentLSTM vs INR."""
+    """Detect grid-sequence models (LSTM or Mamba) versus coordinate-query INRs."""
     model_class_name = model.__class__.__name__
-    return 'LSTM' in model_class_name or 'Latent' in model_class_name
+    return (
+        'LSTM' in model_class_name
+        or 'Latent' in model_class_name
+        or 'Mamba' in model_class_name
+    )
 
 def plot_predictions(v_preds, v_labels, v_coords, epoch, title=""):
     fig, axes = plt.subplots(2, 2, figsize=(12, 12))

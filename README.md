@@ -62,6 +62,9 @@ python3 train_dilation.py --config configs/01_dialation/config_patient_specific.
 # LSTM
 python3 train_lstm.py --config configs/04_lstm/config.py
 
+# Mamba
+python3 train_mamba.py --config configs/07_mamba/config.py
+
 # INR
 python3 train_inr.py --config configs/02_tv_regulation/config.py
 
@@ -81,6 +84,12 @@ To run an LSTM experiment:
 
 ```bash
 python train_lstm.py --config configs/04_lstm/config.py
+```
+
+To run a Mamba experiment:
+
+```bash
+python train_mamba.py --config configs/07_mamba/config.py
 ```
 
 ### Example 2, submit a model to the server and train it there:
@@ -150,6 +159,7 @@ These files are the main entry points for running experiments.
   Main training script for the default lesion INR model. It loads a config, sets up MLflow, builds the datasets, and launches training.
 - `train_lstm.py`  
   Training pipeline for a temporal LSTM-based model. This includes staged training logic with autoencoder pretraining and frozen-weights phases.
+- `train_mamba.py` — Training pipeline for the latent-space Mamba model, including autoencoder pretraining, validation, MLflow logging, and lesion-evolution visualizations.
 - `train_meta.py`  
   Meta-learning variant using MAML-style adaptation. This is designed for patient-specific adaptation and task-based training.
 - `train_autoencoder.py`  
@@ -278,5 +288,3 @@ External nnUnet Repository
 ### `papers/`
 
 This folder is intended for research papers, references, notes, or related literature. It is a place for publication material and background reading.
-
-
