@@ -22,8 +22,8 @@ class Config:
 
     dialation_iterations = 1
     background_samples_proportion = 1
-    from utils.dataloader import LesionDataset
-    train_dataset_class = LesionDataset
+    from utils.dataloader_ode import FourTimepointLesionDataset
+    train_dataset_class = FourTimepointLesionDataset
 
     # Repeat positive voxels to keep training samples balanced with negatives.
     # Disable to use each positive voxel at most once and fill with negatives.
