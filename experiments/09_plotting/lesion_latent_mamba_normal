@@ -1,0 +1,36 @@
+// High-Level LesionLatentMamba Flow
+digraph LesionLatentMamba_Normal {
+	fontname=Helvetica nodesep=0.5 rankdir=TB ranksep=0.6
+	node [fontname=Helvetica fontsize=10 shape=rect style="filled,rounded"]
+	edge [color="#333333" fontname=Helvetica fontsize=9]
+	grids_in [label="Input Occupancy Grids
+[B, T, 1, D, H, W]" fillcolor="#E1F5FE"]
+	times_in [label="Target Timestamps
+[B, T + n_future]" fillcolor="#E8F5E9"]
+	p_idx [label="Patient Index
+[B, 1]" fillcolor="#E8F5E9"]
+	encoder [label="3D Conv Encoder (Encoder3D)
+observed_latents: [B, T, latent_dim]" fillcolor="#FFF3E0"]
+	t_enc [label="TimeEncoder
+[B, 2 * time_freqs]" fillcolor="#E8F5E9"]
+	p_emb [label="Patient Embedding Table
+[B, latent_dim]" fillcolor="#FFF3E0"]
+	concat_in [label="Concatenate [z_curr, t_enc, p_emb]
+Shape: [B, step, input_dim]" fillcolor="#FFFFFF" shape=ellipse]
+	mamba_core [label="Mamba Recurrent Core
+input_proj -> MambaBlock x N -> fc_out
+Predicts next latent vector" fillcolor="#FFEBEE"]
+	decoder [label="3D Conv Decoder (Decoder3D)
+Decodes latent to grid" fillcolor="#FFF3E0"]
+	preds_out [label="Predicted Occupancy Grids
+preds: [B, Steps, 1, D, H, W]" fillcolor="#F3E5F5" shape=doubleoctagon]
+	grids_in -> encoder
+	encoder -> concat_in [label=current_latent]
+	times_in -> t_enc
+	t_enc -> concat_in [label=time_encoding]
+	p_idx -> p_emb
+	p_emb -> concat_in [label=patient_embedding]
+	concat_in -> mamba_core [label="sequence inputs"]
+	mamba_core -> decoder [label="predicted_latent [B, latent_dim]"]
+	decoder -> preds_out
+}

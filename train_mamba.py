@@ -372,6 +372,9 @@ def train_mamba(
                 criterion,
                 config,
             )
+            plot_lesion_time_evolution_lstm(
+                model, epoch, trajectory, config, final_side_length=True
+            )
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
         scheduler.step()

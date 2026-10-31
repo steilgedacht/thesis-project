@@ -4,7 +4,7 @@ import torch
 class Config:
     """ Tracking parameters """
     mlflow_tracking_uri = "http://127.0.0.1:5000"
-    mlflow_experiment_name = "Lesion_INR_Training"
+    mlflow_experiment_name = "Lesion_LSTM_Training"
     mlflow_run_name = "LSTM"
 
     """ Training parameters """

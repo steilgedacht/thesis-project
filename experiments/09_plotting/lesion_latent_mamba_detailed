@@ -1,0 +1,63 @@
+// Detailed LesionLatentMamba Architecture
+digraph LesionLatentMamba_Detailed {
+	fontname=Helvetica nodesep=0.4 rankdir=TB ranksep=0.5 splines=ortho
+	node [fontname=Helvetica fontsize=9 shape=rect style="filled,rounded"]
+	edge [color="#444444" fontname=Helvetica fontsize=8]
+	subgraph cluster_inputs {
+		color="#888888" fontcolor="#555555" label="Model Inputs" style=dashed
+		grids_in [label="Observed Occupancy Grids
+[B, T, 1, D, H, W]" fillcolor="#E1F5FE"]
+		times_in [label="Target Timestamps
+[B, T + n_future]" fillcolor="#E1F5FE"]
+		p_idx [label="Patient Index
+[B]" fillcolor="#E1F5FE"]
+	}
+	subgraph cluster_encoder {
+		color="#00695C" fontcolor="#00695C" label="3D Conv Encoder (Encoder3D)" style=dashed
+		enc_conv [label="Multi-stage Conv3d + LeakyReLU + AdaptiveAvgPool3d" fillcolor="#E0F2F1"]
+		enc_fc [label="Linear Projection -> observed_latents
+Shape: [B, T, latent_dim]" fillcolor="#E0F2F1"]
+	}
+	subgraph cluster_conditioning {
+		color="#2E7D32" fontcolor="#2E7D32" label="Time & Patient Conditioning" style=dashed
+		t_enc [label="TimeEncoder (Sin/Cos Fourier Encoding)
+Shape: [B, 2 * time_freqs]" fillcolor="#E8F5E9"]
+		p_emb [label="nn.Embedding (Patient ID)
+Shape: [B, latent_dim]" fillcolor="#FFF3E0"]
+		cat_in [label="torch.cat([current_latent, time_encoding, (patient_emb)])
+Shape: [B, step, input_dim]" fillcolor="#FFFFFF" shape=ellipse]
+	}
+	subgraph cluster_mamba {
+		color="#C62828" fontcolor="#C62828" label="Mamba Recurrent Core (MambaBlock x N)" style=dashed
+		input_proj [label="input_proj: Linear(input_dim -> latent_dim)" fillcolor="#FFEBEE"]
+		mamba_block [label="MambaBlock(d_model=latent_dim)
+- LayerNorm & in_proj
+- Conv1d + SiLU activation
+- x_proj (dt, B, C selective parameters)
+- State-Space Scan Loop over sequence length
+- out_proj & Gated Residual connection" fillcolor="#FFEBEE"]
+		final_norm_fc [label="final_norm (LayerNorm) + fc_out (Linear)
+Extracts last token -> predicted_latent: [B, latent_dim]" fillcolor="#FFEBEE"]
+	}
+	subgraph cluster_decoder {
+		color="#6A1B9A" fontcolor="#6A1B9A" label="3D Conv Decoder (Decoder3D)" style=dashed
+		dec_fc_unflat [label="Linear -> Unflatten -> [B, base_channels*4, *bottleneck_size]" fillcolor="#F3E5F5"]
+		dec_blocks [label="UpResBlock3D x 4 (Trilinear Interpolation + Conv3d + Residuals)
++ full_resolution_refine + final_conv" fillcolor="#F3E5F5"]
+	}
+	output [label="Predicted Occupancy Grids
+preds: [B, steps, 1, D, H, W]" fillcolor="#ECEFF1" shape=doubleoctagon]
+	grids_in -> enc_conv
+	enc_conv -> enc_fc
+	enc_fc -> cat_in [label=current_latent]
+	times_in -> t_enc
+	t_enc -> cat_in [label=time_encoding]
+	p_idx -> p_emb
+	p_emb -> cat_in [label=patient_embedding]
+	cat_in -> input_proj
+	input_proj -> mamba_block
+	mamba_block -> final_norm_fc
+	final_norm_fc -> dec_fc_unflat [label=predicted_latent]
+	dec_fc_unflat -> dec_blocks
+	dec_blocks -> output
+}

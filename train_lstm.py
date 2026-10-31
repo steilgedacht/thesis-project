@@ -370,8 +370,8 @@ def train_lstm(
             with torch.no_grad():
                 validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
                 validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
-                # for trj in plotting_LesionDataset:
-                #     plot_lesion_time_evolution_lstm(model, epoch, trj, config)
+                for trj in plotting_LesionDataset:
+                    plot_lesion_time_evolution_lstm(model, epoch, trj, config)
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
         scheduler.step()

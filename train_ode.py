@@ -1,6 +1,5 @@
 import importlib.util
 from pathlib import Path
-from django.db.migrations import optimizer
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -202,7 +201,7 @@ def train_inr(
                 validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
                 for trj in plotting_LesionDataset:
                     plot_contanct_sheet(model, epoch, trj, config)
-                    plot_lesion_time_evolution(model, epoch, trj, config)
+                    plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=True)
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
         scheduler.step()
