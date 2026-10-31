@@ -98,5 +98,6 @@ rsync -avm --include='*/' --include='seg_nnUnet.nii_2.gz' --exclude='*' node:~/p
 
 Delete trashed runs of mlflow
 ```sh
-mlflow gc --backend-store-uri sqlite:///mlflow.db
+export MLFLOW_TRACKING_URI="http://127.0.0.1:5000"
+mlflow gc --backend-store-uri sqlite:///mlflow.db 
 ```

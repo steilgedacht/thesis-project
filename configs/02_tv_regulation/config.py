@@ -8,7 +8,7 @@ class Config:
 
 
     """ Dataloading parameters """
-    batchsize = 64
+    batchsize = 200
     num_workers = 7
     prefetch_factor = 2
     pin_memory = True
@@ -49,7 +49,7 @@ class Config:
     model_params = {
         "latent_dim" : 128,
         "input_dim" : 4,
-        "hidden_dim" : 1024,
+        "hidden_dim" : 512,
         "output_dim" : 1,
         "omega_0" : 30.0,
         "n_layers" : 8,

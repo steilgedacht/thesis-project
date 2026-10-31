@@ -16,8 +16,8 @@ class Config:
 
     autoencoder_pretrain_epochs = 10
     mamba_only_epochs = 10
-    load_autoencoder_weights_path = None
-    save_autoencoder_weights_path = "mamba_autoencoder_weights.pth"
+    load_autoencoder_weights_path = True
+    save_autoencoder_weights_path = "/home/optima/bbergmann/mlartifacts/4/bc16c8cf2c4942788ef8a34855bf4296/artifacts/mamba_autoencoder_weights.pth"
     freeze_loaded_autoencoder = True
 
     from utils.loss_bce_dice import Loss_BCE_Dice

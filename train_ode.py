@@ -7,7 +7,7 @@ import mlflow
 import mlflow.pytorch
 from tqdm import tqdm
 from utils.mri_dataloader import MRI_Dataloader
-from utils.dataloader import LesionDataset, Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset, Plotting_LesionDataset
+from utils.dataloader import Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset, Plotting_LesionDataset
 from utils.train_plotting import *
 import argparse
 import requests
@@ -258,11 +258,12 @@ if __name__ == "__main__":
             
         trajectories = mri_dataloader.cache_lesion_trajectories * config.training_dataset_samples_duplication_factor
         
-        train_dataset = LesionDataset(
+        train_dataset = config.train_dataset_class(
             trajectories, 
             dialation_iterations=config.dialation_iterations, 
             device=config.device, 
-            background_samples=config.background_samples
+            background_samples=config.background_samples,
+            oversample_positive_samples=config.oversample_positive_samples,
         )
         train_loader = DataLoader(
             train_dataset, 

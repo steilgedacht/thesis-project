@@ -9,10 +9,12 @@ class LesionDataset(Dataset):
                  trajectories, 
                  device='cuda', 
                  dialation_iterations=5, 
-                 background_samples=3000):
+                 background_samples=3000,
+                 oversample_positive_samples=True):
 
         self.device = device
         self.trajectories = trajectories
+        self.oversample_positive_samples = oversample_positive_samples
 
         with open(DatasetPaths().patient_to_idx(), "r") as f:
             self.patient_to_idx = json.load(f)
@@ -60,7 +62,19 @@ class LesionDataset(Dataset):
         border_samples = binary_dilation(labels, iterations=self.dialation_iterations) - labels
         border_samples_coords = np.argwhere(border_samples)
 
-        num_neg_needed = self.max_samples // self.proportion_pos_neg_samples
+        target_pos_samples = self.max_samples // self.proportion_pos_neg_samples
+        target_sample_count = 2 * target_pos_samples
+        if len(pos_coords) == 0:
+            num_pos_samples = 0
+            num_neg_needed = target_pos_samples
+        else:
+            num_pos_samples = (
+                target_pos_samples
+                if self.oversample_positive_samples
+                else min(len(pos_coords), target_pos_samples)
+            )
+            num_neg_needed = target_sample_count - num_pos_samples
+
         neg_coords = border_samples_coords.tolist()
 
         if len(neg_coords) > num_neg_needed // self.proportion_dialation_background:
@@ -78,7 +92,11 @@ class LesionDataset(Dataset):
         if len(pos_coords) == 0:
             all_sampled_indices = np.concatenate([neg_coords, neg_coords], axis=0)
         else:
-            pos_idx = np.random.choice(len(pos_coords), size=self.max_samples//2, replace=True)
+            pos_idx = np.random.choice(
+                len(pos_coords),
+                size=num_pos_samples,
+                replace=self.oversample_positive_samples,
+            )
             pos_sampled = pos_coords[pos_idx]
             all_sampled_indices = np.vstack([pos_sampled, neg_coords])
 
@@ -201,4 +219,3 @@ class Plotting_LesionDataset(LesionDataset):
         trj.coords = coords
         trj.labels = labels
         return self.trajectories[idx]
-
