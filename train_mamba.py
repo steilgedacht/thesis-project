@@ -372,9 +372,12 @@ def train_mamba(
                 criterion,
                 config,
             )
-            plot_lesion_time_evolution_lstm(
-                model, epoch, trajectory, config, final_side_length=True
-            )
+            with torch.no_grad():
+                for trajectory in plotting_dataset:
+                    plot_contanct_sheet(model, epoch, trajectory, config)
+                    plot_lesion_time_evolution_lstm(
+                        model, epoch, trajectory, config, final_side_length=True
+                    )
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
         scheduler.step()

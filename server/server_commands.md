@@ -57,7 +57,7 @@ ssh -L 5000:localhost:5000 node
 ```
 
 ```bash
-mlflow server --host 0.0.0.0 --port 5124 --backend-store-uri ./mlruns --default-artifact-root ./artifacts --allowed-hosts "*" --disable-security-middleware
+mlflow server --host 0.0.0.0 --port 5124 --default-artifact-root ./artifacts --allowed-hosts "*" --disable-security-middleware
 ```
 
 ## Submitting a sbatch

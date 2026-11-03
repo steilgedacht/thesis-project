@@ -1,0 +1,78 @@
+import torch
+
+
+class Config:
+    """Tracking parameters."""
+    mlflow_tracking_uri = "http://127.0.0.1:5000"
+    mlflow_experiment_name = "Lesion_ODE_Four_Timepoints_Training"
+    mlflow_run_name = "ODE_Four_Timepoints"
+
+    """Dataloading parameters."""
+    # Each lesion contributes four scans, so reduce lesion batch size to keep
+    # the number of sampled points per optimizer update comparable.
+    batchsize = 20
+    num_workers = 7
+    prefetch_factor = 2
+    pin_memory = True
+    persistent_workers = True
+
+    lesion_trajectories_with_more_than_n_scans = 6
+    use_only_growing_lesions = True
+    training_dataset_samples_duplication_factor = 20
+
+    dialation_iterations = 1
+    background_samples_proportion = 1
+    from utils.dataloader_ode import FourTimepointLesionDataset
+    train_dataset_class = FourTimepointLesionDataset
+    oversample_positive_samples = False
+
+    """Training parameters."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    epochs = 350
+    background_samples = 3000
+    lr = 1e-4
+    weight_decay = 1e-6
+    scheduler_eta_min = lr * 0.0001
+    max_grad_norm_clip = 1.0
+    only_train = False
+
+    from utils.loss_node import Loss_BCE_Dice_TV
+
+    use_dynamic_pos_weight = True
+    use_total_variation_loss = True
+    tv_loss_weight = 0.01
+    loss_fn = Loss_BCE_Dice_TV(
+        lambda_space=3e-3,
+        lambda_time=0.01,
+        use_dynamic_pos_weight=use_dynamic_pos_weight,
+    )
+
+    """Model parameters."""
+    from utils.model_neural_ode import NeuralODE_INR
+    model = NeuralODE_INR
+    model_params = dict(
+        patient_embed_dim=32,
+        latent_dim=512,
+        ode_hidden_dim=512,
+        ode_layers=8,
+        ode_steps=16,
+        ode_method="rk4",
+        max_t=3650.0,
+        spatial_hidden_dim=512,
+        spatial_layers=10,
+        num_fourier_frequencies=12,
+    )
+
+    model_save_name = "lesion_ode_four_timepoints_model"
+
+    """Logging parameters."""
+    train_log_interval = 10
+    train_delete_cache_interval = 10
+    n_monitoring_samples_to_visualize = 5
+    validation_interval = 5
+    plot_validation_interval = 50
+    print_loss_interval = 10
+
+    time_evolution_steps = 100
+    time_evolution_side_length = 50
+    full_size_side_length = 500

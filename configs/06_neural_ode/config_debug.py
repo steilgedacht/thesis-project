@@ -79,7 +79,8 @@ class Config:
     train_log_interval = 10
     train_delete_cache_interval = 10
     n_monitoring_samples_to_visualize = 5
-    validation_interval = 50
+    validation_interval = 5
+    plot_validation_interval = 50
     print_loss_interval = 10
     
     time_evolution_steps = 100

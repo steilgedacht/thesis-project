@@ -146,8 +146,18 @@ def train_inr(
         for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}/{config.epochs}"):
 
             coords = coords.to(config.device).requires_grad_(True)
-            labels = labels.to(config.device).unsqueeze(-1)
+            labels = labels.to(config.device)
             patient_idx = patient_idx.to(config.device)
+
+            if coords.ndim == 4:
+                batch_size, num_timepoints, num_points, coord_dim = coords.shape
+                coords = coords.reshape(
+                    batch_size * num_timepoints, num_points, coord_dim
+                )
+                labels = labels.reshape(batch_size * num_timepoints, num_points)
+                patient_idx = patient_idx.repeat_interleave(num_timepoints)
+
+            labels = labels.unsqueeze(-1)
             if coords.shape[1] == 0: continue
 
             optimizer.zero_grad()
@@ -199,6 +209,8 @@ def train_inr(
             with torch.no_grad():
                 validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
                 validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
+        if epoch % config.plot_validation_interval == 0:
+            with torch.no_grad():
                 for trj in plotting_LesionDataset:
                     plot_contanct_sheet(model, epoch, trj, config)
                     plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=True)
