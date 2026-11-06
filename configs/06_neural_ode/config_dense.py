@@ -2,9 +2,9 @@ import torch
 
 class Config:
     """ Tracking parameters """
-    mlflow_tracking_uri = "http://127.0.0.1:5000"
+    mlflow_tracking_uri = "http://127.0.0.1:5124"
     mlflow_experiment_name = "Lesion_ODE_Training"
-    mlflow_run_name = "ODE" 
+    mlflow_run_name = "ODE_Dense" 
 
 
     """ Dataloading parameters """
@@ -59,7 +59,7 @@ class Config:
 
 
     """ Model parameters """
-    from utils.model_neural_ode import NeuralODE_INR
+    from utils.model_neural_ode_translation import NeuralODE_INR
     model = NeuralODE_INR
     model_params = dict(
         patient_embed_dim=32,

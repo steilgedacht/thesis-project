@@ -53,7 +53,7 @@ python3.11 inr.py
 SSH Port forwarding
 ```bash
 ssh -L 5124:localhost:5124 node
-ssh -L 5000:localhost:5000 node
+ssh -L 5124:localhost:5124 node
 ```
 
 ```bash
@@ -98,6 +98,6 @@ rsync -avm --include='*/' --include='seg_nnUnet.nii_2.gz' --exclude='*' node:~/p
 
 Delete trashed runs of mlflow
 ```sh
-export MLFLOW_TRACKING_URI="http://127.0.0.1:5000"
+export MLFLOW_TRACKING_URI="http://127.0.0.1:5124"
 mlflow gc --backend-store-uri sqlite:///mlflow.db 
 ```

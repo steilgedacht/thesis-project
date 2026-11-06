@@ -2,7 +2,7 @@ import torch
 
 class Config:
     """ Tracking parameters """
-    mlflow_tracking_uri = "http://127.0.0.1:5000"
+    mlflow_tracking_uri = "http://127.0.0.1:5124"
     mlflow_experiment_name = "Lesion_INR_MetaLearning"
     mlflow_run_name = "MAML_INR" 
 

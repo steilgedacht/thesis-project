@@ -13,6 +13,10 @@ import argparse
 import requests
 import json
 import os
+import socket
+
+hostname = socket.gethostname()
+print(f"Hostname: {hostname}")
 
 def check_if_mlflow_is_running(config):
     try:
@@ -73,9 +77,9 @@ def plot_extrapolation_time(loss_T_pairs, global_step):
     mlflow.log_artifact(output_path)
     plt.close()
 
-def validate_polation(data_loader, text, global_step, criterion):
+def validate_polation(data_loader, text, plot, global_step, criterion):
     loss = 0.0
-    volume_error_cm3 = 0.0
+    volume_error_cm3 = []
 
     batch_size = getattr(data_loader, 'batch_size', 1) or 1
 
@@ -101,15 +105,17 @@ def validate_polation(data_loader, text, global_step, criterion):
 
             pred_count = (torch.sigmoid(v_preds[local_idx]).squeeze(-1) > 0.5).sum().item()
             true_count = (v_labels[local_idx].squeeze(-1) > 0.5).sum().item()
-            volume_error_cm3 += abs(pred_count - true_count) * voxel_volume_cm3
+            volume_error_cm3.append(abs(pred_count - true_count) * voxel_volume_cm3)
 
     mlflow.log_metrics({
         text.lower().replace(" ", "_") + "_dice_loss"  : loss / len(data_loader),
         text.lower().replace(" ", "_") + "_dice_score" : 1 - loss / len(data_loader),
-        text.lower().replace(" ", "_") + "_wrongly_predicted_volume_cm3" : volume_error_cm3,
+        text.lower().replace(" ", "_") + "_median_wrongly_predicted_volume_cm3" : np.median(np.array(volume_error_cm3)),
+        text.lower().replace(" ", "_") + "_average_wrongly_predicted_volume_cm3" : np.array(volume_error_cm3).mean(),
+        text.lower().replace(" ", "_") + "_wrongly_predicted_volume_cm3" : np.sum(np.array(volume_error_cm3)),
     }, step=global_step)
 
-    if text == "Valid Extrapolation":
+    if text == "Valid Extrapolation" and plot:
         plot_extrapolation_time(loss_T_pairs, global_step)
 
 
@@ -207,8 +213,8 @@ def train_inr(
 
         if epoch % config.validation_interval == 0:
             with torch.no_grad():
-                validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
-                validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
+                validate_polation(valid_extrapolation_loader, "Valid Extrapolation", epoch % config.plot_validation_interval == 0, global_step, criterion)
+                validate_polation(valid_interpolation_loader, "Valid Interpolation", epoch % config.plot_validation_interval == 0 , global_step, criterion)
         if epoch % config.plot_validation_interval == 0:
             with torch.no_grad():
                 for trj in plotting_LesionDataset:

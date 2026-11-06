@@ -24,7 +24,7 @@ target_exp_id = existing.experiment_id if existing else tgt_client.create_experi
 existing_target_runs = tgt_client.search_runs(
     experiment_ids=[target_exp_id],
     run_view_type=ViewType.ALL,
-    max_results=50000,
+    max_results=51240,
 )
 already_migrated = {
     run.data.tags.get("mlflow.source_run_id")
@@ -54,7 +54,7 @@ for exp in tqdm(src_experiments, desc="Experiments", unit="exp"):
     runs = src_client.search_runs(
         experiment_ids=[exp.experiment_id],
         run_view_type=ViewType.ALL,
-        max_results=50000,
+        max_results=51240,
     )
 
     for run in tqdm(runs, desc=f"  Runs in '{exp.name}'", unit="run", leave=False):

@@ -2,13 +2,13 @@ import torch
 
 class Config:
     """ Tracking parameters """
-    mlflow_tracking_uri = "http://127.0.0.1:5000"
+    mlflow_tracking_uri = "http://127.0.0.1:5124"
     mlflow_experiment_name = "Lesion_ODE_Training"
-    mlflow_run_name = "ODE" 
+    mlflow_run_name = "ODE Model Translation" 
 
 
     """ Dataloading parameters """
-    batchsize = 100
+    batchsize = 64
     num_workers = 7
     prefetch_factor = 2
     pin_memory = True
@@ -22,8 +22,8 @@ class Config:
 
     dialation_iterations = 1
     background_samples_proportion = 1
-    from utils.dataloader_ode import FourTimepointLesionDataset
-    train_dataset_class = FourTimepointLesionDataset
+    from utils.dataloader_dense import DenseLesionDataset
+    train_dataset_class = DenseLesionDataset
 
     # Repeat positive voxels to keep training samples balanced with negatives.
     # Disable to use each positive voxel at most once and fill with negatives.
@@ -32,7 +32,7 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 350
+    epochs = 200
     background_samples = 3000
     lr = 1e-4
     weight_decay = 1e-6
@@ -53,7 +53,7 @@ class Config:
     # Instantiate loss with dynamic weighting
     loss_fn = Loss_BCE_Dice_TV(
         lambda_space=3e-3, 
-        lambda_time=0.01,
+        lambda_time=0.001,
         use_dynamic_pos_weight=use_dynamic_pos_weight,
     )
 

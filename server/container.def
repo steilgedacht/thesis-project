@@ -101,7 +101,7 @@ EOF
         wand higher
 
 %startscript
-    tmux new-session -d -s mlflow_server 'mlflow server --host 127.0.0.1 --port 5000'
+    tmux new-session -d -s mlflow_server 'mlflow server --host 127.0.0.1 --port 5124'
 
 %runscript
     # If a command is passed, run it. Otherwise, start zsh.

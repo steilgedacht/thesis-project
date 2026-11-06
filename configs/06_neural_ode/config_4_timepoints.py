@@ -3,8 +3,8 @@ import torch
 
 class Config:
     """Tracking parameters."""
-    mlflow_tracking_uri = "http://127.0.0.1:5000"
-    mlflow_experiment_name = "Lesion_ODE_Four_Timepoints_Training"
+    mlflow_tracking_uri = "http://127.0.0.1:5124"
+    mlflow_experiment_name = "Lesion_ODE_Training"
     mlflow_run_name = "ODE_Four_Timepoints"
 
     """Dataloading parameters."""
@@ -28,7 +28,7 @@ class Config:
 
     """Training parameters."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    epochs = 350
+    epochs = 200
     background_samples = 3000
     lr = 1e-4
     weight_decay = 1e-6

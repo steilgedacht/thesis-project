@@ -13,7 +13,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, ImageMagickWriter
 
-mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_tracking_uri("http://127.0.0.1:5124")
 mlflow.set_experiment("Lesion_INR_Training")
 
 

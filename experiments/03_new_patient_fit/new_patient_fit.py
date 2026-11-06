@@ -21,7 +21,7 @@ from utils.train_plotting import plot_lesion_time_evolution, plot_contanct_sheet
 from utils.loss_bce_dice import Loss_BCE_Dice
 from umap import UMAP
 
-mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_tracking_uri("http://127.0.0.1:5124")
 mlflow.set_experiment("Lesion_INR_Training")
 
 def load_config(config_path: str):
