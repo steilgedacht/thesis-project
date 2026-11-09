@@ -1,1 +1,1 @@
-tmux new-session -d -s mlflow_server 'mlflow server'
+tmux new-session -d -s mlflow_server 'mlflow server --backend-store-uri sqlite:///mlflow.db --default-artifact-root ./mlartifacts --port 5124'

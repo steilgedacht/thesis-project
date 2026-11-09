@@ -4,7 +4,7 @@ class Config:
     """ Tracking parameters """
     mlflow_tracking_uri = "http://127.0.0.1:5124"
     mlflow_experiment_name = "Lesion_ODE_Training"
-    mlflow_run_name = "ODE Model Translation" 
+    mlflow_run_name = "ODE Smaller Model" 
 
 
     """ Dataloading parameters """
@@ -64,16 +64,15 @@ class Config:
     model_params = dict(
         patient_embed_dim=32,
         latent_dim=512,
-        ode_hidden_dim=512,
-        ode_layers=8,
+        ode_hidden_dim=128,
+        ode_layers=12,
         ode_steps=16,        # mehr = genauer, aber langsamer/mehr Speicher (Backprop through time)
         ode_method="rk4",    # oder "euler"
         max_t=3650.0,
-        spatial_hidden_dim=512,
-        spatial_layers=10,
-        num_fourier_frequencies=12,  # 0 = deaktiviert
+        spatial_hidden_dim=128,
+        spatial_layers=16,
+        num_fourier_frequencies=14,  # 0 = deaktiviert
     )
-
 
     model_save_name = "lesion_ode_model"
 

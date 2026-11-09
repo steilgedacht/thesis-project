@@ -1,6 +1,3 @@
-import os
-os.chdir("/home/benjaminb/Dokumente/JKU/Semester_9/Practical_Work")
-
 import mlflow
 import torch
 import json
@@ -19,10 +16,9 @@ from utils.mri_dataloader import MRI_Dataloader
 from utils.dataloader import LesionDataset, Plotting_LesionDataset
 from utils.train_plotting import plot_lesion_time_evolution, plot_contanct_sheet
 from utils.loss_bce_dice import Loss_BCE_Dice
-from umap import UMAP
 
 mlflow.set_tracking_uri("http://127.0.0.1:5124")
-mlflow.set_experiment("Lesion_INR_Training")
+mlflow.set_experiment("Lesion_Embedding")
 
 def load_config(config_path: str):
     config_file = Path(config_path)
@@ -103,120 +99,134 @@ def validate_polation(data_loader, text, global_step, criterion):
 
 
 
-def visualize_embedding_change(model, patient_idx_tensor, train_loader):
-    """Visualize embedding before/after training using UMAP projection"""
-    
-    all_embeddings = model.latent_vectors.weight.detach().cpu().numpy()
-    umap = UMAP(n_components=2, random_state=42)
-    all_embeddings_umap = umap.fit_transform(all_embeddings)
-    final_embedding = model.latent_vectors(patient_idx_tensor).detach().cpu().numpy()
-    final_umap = umap.transform(final_embedding)
-    
-    # Create visualization
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    
-    ax1.scatter(all_embeddings_umap[:, 0], all_embeddings_umap[:, 1], alpha=0.5, s=30, label='Other patients')
-    ax1.scatter(final_umap[:, 0], final_umap[:, 1], color='red', s=200, marker='*', label='New patient (after)', edgecolors='black', linewidth=2)
-    ax1.set_xlabel('UMAP 1')
-    ax1.set_ylabel('UMAP 2')
-    ax1.set_title('Embedding in UMAP Space')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    fig2, axes = plt.subplots(2, 1, figsize=(14, 6))
-    
-    axes[0].imshow(final_embedding.reshape(1, -1), cmap='coolwarm', aspect='auto')
-    axes[0].set_title('Fine-tuned Embedding (128 dimensions)')
-    axes[0].set_ylabel('Patient')
-    axes[0].set_xlabel('Embedding Dimension')
-
-    embedding_std = np.std(all_embeddings, axis=0)
-    axes[1].plot(embedding_std)
-    axes[1].set_title('Std Dev Across All Embeddings (shows which dims vary most)')
-    axes[1].set_xlabel('Embedding Dimension')
-    axes[1].set_ylabel('Std Dev')
-    
-    mlflow.log_figure(fig, "embedding_pca_projection.png")
-    mlflow.log_figure(fig2, "embedding_heatmap.png")
-    plt.close(fig)
-    plt.close(fig2)
-
-
-def fit_trajectory_to_model(model, train_loader, plotting_LesionDataset, config, epochs=100, lr=1e-3, device='cuda'):
+def fit_trajectory_to_model(
+    model,
+    train_loader,
+    plotting_LesionDataset,
+    config,
+    epochs=100,
+    lr=1e-3,
+    device='cuda',
+    combination_epochs=30,
+):
     model.to(device)
     losses = []
 
+    if epochs < 0:
+        raise ValueError("epochs must be non-negative")
+    if combination_epochs < 0:
+        raise ValueError("combination_epochs must be non-negative")
+
+    combination_phase_epochs = min(combination_epochs, epochs)
+    direct_phase_epochs = epochs - combination_phase_epochs
     original_requires_grad = {
         parameter: parameter.requires_grad for parameter in model.parameters()
     }
     for param in model.parameters():
         param.requires_grad_(False)
 
-    basis_embeddings = model.latent_vectors.weight.detach().clone()
+    basis_embeddings = model.patient_embedding.weight.detach().clone()
     coefficients = torch.nn.Parameter(torch.zeros(basis_embeddings.shape[0], device=device))
     with torch.no_grad():
         coefficients[0] = 1.0
-    optimizer = optim.AdamW([coefficients], lr=lr, weight_decay=1e-6)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25)
     criterion = Loss_BCE_Dice()
 
-    def use_convex_embedding(_embedding, _inputs, output):
-        patient_embedding = coefficients @ basis_embeddings
-        return patient_embedding.unsqueeze(0).expand_as(output)
+    global_step = 0
 
-    embedding_hook = model.latent_vectors.register_forward_hook(use_convex_embedding)
-    global_step = epoch = 0
+    def train_embedding_phase(phase_name, phase_epochs, optimizer, embedding_for_batch, project_coefficients=False):
+        nonlocal global_step
+        phase_losses = []
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25)
 
-    try:
-        for epoch in range(epochs):
-            total_loss = 0
-            model.train()
-            for i, (coords, labels, patient_idx) in tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}"):
-                coords = coords.to(device)
-                labels = labels.to(device).unsqueeze(-1)
-                patient_idx = torch.zeros_like(patient_idx, device=device)
+        def use_fitted_embedding(_embedding, _inputs, output):
+            return embedding_for_batch(output)
 
-                if coords.shape[1] == 0:
-                    continue
+        embedding_hook = model.patient_embedding.register_forward_hook(use_fitted_embedding)
+        try:
+            for phase_epoch in range(phase_epochs):
+                total_loss = 0.0
+                model.train()
+                for i, (coords, labels, patient_idx) in tqdm(
+                    enumerate(train_loader),
+                    total=len(train_loader),
+                    desc=f"{phase_name} epoch {phase_epoch + 1}/{phase_epochs}",
+                ):
+                    coords = coords.to(device)
+                    labels = labels.to(device).unsqueeze(-1)
+                    patient_idx = torch.zeros_like(patient_idx, device=device)
 
-                optimizer.zero_grad()
-                predictions = model(coords, patient_idx)
-                loss = criterion(predictions, labels)
-                loss.backward()
-                optimizer.step()
-                with torch.no_grad():
-                    coefficients.copy_(_project_onto_simplex(coefficients))
+                    if coords.shape[1] == 0:
+                        continue
 
-                total_loss += loss.item()
-                scheduler.step(metrics=loss.item())
+                    optimizer.zero_grad()
+                    predictions = model(coords, patient_idx)
+                    loss = criterion(predictions, labels)
+                    loss.backward()
+                    optimizer.step()
+                    if project_coefficients:
+                        with torch.no_grad():
+                            coefficients.copy_(_project_onto_simplex(coefficients))
 
-                mlflow.log_metrics(
-                    {
+                    total_loss += loss.item()
+                    scheduler.step(metrics=loss.item())
+
+                    step_metrics = {
                         "training_loss": loss.item(),
                         "training_loss_bce": criterion.loss_bce.item(),
                         "training_loss_dice": criterion.loss_dice.item(),
-                        "number_of_correctly_predicted_1_labels": (predictions > 0.5).sum().item() / (labels > 0.5).sum().item(),
-                    },
-                    step=global_step
-                )
-                global_step += 1
-                mlflow.log_metric("learning_rate", optimizer.param_groups[0]['lr'], step=global_step)
+                        "number_of_correctly_predicted_1_labels": (
+                            (predictions > 0.5).sum().item()
+                            / (labels > 0.5).sum().item()
+                        ),
+                        f"{phase_name}_training_loss": loss.item(),
+                    }
+                    mlflow.log_metrics(step_metrics, step=global_step)
+                    global_step += 1
+                    mlflow.log_metric(
+                        "learning_rate",
+                        optimizer.param_groups[0]['lr'],
+                        step=global_step,
+                    )
 
-                if i % 10 == 0 and torch.device(device).type == "cuda":
+                    if i % 10 == 0 and torch.device(device).type == "cuda":
+                        torch.cuda.empty_cache()
+
+                model.eval()
+                if torch.device(device).type == "cuda":
                     torch.cuda.empty_cache()
 
-            model.eval()
-            if torch.device(device).type == "cuda":
-                torch.cuda.empty_cache()
+                avg_loss = total_loss / max(len(train_loader), 1)
+                phase_losses.append(avg_loss)
+                if (phase_epoch + 1) % 10 == 0:
+                    print(
+                        f"{phase_name} epoch {phase_epoch + 1}/{phase_epochs}, "
+                        f"Loss: {avg_loss:.6f}"
+                    )
+        finally:
+            embedding_hook.remove()
+        return phase_losses
 
-            avg_loss = total_loss / max(len(train_loader), 1)
-            losses.append(avg_loss)
-            if (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+    try:
+        combination_optimizer = optim.AdamW(
+            [coefficients],
+            lr=lr,
+            weight_decay=1e-6,
+        )
+        losses.extend(
+            train_embedding_phase(
+                "linear_combination",
+                combination_phase_epochs,
+                combination_optimizer,
+                lambda output: (coefficients @ basis_embeddings)
+                .unsqueeze(0)
+                .expand_as(output),
+                project_coefficients=True,
+            )
+        )
 
         with torch.no_grad():
             fitted_embedding = coefficients @ basis_embeddings
-            model.latent_vectors.weight[0].copy_(fitted_embedding)
+            model.patient_embedding.weight[0].copy_(fitted_embedding)
             mlflow.log_metric("coefficient_sum", coefficients.sum().item())
             mlflow.log_metric("maximum_coefficient", coefficients.max().item())
             mlflow.log_dict(
@@ -227,16 +237,47 @@ def fit_trajectory_to_model(model, train_loader, plotting_LesionDataset, config,
                 "new_patient_embedding_coefficients.json",
             )
 
+        if combination_phase_epochs > 0:
+            plotting_LesionDataset.trajectories = [
+                mri_dataloader.find_lesion_trajectory('YG_WCONBI42RLEZ', 1)
+            ]
+            trj = next(iter(plotting_LesionDataset))
+            trj.embedding_id = np.int64(0)
+            plot_lesion_time_evolution(
+                model,
+                combination_phase_epochs - 1,
+                trj,
+                config,
+                final_side_length=True,
+            )
+
+        direct_embedding = torch.nn.Parameter(fitted_embedding.detach().clone())
+        direct_optimizer = optim.AdamW(
+            [direct_embedding],
+            lr=lr*0.01,
+            weight_decay=1e-6,
+        )
+        losses.extend(
+            train_embedding_phase(
+                "direct_embedding",
+                direct_phase_epochs,
+                direct_optimizer,
+                lambda output: direct_embedding.unsqueeze(0).expand_as(output),
+            )
+        )
+
+        with torch.no_grad():
+            model.patient_embedding.weight[0].copy_(direct_embedding)
             plotting_LesionDataset.trajectories = [mri_dataloader.find_lesion_trajectory('YG_WCONBI42RLEZ', 1)]
             trj = next(iter(plotting_LesionDataset))
             trj.embedding_id = np.int64(0)
             validate_polation(train_loader, "Valid Interpolation", global_step, criterion)
-            plot_contanct_sheet(model, epoch, trj, config, final_side_length=True)
-            plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=True)
+            final_epoch = max(epochs - 1, 0)
+            plot_contanct_sheet(model, final_epoch, trj, config, final_side_length=True)
+            plot_lesion_time_evolution(model, final_epoch, trj, config, final_side_length=True)
 
         return losses
     finally:
-        embedding_hook.remove()
         for parameter, requires_grad in original_requires_grad.items():
             parameter.requires_grad_(requires_grad)
 
@@ -256,8 +297,8 @@ with mlflow.start_run(run_name="embedding learning", tags={"type" : "new_patient
     train_loader = DataLoader(train_dataset, batch_size=5, shuffle=True, num_workers=7, prefetch_factor=2, pin_memory=True, persistent_workers=True)
     plotting_LesionDataset = Plotting_LesionDataset(trj)
 
-    run_id = "3b4c1f4f2b634047b788e5893edbd85c"
-    model_uri = f"runs:/{run_id}/lesion_inr_model"
+    run_id = "f82c0dc523134b0699c17c7b16e7a3d7"
+    model_uri = f"runs:/{run_id}/lesion_ode_model"
     model = mlflow.pytorch.load_model(model_uri)
 
     losses = fit_trajectory_to_model(model, train_loader, plotting_LesionDataset, config=config, epochs=100, lr=1., device=device)
