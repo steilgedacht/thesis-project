@@ -4,7 +4,7 @@ class Config:
     """ Tracking parameters """
     mlflow_tracking_uri = "http://127.0.0.1:5124"
     mlflow_experiment_name = "Lesion_ODE_Training"
-    mlflow_run_name = "ODE Smaller Model" 
+    mlflow_run_name = "ODE 8 Dialation correct eval" 
 
 
     """ Dataloading parameters """
@@ -20,7 +20,7 @@ class Config:
     # with that the same lesions can be in the same training batch
     training_dataset_samples_duplication_factor = 20 
 
-    dialation_iterations = 1
+    dialation_iterations = 8
     background_samples_proportion = 1
     from utils.dataloader_dense import DenseLesionDataset
     train_dataset_class = DenseLesionDataset
@@ -52,7 +52,7 @@ class Config:
     
     # Instantiate loss with dynamic weighting
     loss_fn = Loss_BCE_Dice_TV(
-        lambda_space=3e-3, 
+        lambda_space=3e-4, 
         lambda_time=0.001,
         use_dynamic_pos_weight=use_dynamic_pos_weight,
     )

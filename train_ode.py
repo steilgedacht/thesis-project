@@ -293,9 +293,20 @@ if __name__ == "__main__":
             persistent_workers=config.persistent_workers
         )
         
-        valid_interpolation_dataset = Validation_Interpolation_LesionDataset(
+        interpolation_dataset_class = getattr(
+            config,
+            "validation_interpolation_dataset_class",
+            Validation_Interpolation_LesionDataset,
+        )
+        extrapolation_dataset_class = getattr(
+            config,
+            "validation_extrapolation_dataset_class",
+            Validation_Extrapolation_LesionDataset,
+        )
+
+        valid_interpolation_dataset = interpolation_dataset_class(
             mri_dataloader.cache_lesion_trajectories, 
-            dialation_iterations=config.dialation_iterations, 
+            dialation_iterations=1, 
             device=config.device, 
             background_samples=config.background_samples
         )
@@ -304,9 +315,9 @@ if __name__ == "__main__":
             shuffle=False
         )
 
-        valid_extrapolation_dataset = Validation_Extrapolation_LesionDataset(
+        valid_extrapolation_dataset = extrapolation_dataset_class(
             mri_dataloader.cache_lesion_trajectories, 
-            dialation_iterations=config.dialation_iterations, 
+            dialation_iterations=1, 
             device=config.device, 
             background_samples=config.background_samples
         )
@@ -315,7 +326,12 @@ if __name__ == "__main__":
             shuffle=False
         )
 
-        plotting_LesionDataset = Plotting_LesionDataset(
+        plotting_dataset_class = getattr(
+            config,
+            "plotting_dataset_class",
+            Plotting_LesionDataset,
+        )
+        plotting_LesionDataset = plotting_dataset_class(
             mri_dataloader.cache_lesion_trajectories.copy(), 
         )
 

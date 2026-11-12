@@ -66,34 +66,43 @@ def _project_onto_simplex(values):
 
 
 def validate_polation(data_loader, text, global_step, criterion):
-    loss = 0.0
+    dice_score = 0.0
+    timepoint_count = 0
     volume_error_cm3 = 0.0
 
-    batch_size = getattr(data_loader, 'batch_size', 1) or 1
+    trajectories = []
+    seen_trajectories = set()
+    for dataset_item in data_loader.dataset.trajectories:
+        trj, _ = _dataset_item_to_trajectory_and_date(dataset_item)
+        if id(trj) not in seen_trajectories:
+            seen_trajectories.add(id(trj))
+            trajectories.append(trj)
 
-    for batch_idx, (v_coords, v_labels, v_p_idx) in enumerate(tqdm(data_loader, desc=text, total=len(data_loader))):
-        v_coords, v_labels, v_p_idx = v_coords.to(config.device), v_labels.unsqueeze(-1).to(config.device), v_p_idx.to(config.device)
-        v_p_idx = torch.zeros_like(v_p_idx)
-        v_preds = model(v_coords, v_p_idx)
-        l = criterion.dice_loss(v_preds, v_labels).item()
-        loss += l
-        dataset_start = batch_idx * batch_size
-        dataset_end = dataset_start + v_coords.shape[0]
-        for local_idx, sample_p_idx in enumerate(v_p_idx.cpu().tolist()):
-            data_idx = dataset_start + local_idx
-            if data_idx >= len(data_loader.dataset.trajectories):
-                break
-            dataset_item = data_loader.dataset.trajectories[data_idx]
-            trj, date = _dataset_item_to_trajectory_and_date(dataset_item)
-            voxel_volume_cm3 = _voxel_volume_cm3_from_trajectory(trj, date)
+    with torch.no_grad():
+        for trj in trajectories:
+            dates = trj.allowed_dates if hasattr(trj, 'allowed_dates') else trj.dates
+            for date in dates:
+                coords, labels = data_loader.dataset.prepare_data(str(date), trj)
+                v_coords = torch.as_tensor(coords, dtype=torch.float32, device=config.device).unsqueeze(0)
+                v_labels = torch.as_tensor(labels, dtype=torch.float32, device=config.device).unsqueeze(0).unsqueeze(-1)
+                v_p_idx = torch.zeros(1, dtype=torch.long, device=config.device)
+                v_preds = model(v_coords, v_p_idx)
 
-            pred_count = (torch.sigmoid(v_preds[local_idx]).squeeze(-1) > 0.5).sum().item()
-            true_count = (v_labels[local_idx].squeeze(-1) > 0.5).sum().item()
-            volume_error_cm3 += abs(pred_count - true_count) * voxel_volume_cm3
+                dice_score += criterion.dice_score(v_preds, v_labels).item()
+                timepoint_count += 1
+
+                voxel_volume_cm3 = _voxel_volume_cm3_from_trajectory(trj, str(date))
+                pred_count = (torch.sigmoid(v_preds[0]).squeeze(-1) > 0.5).sum().item()
+                true_count = (v_labels[0].squeeze(-1) > 0.5).sum().item()
+                volume_error_cm3 += abs(pred_count - true_count) * voxel_volume_cm3
+
+    if timepoint_count == 0:
+        raise ValueError("Cannot validate a trajectory with no timepoints")
+    mean_dice_score = dice_score / timepoint_count
 
     mlflow.log_metrics({
-        text.lower().replace(" ", "_") + "_dice_loss"  : loss / len(data_loader),
-        text.lower().replace(" ", "_") + "_dice_score" : 1 - loss / len(data_loader),
+        text.lower().replace(" ", "_") + "_dice_loss"  : 1 - mean_dice_score,
+        text.lower().replace(" ", "_") + "_dice_score" : mean_dice_score,
         text.lower().replace(" ", "_") + "_wrongly_predicted_volume_cm3" : volume_error_cm3,
     }, step=global_step)
 
@@ -229,13 +238,13 @@ def fit_trajectory_to_model(
             model.patient_embedding.weight[0].copy_(fitted_embedding)
             mlflow.log_metric("coefficient_sum", coefficients.sum().item())
             mlflow.log_metric("maximum_coefficient", coefficients.max().item())
-            mlflow.log_dict(
-                {
-                    "basis_indices": list(range(coefficients.numel())),
-                    "coefficients": coefficients.detach().cpu().tolist(),
-                },
-                "new_patient_embedding_coefficients.json",
-            )
+            # mlflow.log_dict(
+            #     {
+            #         "basis_indices": list(range(coefficients.numel())),
+            #         "coefficients": coefficients.detach().cpu().tolist(),
+            #     },
+            #     "new_patient_embedding_coefficients.json",
+            # )
 
         if combination_phase_epochs > 0:
             plotting_LesionDataset.trajectories = [

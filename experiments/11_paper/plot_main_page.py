@@ -48,7 +48,7 @@ from utils.train_plotting import (
 )
 
 
-RUN_ID = "f82c0dc523134b0699c17c7b16e7a3d7"
+RUN_ID = "50d82532807e4da3ab4eead3869afb8c"
 TRACKING_URI = "http://127.0.0.1:5124"
 MODEL_ARTIFACT = "lesion_ode_model"
 LABEL_COLOR = "#c62523"
@@ -65,8 +65,11 @@ PLOT_CACHE_VERSION = 3
 
 
 class _OrthogonalConnection:
+    def __init__(self, lane_index=0, lane_count=1):
+        self.lane_fraction = 0.4 - 0.2 * lane_index / max(lane_count - 1, 1) 
+
     def __call__(self, pos_a, pos_b, **kwargs):
-        elbow_y = (pos_a[1] + pos_b[1]) / 2.0
+        elbow_y = pos_a[1] + self.lane_fraction * (pos_b[1] - pos_a[1])
         return MplPath(
             [
                 pos_a,
@@ -222,6 +225,10 @@ def _representative_label_indices(size_mm3, interpolation_index=None, max_labels
             break
         if changes[index - 1] >= minimum_change_mm3:
             selected.add(index)
+    for index in candidates:
+        if len(selected) >= max_labels:
+            break
+        selected.add(index)
     return np.asarray(sorted(selected), dtype=int)
 
 
@@ -582,6 +589,8 @@ def _read_plot_cache(output_path, signature):
             plot_data = {key: archive[key] for key in archive.files}
         plot_data["dates"] = metadata["dates"]
         plot_data["interpolation_date"] = metadata["interpolation_date"]
+        if len(plot_data["panel_indices"]) != min(6, len(metadata["dates"])):
+            return None
         comparison_predictions = {}
         comparison_colors = {"INR": INR_COLOR, "LSTM": LSTM_COLOR}
         for index, comparison in enumerate(metadata["comparisons"]):
@@ -720,6 +729,55 @@ def _add_contact_panels(fig, grid, label_slices, label_days, label_radii_mm,
         fig.add_subplot(grid[index // columns, index % columns]).axis("off")
 
 
+def _add_boundary_zoom_panels(fig, grid, label_slices, label_days,
+                              label_radii_mm, mri_slices, prediction_slices,
+                              columns=4):
+    rows = int(np.ceil(len(label_slices) / columns))
+    for index, (label_slice, day, radius, mri_slice, prediction) in enumerate(
+        zip(label_slices, label_days, label_radii_mm, mri_slices, prediction_slices)
+    ):
+        ax = fig.add_subplot(grid[index // columns, index % columns])
+        low, high = np.percentile(mri_slice, [1, 99])
+        if low == high:
+            high = low + 1
+        ax.imshow(mri_slice, cmap="gray", vmin=low, vmax=high, origin="upper")
+        if np.any(label_slice):
+            ax.contour(label_slice, levels=[0.5], colors=[LABEL_COLOR], linewidths=1.1)
+        if np.any(prediction):
+            ax.contour(prediction, levels=[0.5], colors=[PREDICTION_COLOR], linewidths=1.1)
+
+        boundary = np.asarray(label_slice, dtype=bool) | np.asarray(prediction, dtype=bool)
+        boundary_rows, boundary_columns = np.nonzero(boundary)
+        height, width = boundary.shape
+        if len(boundary_rows):
+            row_min, row_max = int(boundary_rows.min()), int(boundary_rows.max())
+            column_min, column_max = int(boundary_columns.min()), int(boundary_columns.max())
+            center_row = (row_min + row_max) / 2
+            center_column = (column_min + column_max) / 2
+            lesion_size = max(row_max - row_min + 1, column_max - column_min + 1)
+            half_size = min(max(16, int(np.ceil(lesion_size * 1.5))), height / 2, width / 2)
+        else:
+            center_row, center_column = height / 2, width / 2
+            half_size = min(height, width) / 4
+        center_row = np.clip(center_row, half_size, height - half_size)
+        center_column = np.clip(center_column, half_size, width - half_size)
+        ax.set_xlim(center_column - half_size, center_column + half_size)
+        ax.set_ylim(center_row + half_size, center_row - half_size)
+        ax.axis("off")
+        ax.text(
+            0.03,
+            0.04,
+            f"t={day:.0f} days    r={radius:.1f} mm",
+            transform=ax.transAxes,
+            color="grey",
+            fontsize=8,
+            fontweight="bold",
+            bbox={"facecolor": "black", "alpha": 1, "edgecolor": "none", "pad": 2},
+        )
+    for index in range(len(label_slices), rows * columns):
+        fig.add_subplot(grid[index // columns, index % columns]).axis("off")
+
+
 def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
                  prediction_days, prediction_radii_mm, mri_slices,
                  prediction_slices, dates, panel_indices, interpolation_date,
@@ -728,19 +786,25 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
     if len(label_slices) > columns:
         raise ValueError(f"Expected at most {columns} MRI overlay panels, got {len(label_slices)}.")
     contact_rows = 1
-    fig = plt.figure(figsize=(16, 8.0))
+    fig = plt.figure(figsize=(16, 7.92))
     outer = fig.add_gridspec(
-        contact_rows + 1,
+        2,
         columns,
-        height_ratios=[2.5] + [1.3] * contact_rows,
+        height_ratios=[1.36, 2.6],
         hspace=0.16,
         wspace=0.035,
         top=0.94,
     )
-    contact_grid = outer[1, :].subgridspec(
+    contact_rows_grid = outer[1, :].subgridspec(
+        2,
+        1,
+        height_ratios=[1, 1],
+        hspace=0,
+        wspace=0.035,
+    )
+    contact_grid = contact_rows_grid[0, 0].subgridspec(
         contact_rows,
         columns,
-        hspace=0.035,
         wspace=0.035,
     )
     _add_contact_panels(
@@ -753,6 +817,21 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
         prediction_slices,
         [dates[index] for index in panel_indices],
         interpolation_date,
+        columns,
+    )
+    zoom_grid = contact_rows_grid[1, 0].subgridspec(
+        contact_rows,
+        columns,
+        wspace=0.035,
+    )
+    _add_boundary_zoom_panels(
+        fig,
+        zoom_grid,
+        label_slices,
+        label_days[panel_indices],
+        label_radii_mm[panel_indices],
+        mri_slices,
+        prediction_slices,
         columns,
     )
     ax = fig.add_subplot(outer[0, :])
@@ -768,6 +847,7 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
             color=EVALUATION_LABEL_COLOR,
             alpha=0.1,
             zorder=0,
+            ymax=0.86
         )
     def plot_prediction_curve(days, radii, color, label, linewidth):
         for in_phase, linestyle in (
@@ -783,7 +863,7 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
                 0,
                 phase_radii,
                 color=color,
-                alpha=0.05,
+                alpha=0.08,
                 zorder=1,
             )
             ax.plot(
@@ -809,7 +889,7 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
         prediction_days,
         prediction_radii_mm,
         PREDICTION_COLOR,
-        "ODE prediction",
+        "ODE prediction / predicted volume",
         1.8,
     )
     comparison_predictions = comparison_predictions or {}
@@ -865,8 +945,14 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
     ax.spines["bottom"].set_position(("data", 0))
     ax.spines["bottom"].set_bounds(-10, end_day + 10)
     ax.xaxis.set_ticks_position("bottom")
-    ax.set_xlabel("Time since first scan [days]")
-    ax.set_ylabel("Spherical-equivalent lesion radius [mm]")
+    x_label = ax.set_xlabel(
+        "Time since first scan [days]",
+        bbox={"facecolor": "white", "alpha": 0.5, "edgecolor": "none"},
+    )
+    x_label.set_zorder(10)
+    ax.set_ylabel(
+        r"Spherical-equivalent lesion radius [mm]  $r = \sqrt[3]{\frac{3V}{4\pi}}$          "
+    )
     # ax.grid(axis="y", which="major", color="#aeb7c0", linewidth=0.7, alpha=0.55)
     # ax.grid(axis="y", which="minor", color="#d5dbe1", linewidth=0.55, alpha=0.55)
     ax.tick_params(axis="y", which="minor", length=0)
@@ -954,7 +1040,9 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
             arrowprops={"arrowstyle": "-", "color": EVALUATION_LABEL_COLOR, "linewidth": 1},
         )
     panel_axes = fig.axes[:len(label_slices)]
-    for panel_index, panel_ax in zip(panel_indices, panel_axes):
+    for connector_index, (panel_index, panel_ax) in enumerate(
+        zip(panel_indices, panel_axes)
+    ):
         connector = ConnectionPatch(
             xyA=(0.5, 1.0),
             coordsA=panel_ax.transAxes,
@@ -964,7 +1052,7 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
             mutation_scale=15,
             shrinkA=0,
             shrinkB=2,
-            connectionstyle=_OrthogonalConnection(),
+            connectionstyle=_OrthogonalConnection(connector_index, len(panel_axes)),
             linestyle="-",
             linewidth=1,
             color="#000000",
@@ -976,7 +1064,7 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
             [1.0],
             transform=panel_ax.transAxes,
             color="#000000",
-            s=450,
+            s=100,
             zorder=6,
             clip_on=False,
             marker="^",
@@ -1007,12 +1095,12 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
 
     legend_handles = [
         Line2D([], [], color=LABEL_COLOR, marker="|", linestyle="none",
-               markersize=11, label="Training sample"),
+               markersize=11, label="Training samples"),
         Line2D([], [], color=EVALUATION_LABEL_COLOR, marker="|", linestyle="none",
-               markersize=11, label="Evaluation sample"),
-        Line2D([], [], color="#444444", linestyle="-.", linewidth=1.2,
+               markersize=11, label="Evaluation samples"),
+        Line2D([], [], color=PREDICTION_COLOR, linestyle="-.", linewidth=1.2,
                label="Model prediction during extrapolation"),
-        Line2D([], [], color=PREDICTION_COLOR, linewidth=1.5, label="ODE prediction"),
+        Line2D([], [], color=PREDICTION_COLOR, linewidth=1.5, label="Neural ODE prediction"),
     ]
     legend_handles.extend(
         Line2D([], [], color=color, linewidth=1.5, label=f"{name} prediction")
@@ -1026,7 +1114,7 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
         fontsize=9,
     )
     fig.suptitle(
-        f"Lesion growth prediction of various models over time of Lesion {trajectory.label_id} of Patient {trajectory.patient_id}",
+        f"Lesion growth prediction over time of Lesion {trajectory.label_id} of Patient {trajectory.patient_id}",
         y=0.985,
         fontsize=15,
     )

@@ -604,17 +604,19 @@ def plot_contanct_sheet(model, epoch, trj, config, final_side_length=False,
     label_shape = np.array(full_matrix_labels[0][0].shape)
     geometry = _compute_reference_geometry(label_shape, affine)
 
-    # Build time-series data (try INR-style assembler, fallback to LSTM)
+    # This module is for coordinate-query INR models; sequence models use
+    # train_plotting_lstm, which has its own time-series assembler.
     patient_idx_tensor = torch.tensor(trj.embedding_id).unsqueeze(0).to(config.device)
-    try:
-        data = _assemble_time_series(model, patient_idx_tensor, config, full_matrix_labels, label_shape, affine, geometry, side_length)
-    except Exception:
-        canonical_geom = CanonicalGridGeometry(
-            center=getattr(trj, 'canonical_center', None),
-            extent_mm=getattr(trj, 'canonical_extent_mm', None),
-            grid_size=getattr(config, 'lstm_grid_size', None),
-        )
-        data = _assemble_lstm_time_series(model, trj, config, full_matrix_labels, label_shape, affine, geometry, canonical_geom)
+    data = _assemble_time_series(
+        model,
+        patient_idx_tensor,
+        config,
+        full_matrix_labels,
+        label_shape,
+        affine,
+        geometry,
+        side_length,
+    )
 
     n_frames = len(data.heatmaps)
     if n_frames == 0:
