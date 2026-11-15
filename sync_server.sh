@@ -14,11 +14,11 @@ rsync -avP --exclude='.git' --exclude='__pycache__/' --exclude='data' --exclude=
       . "${REMOTE_HOST}:${REMOTE_PROJECT_DIR}"
 
 # 2. Pull down only changed files
-echo "Pulling MLflow data from $REMOTE_HOST..."
-mkdir -p "$LOCAL_SERVER_DIR"
-rsync -avP "${REMOTE_HOST}:~/mlflow.db"    "${LOCAL_SERVER_DIR}/mlflow.db"
-# rsync -avP "${REMOTE_HOST}:~/projects/thesis/mlartifacts/" "${LOCAL_SERVER_DIR}/mlartifacts/"
-rsync -avP "${REMOTE_HOST}:~/mlartifacts/" "${LOCAL_SERVER_DIR}/mlartifacts/"
+# echo "Pulling MLflow data from $REMOTE_HOST..."
+# mkdir -p "$LOCAL_SERVER_DIR"
+# rsync -avP "${REMOTE_HOST}:~/mlflow.db"    "${LOCAL_SERVER_DIR}/mlflow.db"
+# # rsync -avP "${REMOTE_HOST}:~/projects/thesis/mlartifacts/" "${LOCAL_SERVER_DIR}/mlartifacts/"
+# rsync -avP "${REMOTE_HOST}:~/mlartifacts/" "${LOCAL_SERVER_DIR}/mlartifacts/"
 
 # # Get the absolute path to ensure MLflow handles SQLite paths accurately
 # ABS_LOCAL_DIR="$(cd "$LOCAL_SERVER_DIR" && pwd)"

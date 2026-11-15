@@ -335,20 +335,6 @@ if __name__ == "__main__":
             mri_dataloader.cache_lesion_trajectories.copy(), 
         )
 
-        # NOTE (Neural ODE change): the patient embedding table now lives
-        # inside the model (NeuralODE_INR), so its size has to be passed in
-        # explicitly. IMPORTANT: LesionDataset.get_embedding_id() does NOT
-        # return a dense 0..len(patient_to_idx)-1 range -- it's
-        # `patient_to_idx[patient_id] * 100 + label_id`, which can be far
-        # larger than the number of distinct patients. Sizing the embedding
-        # table as len(patient_to_idx) causes an out-of-range index on the
-        # embedding lookup, which on CUDA doesn't fail at the lookup itself
-        # (async execution) but surfaces as an opaque CUBLAS error on the
-        # *next* kernel launch. Instead, size it from the actual max
-        # embedding id used across every trajectory (train + validation +
-        # plotting all draw from the same underlying cache, so this single
-        # pass covers all of them), reusing the dataset's own method so the
-        # id formula can never drift out of sync with dataloader.py.
         max_embedding_id = max(
             train_dataset.get_embedding_id(trj)
             for trj in mri_dataloader.cache_lesion_trajectories

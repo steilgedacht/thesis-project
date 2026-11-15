@@ -75,7 +75,7 @@ def plot_extrapolation_time(loss_T_pairs, global_step):
 
 def validate_polation(data_loader, text, global_step, criterion):
     loss = 0.0
-    volume_error_cm3 = 0.0
+    volume_error_cm3 = []
 
     batch_size = getattr(data_loader, 'batch_size', 1) or 1
 
@@ -101,12 +101,14 @@ def validate_polation(data_loader, text, global_step, criterion):
 
             pred_count = (torch.sigmoid(v_preds[local_idx]).squeeze(-1) > 0.5).sum().item()
             true_count = (v_labels[local_idx].squeeze(-1) > 0.5).sum().item()
-            volume_error_cm3 += abs(pred_count - true_count) * voxel_volume_cm3
+            volume_error_cm3.append(abs(pred_count - true_count) * voxel_volume_cm3)
 
     mlflow.log_metrics({
         text.lower().replace(" ", "_") + "_dice_loss"  : loss / len(data_loader),
         text.lower().replace(" ", "_") + "_dice_score" : 1 - loss / len(data_loader),
-        text.lower().replace(" ", "_") + "_wrongly_predicted_volume_cm3" : volume_error_cm3,
+        text.lower().replace(" ", "_") + "_median_wrongly_predicted_volume_cm3" : np.median(np.array(volume_error_cm3)),
+        text.lower().replace(" ", "_") + "_average_wrongly_predicted_volume_cm3" : np.array(volume_error_cm3).mean(),
+        text.lower().replace(" ", "_") + "_wrongly_predicted_volume_cm3" : np.sum(np.array(volume_error_cm3)),
     }, step=global_step)
 
     if text == "Valid Extrapolation":
@@ -191,9 +193,11 @@ def train_inr(
             with torch.no_grad():
                 validate_polation(valid_extrapolation_loader, "Valid Extrapolation", global_step, criterion)
                 validate_polation(valid_interpolation_loader, "Valid Interpolation", global_step, criterion)
+        if epoch % config.plot_validation_interval == 0:
+            with torch.no_grad():
                 for trj in plotting_LesionDataset:
                     plot_contanct_sheet(model, epoch, trj, config, final_side_length=True)
-                    plot_lesion_time_evolution(model, epoch, trj, config)
+                    plot_lesion_time_evolution(model, epoch, trj, config, final_side_length=True)
 
         mlflow.log_metric("learning_rate", scheduler.get_last_lr()[0], step=global_step)
         scheduler.step()
@@ -248,7 +252,7 @@ if __name__ == "__main__":
             
         trajectories = mri_dataloader.cache_lesion_trajectories * config.training_dataset_samples_duplication_factor
         
-        train_dataset = LesionDataset(
+        train_dataset = config.train_dataset_class(
             trajectories, 
             dialation_iterations=config.dialation_iterations, 
             device=config.device, 
@@ -263,10 +267,21 @@ if __name__ == "__main__":
             pin_memory=config.pin_memory, 
             persistent_workers=config.persistent_workers
         )
-        
+
+        interpolation_dataset_class = getattr(
+            config,
+            "validation_interpolation_dataset_class",
+            Validation_Interpolation_LesionDataset,
+        )
+        extrapolation_dataset_class = getattr(
+            config,
+            "validation_extrapolation_dataset_class",
+            Validation_Extrapolation_LesionDataset,
+        )
+
         valid_interpolation_dataset = Validation_Interpolation_LesionDataset(
             mri_dataloader.cache_lesion_trajectories, 
-            dialation_iterations=config.dialation_iterations, 
+            dialation_iterations=1, 
             device=config.device, 
             background_samples=config.background_samples
         )
@@ -277,7 +292,7 @@ if __name__ == "__main__":
 
         valid_extrapolation_dataset = Validation_Extrapolation_LesionDataset(
             mri_dataloader.cache_lesion_trajectories, 
-            dialation_iterations=config.dialation_iterations, 
+            dialation_iterations=1, 
             device=config.device, 
             background_samples=config.background_samples
         )

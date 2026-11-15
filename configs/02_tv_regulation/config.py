@@ -4,7 +4,7 @@ class Config:
     """ Tracking parameters """
     mlflow_tracking_uri = "http://127.0.0.1:5124"
     mlflow_experiment_name = "Lesion_INR_Training"
-    mlflow_run_name = "TV_Regularization_INR" 
+    mlflow_run_name = "INR Dense and Dialation" 
 
 
     """ Dataloading parameters """
@@ -14,14 +14,17 @@ class Config:
     pin_memory = True
     persistent_workers = True
 
-    lesion_trajectories_with_more_than_n_scans = 4
+    lesion_trajectories_with_more_than_n_scans = 6
     use_only_growing_lesions = True
 
     # with that the same lesions can be in the same training batch
     training_dataset_samples_duplication_factor = 20 
 
-    dialation_iterations = 1
+    dialation_iterations = 8
     background_samples_proportion = 1
+
+    from utils.dataloader_dense import DenseLesionDataset
+    train_dataset_class = DenseLesionDataset
 
 
     """ Training parameters """
@@ -51,7 +54,7 @@ class Config:
         "input_dim" : 4,
         "hidden_dim" : 512,
         "output_dim" : 1,
-        "omega_0" : 30.0,
+        "omega_0" : 45.0,
         "n_layers" : 8,
         "time_freqs" : 6,
         "max_t" : 3650.0,
@@ -63,7 +66,8 @@ class Config:
     train_log_interval = 10
     train_delete_cache_interval = 10
     n_monitoring_samples_to_visualize = 5
-    validation_interval = 25
+    validation_interval = 5
+    plot_validation_interval = 50
     print_loss_interval = 10
     
     time_evolution_steps = 100
