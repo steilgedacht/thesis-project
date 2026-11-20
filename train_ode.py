@@ -261,8 +261,8 @@ if __name__ == "__main__":
     config = add_base_configurations(config)
     print(f"Using configuration from: {args.config}")
 
-    check_if_mlflow_is_running(config)
     mlflow.set_tracking_uri(config.mlflow_tracking_uri)
+    check_if_mlflow_is_running(config)
     mlflow.set_experiment(config.mlflow_experiment_name)
 
     with mlflow.start_run(run_name=config.mlflow_run_name):

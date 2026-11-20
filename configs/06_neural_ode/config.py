@@ -2,9 +2,11 @@ import torch
 
 class Config:
     """ Tracking parameters """
-    mlflow_tracking_uri = "http://127.0.0.1:5124"
+    # mlflow_tracking_uri = "http://127.0.0.1:5124"
+    mlflow_tracking_uri = f"http://{open('/home/optima/bbergmann/mlflow_host.txt').read().strip()}:5124"
+    print(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
     mlflow_experiment_name = "Lesion_ODE_Training"
-    mlflow_run_name = "ODE 8 Dialation correct eval" 
+    mlflow_run_name = "ODE higher lr, lower epoch" 
 
 
     """ Dataloading parameters """
@@ -32,9 +34,9 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 200
+    epochs = 100
     background_samples = 3000
-    lr = 1e-4
+    lr = 4e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.0001
     max_grad_norm_clip = 1.0
@@ -52,7 +54,7 @@ class Config:
     
     # Instantiate loss with dynamic weighting
     loss_fn = Loss_BCE_Dice_TV(
-        lambda_space=3e-4, 
+        lambda_space=3e-5, 
         lambda_time=0.001,
         use_dynamic_pos_weight=use_dynamic_pos_weight,
     )
@@ -61,18 +63,35 @@ class Config:
     """ Model parameters """
     from utils.model_neural_ode_translation import NeuralODETranslationINR
     model = NeuralODETranslationINR
+    # model_params = dict(
+    #     patient_embed_dim=32,
+    #     latent_dim=512,
+    #     ode_hidden_dim=128,
+    #     ode_layers=12,
+    #     ode_steps=16,        # mehr = genauer, aber langsamer/mehr Speicher (Backprop through time)
+    #     ode_method="rk4",    # oder "euler"
+    #     max_t=3650.0,
+    #     spatial_hidden_dim=128,
+    #     spatial_layers=16,
+    #     num_fourier_frequencies=14,  # 0 = deaktiviert
+    # )
+
     model_params = dict(
-        patient_embed_dim=32,
-        latent_dim=512,
-        ode_hidden_dim=128,
-        ode_layers=12,
-        ode_steps=16,        # mehr = genauer, aber langsamer/mehr Speicher (Backprop through time)
-        ode_method="rk4",    # oder "euler"
+        patient_embed_dim=256,
+        latent_dim=256,
+        ode_hidden_dim=256,
+        ode_layers=3,
+        ode_steps=8,
+        ode_method="rk4",
         max_t=3650.0,
-        spatial_hidden_dim=128,
-        spatial_layers=16,
-        num_fourier_frequencies=14,  # 0 = deaktiviert
+        spatial_hidden_dim=256,
+        spatial_layers=8,
+        num_fourier_frequencies=8,
+        # new: add as separate args in NeuralODETranslationINR
+        translation_ode_hidden_dim=64,
+        translation_ode_layers=2,
     )
+
 
     model_save_name = "lesion_ode_model"
 
@@ -82,7 +101,7 @@ class Config:
     train_delete_cache_interval = 10
     n_monitoring_samples_to_visualize = 5
     validation_interval = 5
-    plot_validation_interval = 50
+    plot_validation_interval = 25
     print_loss_interval = 10
     
     time_evolution_steps = 100

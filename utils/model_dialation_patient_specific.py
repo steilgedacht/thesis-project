@@ -7,6 +7,29 @@ from tqdm import tqdm
 from scipy.ndimage import binary_dilation
 
 
+def calculate_lesion_growth_rate(trj, dates=None):
+    """Estimate equivalent-sphere radius growth in voxels per day."""
+    if dates is None:
+        dates = trj.allowed_dates if hasattr(trj, "allowed_dates") else trj.dates
+    dates = list(dates)
+    if not dates:
+        raise ValueError(f"Trajectory {trj.patient_id}_{trj.label_id} has no dates.")
+
+    mask_first, t0 = trj.load_labels_for_inr(
+        selected_date=dates[0], absolute_day_number=True
+    )
+    mask_last, tT = trj.load_labels_for_inr(
+        selected_date=dates[-1], absolute_day_number=True
+    )
+    dt = max(1.0, float(tT - t0))
+
+    vol_first = np.count_nonzero(mask_first > 0.5)
+    vol_last = np.count_nonzero(mask_last > 0.5)
+    r_first = (3 * vol_first / (4 * np.pi)) ** (1 / 3)
+    r_last = (3 * vol_last / (4 * np.pi)) ** (1 / 3)
+    return max(0.0, (r_last - r_first) / dt)
+
+
 class Patient_Specific_Dilation_Model(nn.Module):
     def __init__(self, trajectories, shape=(500, 500, 50)):
         super().__init__()
@@ -23,21 +46,7 @@ class Patient_Specific_Dilation_Model(nn.Module):
             label_key = (self.patient_to_idx[trj.patient_id] * 100) + trj.label_id
             self.trajectories_map[label_key] = trj
             
-            mask_first, t0 = trj.load_labels_for_inr(selected_date=trj.allowed_dates[0], absolute_day_number=True)
-            mask_last, tT = trj.load_labels_for_inr(selected_date=trj.allowed_dates[-1], absolute_day_number=True)
-            
-            dt = max(1.0, tT - t0)
-            
-            # approximate the lesion as a sphere to calculate the radius
-            vol_first = np.sum(mask_first > 0.5)
-            vol_last = np.sum(mask_last > 0.5)
-            
-            r_first = (3 * vol_first / (4 * np.pi)) ** (1/3)
-            r_last = (3 * vol_last / (4 * np.pi)) ** (1/3)
-            
-            # pixel growth rate per day
-            growth_rate = max(0.0, (r_last - r_first) / dt)
-            self.rates_per_lesion[label_key] = growth_rate
+            self.rates_per_lesion[label_key] = calculate_lesion_growth_rate(trj)
 
     @functools.lru_cache(maxsize=16) 
     def _load_base_scan(self, p_id):
