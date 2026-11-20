@@ -79,7 +79,7 @@ class DatasetPaths:
         return "experiments/05_data_visualizer/patient_to_idx.json"
 
     def validation_samples(self):
-        return "experiments/05_data_visualizer/validation_lesions.json"
+        return "experiments/05_data_visualizer/validation_lesions_2.json"
 
     def plotting_samples(self):
         return "experiments/05_data_visualizer/plotting_lesions.json"

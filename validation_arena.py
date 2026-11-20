@@ -112,6 +112,7 @@ class EvaluationCase:
     target_date: str
     days_from_endpoint: int | float | None
     history_dates: tuple[str, ...]
+    extrapolation_timepoints: int | None = None
 
 
 @dataclass(frozen=True)
@@ -264,15 +265,25 @@ def _make_cases(
         sample = validation_samples[lesion_id]
         if split in ("both", "interpolation"):
             target_index = int(sample["interpolation"])
-            target_date = str(dates[target_index])
-            history = tuple(str(date) for date in dates[:target_index])
-            if not history:
-                history = (target_date,)
-            cases.append(
-                EvaluationCase(
-                    lesion_id, trajectory, "interpolation", target_date, None, history
+            if target_index != -1:
+                if not 0 <= target_index < len(dates):
+                    raise ValueError(
+                        f"Invalid interpolation index for lesion {lesion_id}."
+                    )
+                target_date = str(dates[target_index])
+                history = tuple(str(date) for date in dates[:target_index])
+                if not history:
+                    history = (target_date,)
+                cases.append(
+                    EvaluationCase(
+                        lesion_id,
+                        trajectory,
+                        "interpolation",
+                        target_date,
+                        None,
+                        history,
+                    )
                 )
-            )
         if split in ("both", "extrapolation"):
             held_out_dates = sample["extrapolation_dates"]
             held_out_steps = sample["extrapolation_T_minus"]
@@ -288,6 +299,7 @@ def _make_cases(
                         str(date),
                         float(step),
                         history,
+                        len(held_out_dates),
                     )
                 )
     return cases
@@ -327,7 +339,11 @@ def _training_dates_for_rate(
         training_dates = dates
     else:
         held_out_dates = set(str(date) for date in sample["extrapolation_dates"])
-        held_out_dates.add(str(dates[int(sample["interpolation"])]))
+        interpolation_index = int(sample["interpolation"])
+        if interpolation_index != -1:
+            if not 0 <= interpolation_index < len(dates):
+                raise ValueError(f"Invalid interpolation index for lesion {lesion_id}.")
+            held_out_dates.add(str(dates[interpolation_index]))
         training_dates = [date for date in dates if date not in held_out_dates]
     if len(training_dates) < 2:
         raise ValueError(
@@ -423,7 +439,7 @@ def _summary_metrics(rows: list[dict[str, Any]], model_name: str) -> dict[str, f
         if not split_rows:
             continue
         prefix = f"{model_name}_{split}"
-        dice_score = float(np.mean([row["dice_score"] for row in split_rows]))
+        dice_score = _average_metric(split_rows, "dice_score")
         volume_errors = [
             row["wrongly_predicted_volume_cm3"] for row in split_rows
         ]
@@ -435,7 +451,7 @@ def _summary_metrics(rows: list[dict[str, Any]], model_name: str) -> dict[str, f
                     np.median(volume_errors)
                 ),
                 f"{prefix}_average_wrongly_predicted_volume_cm3": float(
-                    np.mean(volume_errors)
+                    _average_metric(split_rows, "wrongly_predicted_volume_cm3")
                 ),
                 f"{prefix}_wrongly_predicted_volume_cm3": float(
                     np.sum(volume_errors)
@@ -443,6 +459,31 @@ def _summary_metrics(rows: list[dict[str, Any]], model_name: str) -> dict[str, f
             }
         )
     return metrics
+
+
+def _average_metric(rows: list[dict[str, Any]], metric: str) -> float:
+    if rows[0]["split"] != "extrapolation":
+        return float(np.mean([row[metric] for row in rows]))
+
+    values_by_lesion: dict[str, list[float]] = {}
+    weights_by_lesion: dict[str, float] = {}
+    for row in rows:
+        lesion_id = row["lesion_id"]
+        values_by_lesion.setdefault(lesion_id, []).append(row[metric])
+        timepoint_count = row["extrapolation_timepoints"]
+        if timepoint_count is None or timepoint_count < 1:
+            raise ValueError(
+                f"Invalid extrapolation timepoint count for lesion {lesion_id}."
+            )
+        weights_by_lesion[lesion_id] = float(timepoint_count)
+    max_timepoints = max(weights_by_lesion.values())
+    lesion_weights = [
+        weight / max_timepoints for weight in weights_by_lesion.values()
+    ]
+    lesion_averages = [
+        float(np.mean(values)) for values in values_by_lesion.values()
+    ]
+    return float(np.average(lesion_averages, weights=lesion_weights))
 
 
 def _project_onto_simplex(values: torch.Tensor) -> torch.Tensor:
@@ -1297,7 +1338,7 @@ def main() -> None:
             for loaded in models
             if loaded.family == "lstm"
         }
-    mlflow.set_experiment("Validation")
+    mlflow.set_experiment("Uniform Grid Validation")
     mlflow.start_run(run_name="Uniform Grid Validation")
     validation_params: dict[str, str] = {
         "resolution_per_axis": str(args.resolution),
@@ -1375,6 +1416,7 @@ def main() -> None:
                 "split": case.split,
                 "target_date": case.target_date,
                 "days_from_endpoint": case.days_from_endpoint,
+                "extrapolation_timepoints": case.extrapolation_timepoints,
                 "resolution_per_axis": args.resolution,
                 "growth_rate_voxels_per_day": growth_rate,
                 "dice_score": dice_score,
@@ -1674,7 +1716,7 @@ def main() -> None:
             if split_rows:
                 prefix = f"{model_name}_{split}"
                 dice_score = float(
-                    np.mean([row["dice_score"] for row in split_rows])
+                    _average_metric(split_rows, "dice_score")
                 )
                 volume_errors = [
                     row["wrongly_predicted_volume_cm3"] for row in split_rows
@@ -1687,7 +1729,9 @@ def main() -> None:
                             float(np.median(volume_errors))
                         ),
                         f"{prefix}_average_wrongly_predicted_volume_cm3": str(
-                            float(np.mean(volume_errors))
+                            _average_metric(
+                                split_rows, "wrongly_predicted_volume_cm3"
+                            )
                         ),
                         f"{prefix}_wrongly_predicted_volume_cm3": str(
                             float(np.sum(volume_errors))
@@ -1699,7 +1743,8 @@ def main() -> None:
                     f"dice loss={1.0 - dice_score:.5f}, "
                     f"dice score={dice_score:.5f}, "
                     f"median volume error={np.median(volume_errors):.5f} cm^3, "
-                    f"average volume error={np.mean(volume_errors):.5f} cm^3, "
+                    f"average volume error="
+                    f"{_average_metric(split_rows, 'wrongly_predicted_volume_cm3'):.5f} cm^3, "
                     f"total volume error={np.sum(volume_errors):.5f} cm^3, "
                     f"(n={len(split_rows)})"
                 )
