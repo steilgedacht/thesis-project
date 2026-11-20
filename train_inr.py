@@ -14,6 +14,8 @@ import argparse
 import requests
 import json
 import os
+import tempfile
+from mlflow.artifacts import get_artifact_repository
 
 def check_if_mlflow_is_running(config):
     try:
@@ -136,6 +138,7 @@ def train_inr(
 
     model.to(config.device)
     losses = []
+    previous_checkpoint_path = None
     
     global_step = epoch = 0
 
@@ -183,6 +186,24 @@ def train_inr(
             if i % config.train_delete_cache_interval == 0:
                 del coords, labels, patient_idx, predictions, loss
                 torch.cuda.empty_cache()
+
+        if epoch % config.plot_validation_interval == 0:
+            active_run = mlflow.active_run()
+            if active_run is None:
+                raise RuntimeError("Cannot log an intermediate checkpoint without an active MLflow run.")
+
+            checkpoint_name = f"intermediate_model_epoch_{epoch}.pt"
+            checkpoint_path = f"checkpoints/{checkpoint_name}"
+            with tempfile.TemporaryDirectory() as temp_dir:
+                local_checkpoint_path = Path(temp_dir) / checkpoint_name
+                torch.save(model.state_dict(), local_checkpoint_path)
+                mlflow.log_artifact(str(local_checkpoint_path), artifact_path="checkpoints")
+
+            if previous_checkpoint_path is not None:
+                get_artifact_repository(active_run.info.artifact_uri).delete_artifacts(
+                    previous_checkpoint_path
+                )
+            previous_checkpoint_path = checkpoint_path
 
         if config.only_train: continue
 

@@ -24,7 +24,7 @@ def check_if_mlflow_is_running(config):
     except Exception as e:
         import shutil
         import time
-        shutil.os.system("tmux new-session -d -s mlflow_server 'mlflow server'")
+        shutil.os.system("tmux new-session -d -s mlflow_server 'mlflow server --port 5124'")
         print("Starting Mlflow in a new tmux session...")
         time.sleep(5)
 

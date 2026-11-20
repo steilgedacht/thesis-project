@@ -1,4 +1,4 @@
-"""Compare saved MLflow INR, Neural ODE, and LSTM models on one uniform grid.
+"""Compare saved MLflow INR, Neural ODE, and LSTM models with dilation baselines.
 
 The evaluator uses 500 points per axis by default (125 million points per
 held-out scan). Run it from the repository root, for example:
@@ -13,8 +13,14 @@ Ground-truth masks are sampled at the corresponding physical locations, and
 LSTM probabilities are interpolated from the model's native grid to those
 same locations. Results are written per held-out scan to CSV.
 
-Unless --skip-embedding-test is set, each model also fits one embedding on
-YG_WCONBI42RLEZ lesion 1 and reports fitted-embedding Dice for every timepoint.
+Unless --skip-embedding-test is set, INR, Neural ODE, and LSTM models also fit
+one embedding on YG_WCONBI42RLEZ lesion 1 and report fitted-embedding Dice for
+every timepoint. Global-rate and lesion-specific-rate dilation baselines are
+computed only from non-validation scans and also evaluated on the embedding
+trajectory.
+
+Use --plot-contact-sheets to save contact sheets for up to five validation
+lesions and each model's fitted-embedding trajectory.
 """
 
 import argparse
@@ -35,13 +41,14 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from mlflow.tracking import MlflowClient
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import binary_dilation, map_coordinates
 
 from utils.dataloader import LesionDataset
 from utils.dataloader_lstm import LesionSequenceDataset
 from utils.loss_bce_dice import Loss_BCE_Dice
 from utils.model_inr import LesionINR
 from utils.model_lstm import LesionLSTM, LesionLatentLSTM
+from utils.model_dialation_patient_specific import calculate_lesion_growth_rate
 from utils import model_neural_ode_validation
 from utils import model_neural_ode_translation_validation
 from utils.mri_dataloader import MRI_Dataloader
@@ -56,6 +63,8 @@ MODEL_CLASSES = {
     ),
     "lstm": (LesionLSTM, LesionLatentLSTM),
 }
+EMBEDDING_SUPPORTED_FAMILIES = {"inr", "node", "lstm"}
+DILATION_BASELINE_NAMES = ("dilation_global", "dilation_lesion_specific")
 EMBEDDING_TRAJECTORY = ("YG_WCONBI42RLEZ", 1)
 
 
@@ -284,6 +293,59 @@ def _make_cases(
     return cases
 
 
+def _dilation_growth_rates(
+    trajectories: dict[str, Any],
+    validation_samples: dict[str, dict[str, Any]],
+) -> tuple[float, dict[str, float]]:
+    """Estimate rates from training dates only, excluding validation targets."""
+    lesion_rates = {}
+    for lesion_id, trajectory in trajectories.items():
+        training_dates = _training_dates_for_rate(trajectory, validation_samples)
+        lesion_rates[lesion_id] = float(
+            calculate_lesion_growth_rate(trajectory, training_dates)
+        )
+    if not lesion_rates:
+        raise ValueError("Cannot calculate dilation growth rates without trajectories.")
+    return float(np.mean(list(lesion_rates.values()))), lesion_rates
+
+
+def _training_dates_for_rate(
+    trajectory: Any,
+    validation_samples: dict[str, dict[str, Any]],
+) -> list[str]:
+    dates = [
+        str(date)
+        for date in (
+            trajectory.allowed_dates
+            if hasattr(trajectory, "allowed_dates")
+            else trajectory.dates
+        )
+    ]
+    lesion_id = f"{trajectory.patient_id}_{trajectory.label_id}"
+    sample = validation_samples.get(lesion_id)
+    if sample is None:
+        training_dates = dates
+    else:
+        held_out_dates = set(str(date) for date in sample["extrapolation_dates"])
+        held_out_dates.add(str(dates[int(sample["interpolation"])]))
+        training_dates = [date for date in dates if date not in held_out_dates]
+    if len(training_dates) < 2:
+        raise ValueError(
+            f"Cannot estimate a dilation growth rate for {lesion_id}: "
+            f"only {len(training_dates)} training scan(s) remain after "
+            "excluding validation timepoints."
+        )
+    return training_dates
+
+
+def _seed_embedding_fit(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _coordinates_and_labels(
     target_volume: TargetVolume,
     start: int,
@@ -338,22 +400,16 @@ def _dice_sums(
 ) -> None:
     probabilities = np.clip(probabilities.astype(np.float64, copy=False), 0.0, 1.0)
     targets = targets.astype(bool, copy=False)
-    sums["probability"] += float(probabilities.sum())
     sums["target"] += float(targets.sum())
-    sums["soft_intersection"] += float(probabilities[targets].sum())
     predicted = probabilities >= 0.5
     sums["hard_prediction"] += int(predicted.sum())
     sums["hard_intersection"] += int(np.logical_and(predicted, targets).sum())
 
 
-def _dice_results(sums: dict[str, float]) -> tuple[float, float]:
-    soft = (
-        2.0 * sums["soft_intersection"] + 1e-6
-    ) / (sums["probability"] + sums["target"] + 1e-6)
-    hard = (
+def _dice_results(sums: dict[str, float]) -> float:
+    return (
         2.0 * sums["hard_intersection"] + 1e-6
     ) / (sums["hard_prediction"] + sums["target"] + 1e-6)
-    return soft, hard
 
 
 def _summary_metrics(rows: list[dict[str, Any]], model_name: str) -> dict[str, float]:
@@ -367,14 +423,14 @@ def _summary_metrics(rows: list[dict[str, Any]], model_name: str) -> dict[str, f
         if not split_rows:
             continue
         prefix = f"{model_name}_{split}"
-        dice_loss = float(np.mean([1.0 - row["soft_dice"] for row in split_rows]))
+        dice_score = float(np.mean([row["dice_score"] for row in split_rows]))
         volume_errors = [
             row["wrongly_predicted_volume_cm3"] for row in split_rows
         ]
         metrics.update(
             {
-                f"{prefix}_dice_loss": dice_loss,
-                f"{prefix}_dice_score": 1.0 - dice_loss,
+                f"{prefix}_dice_loss": 1.0 - dice_score,
+                f"{prefix}_dice_score": dice_score,
                 f"{prefix}_median_wrongly_predicted_volume_cm3": float(
                     np.median(volume_errors)
                 ),
@@ -383,9 +439,6 @@ def _summary_metrics(rows: list[dict[str, Any]], model_name: str) -> dict[str, f
                 ),
                 f"{prefix}_wrongly_predicted_volume_cm3": float(
                     np.sum(volume_errors)
-                ),
-                f"{prefix}_hard_dice_score": float(
-                    np.mean([row["hard_dice_at_0.5"] for row in split_rows])
                 ),
             }
         )
@@ -415,9 +468,7 @@ def _infer_continuous_model(
 ) -> dict[str, float]:
     count = resolution**3
     sums = {
-        "probability": 0.0,
         "target": 0.0,
-        "soft_intersection": 0.0,
         "hard_prediction": 0.0,
         "hard_intersection": 0.0,
     }
@@ -449,6 +500,71 @@ def _infer_continuous_model(
     return sums
 
 
+def _infer_dilation_baseline(
+    case: EvaluationCase,
+    target_volume: TargetVolume,
+    growth_rate: float,
+    resolution: int,
+    chunk_size: int,
+) -> dict[str, float]:
+    trajectory = case.trajectory
+    dates = list(
+        trajectory.allowed_dates
+        if hasattr(trajectory, "allowed_dates")
+        else trajectory.dates
+    )
+    (base_labels, base_time), affine = trajectory.load_labels_for_inr(
+        selected_date=str(dates[0]),
+        absolute_day_number=True,
+        affine=True,
+    )
+    base_mask = np.asarray(base_labels) > 0.5
+    elapsed_days = max(0.0, target_volume.time_point - float(base_time))
+    iterations = int(np.round(elapsed_days * growth_rate))
+    predicted_mask = (
+        binary_dilation(base_mask, iterations=iterations)
+        if iterations > 0
+        else base_mask
+    )
+
+    volume_center_voxel = (np.asarray(base_mask.shape, dtype=np.float64) - 1) / 2
+    volume_center_phys = affine[:3, :3] @ volume_center_voxel + affine[:3, 3]
+    inverse_affine = np.linalg.inv(affine)
+    positive_probability = 1.0 / (1.0 + np.exp(-15.0))
+    negative_probability = 1.0 / (1.0 + np.exp(15.0))
+    sums = {
+        "target": 0.0,
+        "hard_prediction": 0.0,
+        "hard_intersection": 0.0,
+    }
+
+    for start in range(0, resolution**3, chunk_size):
+        end = min(start + chunk_size, resolution**3)
+        coords, targets = _coordinates_and_labels(
+            target_volume, start, end, resolution
+        )
+        physical_coords = (
+            volume_center_phys + coords[:, :3].astype(np.float64) * 100.0
+        )
+        physical_homogeneous = np.concatenate(
+            (physical_coords, np.ones((len(coords), 1))), axis=1
+        )
+        voxel_coords = physical_homogeneous @ inverse_affine.T
+        pixel_coords = np.rint(voxel_coords[:, :3]).astype(np.int64)
+        pixel_coords = np.clip(
+            pixel_coords, 0, np.asarray(base_mask.shape, dtype=np.int64) - 1
+        )
+        sampled_mask = predicted_mask[
+            pixel_coords[:, 0], pixel_coords[:, 1], pixel_coords[:, 2]
+        ]
+        probabilities = np.where(
+            sampled_mask, positive_probability, negative_probability
+        )
+        _dice_sums(sums, probabilities, targets)
+
+    return sums
+
+
 def _lstm_dataset(
     trajectories: list[Any],
     loaded: LoadedModel,
@@ -467,6 +583,114 @@ def _lstm_dataset(
         min_extent_mm=float(dataset_params.get("min_extent_mm", 80.0)),
         max_sequence_len=int(dataset_params.get("max_sequence_len", 6)),
     )
+
+
+def _plot_lstm_contact_sheet(
+    model: torch.nn.Module,
+    trajectory: Any,
+    sequence_dataset: LesionSequenceDataset,
+    trajectory_index: int,
+    output_path: Path,
+    device: torch.device,
+    embedding_override: torch.Tensor | None = None,
+) -> None:
+    from matplotlib import pyplot as plt
+    from utils.train_plotting_lstm import plot_contanct_sheet
+
+    dates = list(
+        trajectory.allowed_dates
+        if hasattr(trajectory, "allowed_dates")
+        else trajectory.dates
+    )
+    if not dates:
+        raise ValueError(
+            f"Cannot plot LSTM contact sheet for "
+            f"{trajectory.patient_id}_{trajectory.label_id}: no dates."
+        )
+    resampled = sequence_dataset._compute_resampled_trajectory(
+        trajectory_index, dates
+    )
+    trajectory.grids = np.stack(
+        [resampled["grids"][date] for date in dates], axis=0
+    )[:, None]
+    trajectory.times = np.asarray(
+        [resampled["times"][date] for date in dates], dtype=np.float32
+    )
+    trajectory.embedding_id = sequence_dataset.get_embedding_id(trajectory)
+    trajectory.canonical_center = resampled["center"]
+    trajectory.canonical_extent_mm = float(resampled["extent"])
+
+    plot_config = argparse.Namespace(
+        device=device,
+        time_evolution_steps=12,
+        lstm_grid_size=tuple(sequence_dataset.grid_size),
+        full_size_side_length=500,
+        time_evolution_side_length=100,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    hook = (
+        _embedding_override(model, embedding_override)
+        if embedding_override is not None
+        else None
+    )
+    figure = None
+    try:
+        figure = plot_contanct_sheet(
+            model,
+            epoch=0,
+            trj=trajectory,
+            config=plot_config,
+            final_side_length=True,
+            jupyter_mode=False,
+            output_path=str(output_path),
+        )
+    finally:
+        if hook is not None:
+            hook.remove()
+        if figure is not None:
+            plt.close(figure)
+
+
+def _plot_continuous_contact_sheet(
+    model: torch.nn.Module,
+    trajectory: Any,
+    embedding_id: int,
+    output_path: Path,
+    device: torch.device,
+    embedding_override: torch.Tensor | None = None,
+) -> None:
+    from matplotlib import pyplot as plt
+    from utils.train_plotting import plot_contanct_sheet
+
+    trajectory.embedding_id = embedding_id
+    plot_config = argparse.Namespace(
+        device=device,
+        time_evolution_steps=12,
+        full_size_side_length=500,
+        time_evolution_side_length=128,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    hook = (
+        _embedding_override(model, embedding_override)
+        if embedding_override is not None
+        else None
+    )
+    figure = None
+    try:
+        figure = plot_contanct_sheet(
+            model,
+            epoch=0,
+            trj=trajectory,
+            config=plot_config,
+            final_side_length=False,
+            jupyter_mode=False,
+            output_path=str(output_path),
+        )
+    finally:
+        if hook is not None:
+            hook.remove()
+        if figure is not None:
+            plt.close(figure)
 
 
 def _infer_lstm(
@@ -524,9 +748,7 @@ def _infer_lstm(
     extent = float(resampled["extent"])
     center = np.asarray(resampled["center"], dtype=np.float64)
     sums = {
-        "probability": 0.0,
         "target": 0.0,
-        "soft_intersection": 0.0,
         "hard_prediction": 0.0,
         "hard_intersection": 0.0,
     }
@@ -540,7 +762,10 @@ def _infer_lstm(
         coords, targets = _coordinates_and_labels(
             target_volume, start, end, resolution
         )
-        physical_coords = center + coords[:, :3].astype(np.float64) * 100.0
+        physical_coords = (
+            target_volume.center_phys
+            + coords[:, :3].astype(np.float64) * 100.0
+        )
         normalized_axes = 2.0 * (physical_coords - center) / extent
         in_bounds = np.all(np.abs(normalized_axes) <= 1.0, axis=1)
         sample_grid = np.stack(
@@ -688,7 +913,6 @@ def _fit_embedding(
     direct_embedding = None
     criterion = Loss_BCE_Dice()
     phase_epochs = min(combination_epochs, epochs)
-    support_samples = None
     support_sequence = None
 
     def train_phase(
@@ -748,8 +972,10 @@ def _fit_embedding(
                                 _project_onto_simplex(coefficients)
                             )
                 else:
-                    assert support_samples is not None
-                    shuffled = random.sample(support_samples, len(support_samples))
+                    epoch_samples = _prepare_continuous_support(
+                        loaded, case, samples_per_epoch
+                    )
+                    shuffled = random.sample(epoch_samples, len(epoch_samples))
                     for start in range(0, len(shuffled), batch_size):
                         batch = shuffled[start : start + batch_size]
                         coords = torch.stack([item[0] for item in batch]).to(device)
@@ -777,10 +1003,6 @@ def _fit_embedding(
                 raise ValueError("LSTM support dataset was not initialized.")
             support_sequence = _prepare_lstm_support(
                 loaded, case, trajectory_index, lstm_dataset
-            )
-        else:
-            support_samples = _prepare_continuous_support(
-                loaded, case, samples_per_epoch
             )
 
         combination_optimizer = optim.AdamW(
@@ -817,8 +1039,8 @@ def _fit_embedding(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate MLflow INR, Neural ODE, and/or LSTM runs on a shared "
-            "uniform spatial grid."
+            "Evaluate MLflow INR, Neural ODE, and/or LSTM runs alongside "
+            "calculated dilation baselines on a shared uniform spatial grid."
         )
     )
     for family in MODEL_CLASSES:
@@ -866,6 +1088,18 @@ def _parse_args() -> argparse.Namespace:
         help="Evaluate only the original saved embeddings, without adaptation.",
     )
     parser.add_argument(
+        "--plot-contact-sheets",
+        "--plot-lstm-contact-sheets",
+        dest="plot_contact_sheets",
+        action="store_true",
+        help=(
+            "Save contact sheets for up to five distinct validation lesions "
+            "per model and, unless embedding testing is skipped, each fitted "
+            "embedding trajectory. The LSTM-specific option name remains an "
+            "alias."
+        ),
+    )
+    parser.add_argument(
         "--embedding-epochs",
         type=int,
         default=100,
@@ -896,14 +1130,26 @@ def _parse_args() -> argparse.Namespace:
         help="Sampled support batches per continuous-model epoch (default: 20).",
     )
     parser.add_argument(
+        "--embedding-seed",
+        type=int,
+        default=42,
+        help="Random seed reset before each embedding fit (default: 42).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
-        default=Path("validation_arena_results.csv"),
-        help="Per-target results CSV path",
+        default=Path(__file__).resolve().with_name("validation_arena_results.csv"),
+        help=(
+            "Per-target results CSV path (default: validation_arena_results.csv "
+            "beside this script)"
+        ),
     )
     args = parser.parse_args()
     if not any(getattr(args, f"{family}_run_id") for family in MODEL_CLASSES):
-        parser.error("Provide at least one of --inr-run-id, --node-run-id, or --lstm-run-id.")
+        parser.error(
+            "Provide at least one of --inr-run-id, --node-run-id, "
+            "or --lstm-run-id."
+        )
     if args.resolution < 2:
         parser.error("--resolution must be at least 2.")
     if args.chunk_size < 1:
@@ -970,11 +1216,19 @@ def main() -> None:
         cases = cases[: args.max_cases]
     if not cases:
         raise ValueError(f"No {args.split} validation cases were selected.")
+    global_growth_rate, lesion_growth_rates = _dilation_growth_rates(
+        trajectories, validation
+    )
 
     print(
-        f"Evaluating {len(models)} model(s), {len(trajectories)} shared lesion(s), "
+        f"Evaluating {len(models)} model(s) and 2 dilation baselines, "
+        f"{len(trajectories)} shared lesion(s), "
         f"{len(cases)} target(s), {args.resolution}^3 = "
         f"{args.resolution**3:,} query points per target on {device}."
+    )
+    print(
+        "Calculated global dilation growth rate: "
+        f"{global_growth_rate:.6f} voxels/day."
     )
 
     lstm_datasets = {
@@ -987,11 +1241,17 @@ def main() -> None:
     }
 
     rows = []
+    embedding_families = {
+        loaded.family
+        for loaded in models
+        if loaded.family in EMBEDDING_SUPPORTED_FAMILIES
+    }
     embedding_trajectory = None
     embedding_model_idx: int | None = None
     embedding_trajectory_dates: list[str] = []
+    embedding_dilation_growth_rate: float | None = None
     embedding_lstm_datasets = {}
-    if not args.skip_embedding_test:
+    if not args.skip_embedding_test and embedding_families:
         embedding_dataloader = MRI_Dataloader()
         embedding_trajectory = embedding_dataloader.find_lesion_trajectory(
             *EMBEDDING_TRAJECTORY
@@ -1026,6 +1286,12 @@ def main() -> None:
                 f"{embedding_trajectory.patient_id} is missing from patient_to_idx."
             )
         embedding_model_idx = embedding_patient_idx * 100 + EMBEDDING_TRAJECTORY[1]
+        embedding_dilation_growth_rate = float(
+            calculate_lesion_growth_rate(
+                embedding_trajectory,
+                _training_dates_for_rate(embedding_trajectory, validation),
+            )
+        )
         embedding_lstm_datasets = {
             loaded.run_id: _lstm_dataset([embedding_trajectory], loaded)
             for loaded in models
@@ -1038,9 +1304,31 @@ def main() -> None:
         "query_points_per_target": str(args.resolution**3),
         "decision_threshold": "0.5",
         "split": args.split,
-        "embedding_test_enabled": str(not args.skip_embedding_test),
+        "contact_sheets_enabled": str(args.plot_contact_sheets),
+        "embedding_test_enabled": str(
+            not args.skip_embedding_test and bool(embedding_families)
+        ),
+        "dilation_global_growth_rate_voxels_per_day": str(global_growth_rate),
+        "dilation_lesion_growth_rate_count": str(len(lesion_growth_rates)),
+        "dilation_growth_rate_excludes_validation_timepoints": "true",
+        "inr_run_id": args.inr_run_id or "",
+        "node_run_id": args.node_run_id or "",
+        "lstm_run_id": args.lstm_run_id or "",
     }
-    if not args.skip_embedding_test:
+    if embedding_dilation_growth_rate is not None:
+        validation_params[
+            "dilation_embedding_lesion_growth_rate_voxels_per_day"
+        ] = str(embedding_dilation_growth_rate)
+    for loaded in models:
+        validation_params[f"{loaded.family}_embedding_test_enabled"] = str(
+            not args.skip_embedding_test
+            and loaded.family in EMBEDDING_SUPPORTED_FAMILIES
+        )
+    for baseline_name in DILATION_BASELINE_NAMES:
+        validation_params[f"{baseline_name}_embedding_test_enabled"] = str(
+            not args.skip_embedding_test and embedding_trajectory is not None
+        )
+    if not args.skip_embedding_test and embedding_families:
         validation_params.update(
             {
                 "embedding_adaptation_epochs": str(args.embedding_epochs),
@@ -1055,6 +1343,7 @@ def main() -> None:
                 "embedding_samples_per_epoch": str(
                     args.embedding_samples_per_epoch
                 ),
+                "embedding_seed": str(args.embedding_seed),
                 "embedding_trajectory": (
                     f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]}"
                 ),
@@ -1066,12 +1355,13 @@ def main() -> None:
     logged_params = set(validation_params)
 
     def record_result(
-        loaded: LoadedModel,
         model_name: str,
+        run_id: str,
         case: EvaluationCase,
         result_sums: dict[str, float],
+        growth_rate: float | None = None,
     ) -> None:
-        soft_dice, hard_dice = _dice_results(result_sums)
+        dice_score = _dice_results(result_sums)
         voxel_volume_cm3 = (200.0 / (args.resolution - 1)) ** 3 / 1000.0
         predicted_volume_cm3 = (
             result_sums["hard_prediction"] * voxel_volume_cm3
@@ -1080,14 +1370,14 @@ def main() -> None:
         rows.append(
             {
                 "model": model_name,
-                "run_id": loaded.run_id,
+                "run_id": run_id,
                 "lesion_id": case.lesion_id,
                 "split": case.split,
                 "target_date": case.target_date,
                 "days_from_endpoint": case.days_from_endpoint,
                 "resolution_per_axis": args.resolution,
-                "soft_dice": soft_dice,
-                "hard_dice_at_0.5": hard_dice,
+                "growth_rate_voxels_per_day": growth_rate,
+                "dice_score": dice_score,
                 "wrongly_predicted_volume_cm3": abs(
                     predicted_volume_cm3 - target_volume_cm3
                 ),
@@ -1122,13 +1412,55 @@ def main() -> None:
                     device,
                 )
 
-            record_result(loaded, loaded.family, case, sums)
+            record_result(loaded.family, loaded.run_id, case, sums)
+
+        if args.plot_contact_sheets:
+            plotted_lesions = set()
+            normal_plot_count = 0
+            contact_sheet_dir = args.output.with_name(
+                f"{args.output.stem}_contact_sheets"
+            )
+            for case in cases:
+                if case.lesion_id in plotted_lesions:
+                    continue
+                plotted_lesions.add(case.lesion_id)
+                normal_plot_count += 1
+                output_path = contact_sheet_dir / (
+                    f"{loaded.family}_normal_{normal_plot_count:02d}_"
+                    f"{case.lesion_id}.png"
+                )
+                if loaded.family == "lstm":
+                    _plot_lstm_contact_sheet(
+                        loaded.model,
+                        case.trajectory,
+                        lstm_datasets[loaded.run_id],
+                        trajectory_indices[case.lesion_id],
+                        output_path,
+                        device,
+                    )
+                else:
+                    embedding_id = (
+                        int(patient_to_idx[case.trajectory.patient_id]) * 100
+                        + int(case.trajectory.label_id)
+                    )
+                    _plot_continuous_contact_sheet(
+                        loaded.model,
+                        case.trajectory,
+                        embedding_id,
+                        output_path,
+                        device,
+                    )
+                if normal_plot_count == 5:
+                    break
 
         model_metrics = _summary_metrics(rows, loaded.family)
         if model_metrics:
             mlflow.log_metrics(model_metrics)
 
-        if args.skip_embedding_test:
+        if (
+            args.skip_embedding_test
+            or loaded.family not in EMBEDDING_SUPPORTED_FAMILIES
+        ):
             continue
 
         if embedding_trajectory is None or embedding_model_idx is None:
@@ -1147,6 +1479,7 @@ def main() -> None:
             None,
             tuple(embedding_trajectory_dates),
         )
+        _seed_embedding_fit(args.embedding_seed)
         fitted_embedding = _fit_embedding(
             loaded,
             embedding_case,
@@ -1159,6 +1492,29 @@ def main() -> None:
             args.embedding_samples_per_epoch,
             device,
         )
+        if args.plot_contact_sheets:
+            output_path = args.output.with_name(
+                f"{args.output.stem}_contact_sheets"
+            ) / f"{loaded.family}_embedding_{embedding_case.lesion_id}.png"
+            if loaded.family == "lstm":
+                _plot_lstm_contact_sheet(
+                    loaded.model,
+                    embedding_trajectory,
+                    embedding_lstm_datasets[loaded.run_id],
+                    0,
+                    output_path,
+                    device,
+                    embedding_override=fitted_embedding,
+                )
+            else:
+                _plot_continuous_contact_sheet(
+                    loaded.model,
+                    embedding_trajectory,
+                    embedding_model_idx,
+                    output_path,
+                    device,
+                    embedding_override=fitted_embedding,
+                )
 
         for date_index, date in enumerate(
             _print_progress(
@@ -1200,12 +1556,87 @@ def main() -> None:
                     embedding_override=fitted_embedding,
                 )
             record_result(
-                loaded, f"{loaded.family}_embedding", trajectory_case, adapted_sums
+                f"{loaded.family}_embedding",
+                loaded.run_id,
+                trajectory_case,
+                adapted_sums,
             )
 
         embedding_metrics = _summary_metrics(rows, f"{loaded.family}_embedding")
         if embedding_metrics:
             mlflow.log_metrics(embedding_metrics)
+
+    for model_name in DILATION_BASELINE_NAMES:
+        for case in _print_progress(
+            cases, f"Evaluating {model_name}", "targets"
+        ):
+            target_volume = _load_target_volume(case)
+            growth_rate = (
+                global_growth_rate
+                if model_name == "dilation_global"
+                else lesion_growth_rates[case.lesion_id]
+            )
+            sums = _infer_dilation_baseline(
+                case,
+                target_volume,
+                growth_rate,
+                args.resolution,
+                args.chunk_size,
+            )
+            record_result(
+                model_name,
+                "computed",
+                case,
+                sums,
+                growth_rate=growth_rate,
+            )
+        baseline_metrics = _summary_metrics(rows, model_name)
+        if baseline_metrics:
+            mlflow.log_metrics(baseline_metrics)
+        if (
+            not args.skip_embedding_test
+            and embedding_trajectory is not None
+            and embedding_dilation_growth_rate is not None
+        ):
+            embedding_growth_rate = (
+                global_growth_rate
+                if model_name == "dilation_global"
+                else embedding_dilation_growth_rate
+            )
+            embedding_model_name = f"{model_name}_embedding"
+            for date_index, date in enumerate(
+                _print_progress(
+                    embedding_trajectory_dates,
+                    f"Evaluating {embedding_model_name}",
+                    "timepoints",
+                )
+            ):
+                embedding_case = EvaluationCase(
+                    f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]}",
+                    embedding_trajectory,
+                    "trajectory",
+                    date,
+                    None,
+                    tuple(embedding_trajectory_dates[:date_index]) or (date,),
+                )
+                target_volume = _load_target_volume(embedding_case)
+                sums = _infer_dilation_baseline(
+                    embedding_case,
+                    target_volume,
+                    embedding_growth_rate,
+                    args.resolution,
+                    args.chunk_size,
+                )
+                record_result(
+                    embedding_model_name,
+                    "computed",
+                    embedding_case,
+                    sums,
+                    growth_rate=embedding_growth_rate,
+                )
+            embedding_metrics = _summary_metrics(rows, embedding_model_name)
+            if embedding_metrics:
+                mlflow.log_metrics(embedding_metrics)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="", encoding="utf-8") as file:
@@ -1214,65 +1645,64 @@ def main() -> None:
         writer.writerows(rows)
 
     print(f"\nPer-target results written to {args.output}")
+    model_names_to_summarize = []
     for loaded in models:
         model_names = [loaded.family]
-        if not args.skip_embedding_test:
+        if (
+            not args.skip_embedding_test
+            and loaded.family in EMBEDDING_SUPPORTED_FAMILIES
+        ):
             model_names.append(f"{loaded.family}_embedding")
-        for model_name in model_names:
-            splits = (
-                ("trajectory",)
-                if model_name.endswith("_embedding")
-                else ("interpolation", "extrapolation")
-            )
-            for split in splits:
-                split_rows = [
-                    row
-                    for row in rows
-                    if row["model"] == model_name and row["split"] == split
+        model_names_to_summarize.extend(model_names)
+    model_names_to_summarize.extend(DILATION_BASELINE_NAMES)
+    if not args.skip_embedding_test and embedding_trajectory is not None:
+        model_names_to_summarize.extend(
+            f"{name}_embedding" for name in DILATION_BASELINE_NAMES
+        )
+    for model_name in model_names_to_summarize:
+        splits = (
+            ("trajectory",)
+            if model_name.endswith("_embedding")
+            else ("interpolation", "extrapolation")
+        )
+        for split in splits:
+            split_rows = [
+                row
+                for row in rows
+                if row["model"] == model_name and row["split"] == split
+            ]
+            if split_rows:
+                prefix = f"{model_name}_{split}"
+                dice_score = float(
+                    np.mean([row["dice_score"] for row in split_rows])
+                )
+                volume_errors = [
+                    row["wrongly_predicted_volume_cm3"] for row in split_rows
                 ]
-                if split_rows:
-                    prefix = f"{model_name}_{split}"
-                    dice_loss = float(
-                        np.mean([1.0 - row["soft_dice"] for row in split_rows])
-                    )
-                    volume_errors = [
-                        row["wrongly_predicted_volume_cm3"] for row in split_rows
-                    ]
-                    validation_params.update(
-                        {
-                            f"{prefix}_dice_loss": str(dice_loss),
-                            f"{prefix}_dice_score": str(1.0 - dice_loss),
-                            f"{prefix}_median_wrongly_predicted_volume_cm3": str(
-                                float(np.median(volume_errors))
-                            ),
-                            f"{prefix}_average_wrongly_predicted_volume_cm3": str(
-                                float(np.mean(volume_errors))
-                            ),
-                            f"{prefix}_wrongly_predicted_volume_cm3": str(
-                                float(np.sum(volume_errors))
-                            ),
-                            f"{prefix}_hard_dice_score": str(
-                                float(
-                                    np.mean(
-                                        [
-                                            row["hard_dice_at_0.5"]
-                                            for row in split_rows
-                                        ]
-                                    )
-                                )
-                            ),
-                        }
-                    )
-                    print(
-                        f"{model_name} {split}: "
-                        f"dice loss={dice_loss:.5f}, "
-                        f"dice score={1.0 - dice_loss:.5f}, "
-                        f"median volume error={np.median(volume_errors):.5f} cm^3, "
-                        f"average volume error={np.mean(volume_errors):.5f} cm^3, "
-                        f"total volume error={np.sum(volume_errors):.5f} cm^3, "
-                        f"hard Dice={np.mean([row['hard_dice_at_0.5'] for row in split_rows]):.5f} "
-                        f"(n={len(split_rows)})"
-                    )
+                validation_params.update(
+                    {
+                        f"{prefix}_dice_loss": str(1.0 - dice_score),
+                        f"{prefix}_dice_score": str(dice_score),
+                        f"{prefix}_median_wrongly_predicted_volume_cm3": str(
+                            float(np.median(volume_errors))
+                        ),
+                        f"{prefix}_average_wrongly_predicted_volume_cm3": str(
+                            float(np.mean(volume_errors))
+                        ),
+                        f"{prefix}_wrongly_predicted_volume_cm3": str(
+                            float(np.sum(volume_errors))
+                        ),
+                    }
+                )
+                print(
+                    f"{model_name} {split}: "
+                    f"dice loss={1.0 - dice_score:.5f}, "
+                    f"dice score={dice_score:.5f}, "
+                    f"median volume error={np.median(volume_errors):.5f} cm^3, "
+                    f"average volume error={np.mean(volume_errors):.5f} cm^3, "
+                    f"total volume error={np.sum(volume_errors):.5f} cm^3, "
+                    f"(n={len(split_rows)})"
+                )
     summary_params = {
         key: value
         for key, value in validation_params.items()

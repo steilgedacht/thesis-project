@@ -4,6 +4,7 @@ import json
 import argparse
 import matplotlib
 import importlib.util
+import sys
 from pathlib import Path
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -16,6 +17,8 @@ from utils.mri_dataloader import MRI_Dataloader
 from utils.dataloader import LesionDataset, Plotting_LesionDataset
 from utils.train_plotting import plot_lesion_time_evolution, plot_contanct_sheet
 from utils.loss_bce_dice import Loss_BCE_Dice
+from utils import model_neural_ode_validation
+from utils import model_neural_ode_translation_validation
 
 mlflow.set_tracking_uri("http://127.0.0.1:5124")
 mlflow.set_experiment("Lesion_Embedding")
@@ -35,6 +38,25 @@ def add_base_configurations(config):
         if not hasattr(config, key):
             setattr(config, key, value)
     return config
+
+
+def load_mlflow_model(model_uri: str):
+    validation_modules = {
+        "utils.model_neural_ode": model_neural_ode_validation,
+        "utils.model_neural_ode_translation": model_neural_ode_translation_validation,
+    }
+    original_modules = {
+        name: sys.modules.get(name) for name in validation_modules
+    }
+    sys.modules.update(validation_modules)
+    try:
+        return mlflow.pytorch.load_model(model_uri)
+    finally:
+        for name, module in original_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def _dataset_item_to_trajectory_and_date(item):
@@ -306,8 +328,8 @@ with mlflow.start_run(run_name="embedding learning", tags={"type" : "new_patient
     train_loader = DataLoader(train_dataset, batch_size=5, shuffle=True, num_workers=7, prefetch_factor=2, pin_memory=True, persistent_workers=True)
     plotting_LesionDataset = Plotting_LesionDataset(trj)
 
-    run_id = "f82c0dc523134b0699c17c7b16e7a3d7"
+    run_id = "fbebcf52c99c43b39228e42cf7539832"
     model_uri = f"runs:/{run_id}/lesion_ode_model"
-    model = mlflow.pytorch.load_model(model_uri)
+    model = load_mlflow_model(model_uri)
 
     losses = fit_trajectory_to_model(model, train_loader, plotting_LesionDataset, config=config, epochs=100, lr=1., device=device)

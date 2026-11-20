@@ -92,22 +92,26 @@ class FourierFeatures(nn.Module):
 
 
 class LatentODEFunc(nn.Module):
-    """f_theta(z, cond) -> dz/dt. `cond` (the patient embedding) is fed in
-    at every ODE step so the dynamics themselves are patient-specific, not
-    just the initial condition."""
     def __init__(self, latent_dim, cond_dim, hidden_dim=128, n_layers=2):
         super().__init__()
-        layers = [nn.Linear(latent_dim + cond_dim, hidden_dim), nn.Tanh()]
-        for _ in range(n_layers - 1):
-            layers += [nn.Linear(hidden_dim, hidden_dim), nn.Tanh()]
-        output_layer = nn.Linear(hidden_dim, latent_dim)
-        nn.init.zeros_(output_layer.weight)
-        nn.init.zeros_(output_layer.bias)
-        layers += [output_layer]
-        self.net = nn.Sequential(*layers)
+        self.inp = nn.Linear(latent_dim + cond_dim, hidden_dim)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.Tanh(),
+            )
+            for _ in range(n_layers - 1)
+        ])
+        self.out = nn.Linear(hidden_dim, latent_dim)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
 
     def forward(self, z, cond):
-        return self.net(torch.cat([z, cond], dim=-1))
+        h = self.inp(torch.cat([z, cond], dim=-1))
+        for block in self.blocks:
+            h = h + block(h)
+        return self.out(h)
 
 
 class FixedStepODESolver(nn.Module):
