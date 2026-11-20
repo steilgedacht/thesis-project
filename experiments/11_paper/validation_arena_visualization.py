@@ -15,7 +15,8 @@ import plotly.express as px
 import streamlit as st
 
 DEFAULT_URI = "http://localhost:5124"
-DEFAULT_RUN_ID = "7ac3df95f6674199b297889000b27ce8"
+DEFAULT_EXPERIMENT_ID = "9"  # Uniform Grid Validation
+DEFAULT_EXPERIMENT_NAME = "Uniform Grid Validation"
 
 # Order matters: longest suffixes first so "median_wrongly_..." is not
 # mistaken for "wrongly_predicted_volume_cm3".
@@ -47,16 +48,21 @@ def parse_metric(name: str):
     return None
 
 
-@st.cache_data(ttl=60, show_spinner="Loading from MLflow ...")
+@st.cache_data(ttl=60, show_spinner="Loading experiments ...")
 def load_experiments(uri: str):
+    """{experiment_id: experiment_name}"""
     mlflow.set_tracking_uri(uri)
-    return {e.name: e.experiment_id for e in mlflow.search_experiments()}
+    return {e.experiment_id: e.name for e in mlflow.search_experiments()}
 
 
 @st.cache_data(ttl=60, show_spinner="Loading runs ...")
 def load_runs(uri: str, experiment_id: str) -> pd.DataFrame:
     mlflow.set_tracking_uri(uri)
-    return mlflow.search_runs(experiment_ids=[experiment_id], max_results=5000)
+    return mlflow.search_runs(
+        experiment_ids=[experiment_id],
+        max_results=5000,
+        order_by=["attributes.start_time DESC"],
+    )
 
 
 @st.cache_data(ttl=60, show_spinner="Loading run ...")
@@ -71,6 +77,19 @@ def load_runs_by_id(uri: str, run_ids: tuple) -> pd.DataFrame:
         row.update({f"metrics.{k}": v for k, v in run.data.metrics.items()})
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def run_label(r: pd.Series) -> str:
+    """Readable label for the run picker."""
+    name = r.get("tags.mlflow.runName") or r["run_id"][:8]
+    label = f"{name} ({r['run_id'][:6]})"
+    start = r.get("start_time")
+    if pd.notna(start):
+        label += f" · {pd.Timestamp(start):%Y-%m-%d %H:%M}"
+    status = r.get("status")
+    if isinstance(status, str) and status != "FINISHED":
+        label += f" · {status}"
+    return label
 
 
 def to_long(runs: pd.DataFrame) -> pd.DataFrame:
@@ -93,34 +112,68 @@ def to_long(runs: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------- sidebar
+# ---------------------------------------------------------------- sidebar: data source
 with st.sidebar:
     st.header("Connection")
     uri = st.text_input("Tracking URI", DEFAULT_URI)
     if st.button("Refresh"):
         st.cache_data.clear()
 
-with st.sidebar:
-    run_ids_text = st.text_input(
-        "Run ID(s), comma-separated (leave empty to browse an experiment)",
-        DEFAULT_RUN_ID,
+    manual_ids_text = ""
+    try:
+        experiments = load_experiments(uri)
+    except Exception as e:
+        st.error(f"Could not load experiments from MLflow at {uri}\n\n{e}")
+        st.stop()
+
+    st.header("Experiment & Run")
+    exp_ids = list(experiments)
+    if DEFAULT_EXPERIMENT_ID in experiments:
+        default_idx = exp_ids.index(DEFAULT_EXPERIMENT_ID)
+    else:
+        by_name = [i for i, n in experiments.items() if n == DEFAULT_EXPERIMENT_NAME]
+        default_idx = exp_ids.index(by_name[0]) if by_name else 0
+    exp_id = st.selectbox(
+        "Experiment",
+        exp_ids,
+        index=default_idx,
+        format_func=lambda i: f"{experiments[i]} (id {i})",
     )
-run_ids = tuple(r.strip() for r in run_ids_text.split(",") if r.strip())
+
+    try:
+        exp_runs = load_runs(uri, exp_id)
+    except Exception as e:
+        st.error(f"Could not load runs\n\n{e}")
+        st.stop()
+
+    if exp_runs.empty:
+        st.warning("This experiment has no runs.")
+        st.stop()
+
+    labels = {r["run_id"]: run_label(r) for _, r in exp_runs.iterrows()}
+    sel_run_ids = st.multiselect(
+        "Run(s)",
+        list(labels),
+        default=list(labels)[:1],  # newest run
+        format_func=lambda rid: labels[rid],
+    )
+
+    with st.expander("Or enter run ID(s) manually"):
+        manual_ids_text = st.text_input("Run ID(s), comma-separated", "")
+
+manual_ids = tuple(r.strip() for r in manual_ids_text.split(",") if r.strip())
 
 try:
-    if run_ids:
-        runs_raw = load_runs_by_id(uri, run_ids)
+    if manual_ids:
+        runs_raw = load_runs_by_id(uri, manual_ids)
     else:
-        experiments = load_experiments(uri)
-        with st.sidebar:
-            exp_name = st.selectbox("Experiment", list(experiments))
-        runs_raw = load_runs(uri, experiments[exp_name])
+        runs_raw = exp_runs[exp_runs["run_id"].isin(sel_run_ids)]
 except Exception as e:
-    st.error(f"Could not load from MLflow at {uri}\n\n{e}")
+    st.error(f"Could not load runs from MLflow at {uri}\n\n{e}")
     st.stop()
 
 if runs_raw.empty:
-    st.warning("No runs found.")
+    st.info("Select at least one run in the sidebar.")
     st.stop()
 
 df = to_long(runs_raw)
@@ -128,23 +181,22 @@ if df.empty:
     st.warning("No metrics matched the <method>_<eval>_<metric> naming scheme.")
     st.stop()
 
+# ---------------------------------------------------------------- sidebar: filters
 with st.sidebar:
     st.header("Filters")
-    all_runs = sorted(df["run"].unique())
-    sel_runs = st.multiselect("Runs", all_runs, default=all_runs[:5])
     sel_methods = st.multiselect(
         "Methods", sorted(df["method"].unique()), default=sorted(df["method"].unique())
     )
     sel_evals = st.multiselect(
         "Evaluations", sorted(df["eval"].unique()), default=sorted(df["eval"].unique())
     )
+    use_log = st.checkbox("Log y-axis", value=False)
 
-df = df[df["run"].isin(sel_runs) & df["method"].isin(sel_methods) & df["eval"].isin(sel_evals)]
+df = df[df["method"].isin(sel_methods) & df["eval"].isin(sel_evals)]
 if df.empty:
     st.info("Nothing selected.")
     st.stop()
 
-use_log = st.sidebar.checkbox("Log y-axis", value=False)
 multi = df["run"].nunique() > 1
 EVAL_ORDER = {"eval": ["interpolation", "extrapolation", "embedding_trajectory"]}
 
