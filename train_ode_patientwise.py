@@ -1,7 +1,10 @@
 """Patient-wise ODE training with dense, target-lesion crop validation."""
 
 import argparse
+import importlib.util
 import os
+from pathlib import Path
+import sys
 
 import mlflow
 import numpy as np
@@ -15,6 +18,27 @@ from utils.dataloader_patient import (
     PatientLesionCropInterpolationDataset,
 )
 from utils.mri_dataloader import MRI_Dataloader
+
+
+def load_patient_plotting():
+    plotting_path = (
+        Path(__file__).resolve().parent
+        / "experiments"
+        / "12_patient-specific"
+        / "patient_plotting.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "patient_specific_plotting", plotting_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load patient plotting module from {plotting_path}.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+patient_plotting = load_patient_plotting()
 
 
 def validate_patient_polation(data_loader, text, plot, global_step, criterion):
@@ -108,9 +132,15 @@ def train_patientwise(
 ):
     """Reuse the existing training loop with the patient-wise dense evaluator."""
     original_validator = lesion_training.validate_polation
+    original_contact_sheet = lesion_training.plot_contanct_sheet
+    original_time_evolution = lesion_training.plot_lesion_time_evolution
     lesion_training.config = config
     lesion_training.model = model
     lesion_training.validate_polation = validate_patient_polation
+    lesion_training.plot_contanct_sheet = patient_plotting.plot_patient_contact_sheet
+    lesion_training.plot_lesion_time_evolution = (
+        patient_plotting.plot_patient_time_evolution
+    )
     try:
         return lesion_training.train_inr(
             model,
@@ -122,6 +152,8 @@ def train_patientwise(
         )
     finally:
         lesion_training.validate_polation = original_validator
+        lesion_training.plot_contanct_sheet = original_contact_sheet
+        lesion_training.plot_lesion_time_evolution = original_time_evolution
 
 
 def main():
@@ -190,14 +222,7 @@ def main():
             valid_extrapolation_dataset, batch_size=1, shuffle=False
         )
 
-        plotting_dataset_class = getattr(
-            config, "plotting_dataset_class", None
-        )
-        plotting_dataset = (
-            plotting_dataset_class(trajectories.copy())
-            if plotting_dataset_class is not None
-            else []
-        )
+        plotting_dataset = patient_plotting.PatientPlottingDataset(trajectories)
 
         max_embedding_id = max(
             train_dataset.get_embedding_id(trj) for trj in trajectories

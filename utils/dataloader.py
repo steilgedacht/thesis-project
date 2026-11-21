@@ -43,7 +43,8 @@ class LesionDataset(Dataset):
             interpolation_index = int(self.validation_samples[l_id]["interpolation"])
 
             dates_list = [date for date in dates_list if date not in extrapolation_time]
-            dates_list.pop(interpolation_index)
+            if interpolation_index >= 0:  # -1 = no interpolation scan
+                dates_list.pop(interpolation_index)
 
         random_time_point = str(np.random.choice(dates_list))
 
@@ -183,7 +184,12 @@ class Validation_Interpolation_LesionDataset(LesionDataset):
                  dialation_iterations=5, 
                  background_samples=3000):
         super().__init__(trajectories, device=device, dialation_iterations=dialation_iterations, background_samples=background_samples)
-        self.trajectories = [trj for trj in self.trajectories if f"{trj.patient_id}_{trj.label_id}" in self.validation_patients]
+        # interpolation == -1 means the lesion has no interpolation scan.
+        self.trajectories = [
+            trj for trj in self.trajectories
+            if f"{trj.patient_id}_{trj.label_id}" in self.validation_patients
+            and int(self.validation_samples[f"{trj.patient_id}_{trj.label_id}"]["interpolation"]) >= 0
+        ]
 
     def __getitem__(self, idx):
         trj = self.trajectories[idx]

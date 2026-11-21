@@ -25,4 +25,4 @@ singularity instance start --nv thesis.sif "$INSTANCE_NAME"
 trap 'singularity instance stop "$INSTANCE_NAME"' EXIT
 
 singularity exec --nv instance://"$INSTANCE_NAME" \
-    bash -c "cd /home/optima/bbergmann/projects/thesis && python3.11 train_ode_patientwise.py"
+    bash -c "cd /home/optima/bbergmann/projects/thesis && python3.11 train_ode_patientwise.py --config configs/06_neural_ode/config_patient_wise.py"

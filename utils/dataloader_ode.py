@@ -21,7 +21,8 @@ class FourTimepointLesionDataset(LesionDataset):
             validation = self.validation_samples[lesion_id]
             extrapolation_dates = validation["extrapolation_dates"]
             dates = [date for date in dates if date not in extrapolation_dates]
-            dates.pop(int(validation["interpolation"]))
+            if int(validation["interpolation"]) >= 0:  # -1 = no interpolation scan
+                dates.pop(int(validation["interpolation"]))
 
         return sorted(dates, key=str)
 

@@ -69,16 +69,30 @@ class PatientDataset(LesionDataset):
         held_out_dates = set()
 
         for trj in trajectories:
-            dates = list(trj.allowed_dates if hasattr(trj, "allowed_dates") else trj.dates)
+            dates = [
+                str(date)
+                for date in (
+                    trj.allowed_dates if hasattr(trj, "allowed_dates") else trj.dates
+                )
+            ]
             lesion_id = f"{trj.patient_id}_{trj.label_id}"
             if lesion_id in self.validation_samples:
                 validation = self.validation_samples[lesion_id]
-                extrapolation_dates = set(validation["extrapolation_dates"])
-                dates = [date for date in dates if date not in extrapolation_dates]
+                extrapolation_dates = {
+                    str(date) for date in validation["extrapolation_dates"]
+                }
                 held_out_dates.update(extrapolation_dates)
                 interpolation_index = int(validation["interpolation"])
-                held_out_dates.add(dates.pop(interpolation_index))
-            training_dates.update(str(date) for date in dates)
+                if not 0 <= interpolation_index < len(dates):
+                    raise ValueError(
+                        f"Invalid interpolation index for lesion {lesion_id}."
+                    )
+                held_out_dates.add(dates[interpolation_index])
+                training_dates.update(
+                    date for date in dates if date not in extrapolation_dates
+                )
+            else:
+                training_dates.update(dates)
 
         dates = sorted(training_dates - held_out_dates)
         if not dates:
@@ -135,7 +149,12 @@ class PatientDataset(LesionDataset):
 
         for trj in trajectories:
             lesion_union, lesion_affine = self._load_lesion_union(trj)
-            trajectory_dates = {str(date) for date in trj.dates}
+            trajectory_dates = {
+                str(date)
+                for date in (
+                    trj.allowed_dates if hasattr(trj, "allowed_dates") else trj.dates
+                )
+            }
 
             if unavailable_union is None:
                 unavailable_union = np.zeros_like(lesion_union)

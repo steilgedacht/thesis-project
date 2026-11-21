@@ -26,10 +26,15 @@ lesions and each model's fitted-embedding trajectory.
 import argparse
 import ast
 import csv
+import hashlib
 import json
+import os
 import random
 import sys
+import tempfile
 import time
+import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,6 +56,13 @@ from utils.model_lstm import LesionLSTM, LesionLatentLSTM
 from utils.model_dialation_patient_specific import calculate_lesion_growth_rate
 from utils import model_neural_ode_validation
 from utils import model_neural_ode_translation_validation
+from utils.model_point_lstm import PointLSTM
+from utils.dataloader_point_lstm import (
+    ScanCache,
+    batch_to_device,
+    collate_history,
+    history_arrays,
+)
 from utils.mri_dataloader import MRI_Dataloader
 from utils.paths import DatasetPaths
 
@@ -62,10 +74,15 @@ MODEL_CLASSES = {
         model_neural_ode_translation_validation.NeuralODETranslationINR,
     ),
     "lstm": (LesionLSTM, LesionLatentLSTM),
+    "plstm": (PointLSTM,),
 }
 EMBEDDING_SUPPORTED_FAMILIES = {"inr", "node", "lstm"}
 DILATION_BASELINE_NAMES = ("dilation_global", "dilation_lesion_specific")
 EMBEDDING_TRAJECTORY = ("YG_WCONBI42RLEZ", 1)
+VALIDATION_CACHE_DIR = (
+    Path(__file__).resolve().parent / "cache" / "validation_arena"
+)
+CACHE_VERSION = 2
 
 
 def _print_progress(iterable, description, unit, interval_seconds=30.0):
@@ -285,12 +302,26 @@ def _make_cases(
                     )
                 )
         if split in ("both", "extrapolation"):
-            held_out_dates = sample["extrapolation_dates"]
+            held_out_list = [str(date) for date in sample["extrapolation_dates"]]
+            held_out_dates = set(held_out_list)
             held_out_steps = sample["extrapolation_T_minus"]
-            history = tuple(
-                str(date) for date in dates if date not in held_out_dates
+            interpolation_index = int(sample["interpolation"])
+            # -1 means the lesion has no interpolation scan.
+            interpolation_date = (
+                str(dates[interpolation_index]) if interpolation_index != -1 else None
             )
-            for step, date in zip(held_out_steps, held_out_dates):
+            if interpolation_date is not None and interpolation_date in held_out_dates:
+                raise ValueError(
+                    f"{lesion_id}: interpolation date {interpolation_date} is also "
+                    "an extrapolation date."
+                )
+            history = tuple(
+                str(date)
+                for date in dates
+                if str(date) not in held_out_dates
+                and str(date) != interpolation_date
+            )
+            for step, date in zip(held_out_steps, held_out_list):
                 cases.append(
                     EvaluationCase(
                         lesion_id,
@@ -428,6 +459,191 @@ def _dice_results(sums: dict[str, float]) -> float:
     ) / (sums["hard_prediction"] + sums["target"] + 1e-6)
 
 
+def _cache_run_component(run_id: str) -> str:
+    component = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in run_id
+    )
+    return component or "unknown-run"
+
+
+def _prediction_cache_path(
+    run_id: str,
+    model_name: str,
+    case: EvaluationCase,
+    resolution: int,
+    chunk_size: int,
+    device: torch.device,
+    growth_rate: float | None = None,
+    inference_key: str | None = None,
+) -> Path:
+    cache_key = json.dumps(
+        {
+            "version": CACHE_VERSION,
+            "run_id": run_id,
+            "model": model_name,
+            "lesion_id": case.lesion_id,
+            "split": case.split,
+            "target_date": case.target_date,
+            "days_from_endpoint": case.days_from_endpoint,
+            "history_dates": case.history_dates,
+            "resolution": resolution,
+            "chunk_size": chunk_size,
+            "device": str(device),
+            "growth_rate": growth_rate,
+            "inference_key": inference_key,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+    run_dir = VALIDATION_CACHE_DIR / _cache_run_component(run_id)
+    return run_dir / f"{digest}.npz"
+
+
+def _load_cached_masks(
+    path: Path, point_count: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if not path.is_file():
+        return None
+    with np.load(path, allow_pickle=False) as cache:
+        cached_point_count = int(cache["point_count"])
+        if cached_point_count != point_count:
+            raise ValueError(
+                f"Cached evaluation at {path} has {cached_point_count} points; "
+                f"expected {point_count}."
+            )
+        expected_bytes = (point_count + 7) // 8
+        predictions = np.asarray(cache["predictions"], dtype=np.uint8)
+        targets = np.asarray(cache["targets"], dtype=np.uint8)
+        if predictions.size != expected_bytes or targets.size != expected_bytes:
+            raise ValueError(f"Cached evaluation at {path} has invalid mask data.")
+        return (
+            np.unpackbits(predictions, count=point_count).astype(bool, copy=False),
+            np.unpackbits(targets, count=point_count).astype(bool, copy=False),
+        )
+
+
+def _save_cached_masks(
+    path: Path,
+    point_count: int,
+    predictions: np.ndarray,
+    targets: np.ndarray,
+) -> None:
+    predictions = np.asarray(predictions, dtype=bool).reshape(-1)
+    targets = np.asarray(targets, dtype=bool).reshape(-1)
+    if predictions.size != point_count or targets.size != point_count:
+        raise ValueError(
+            "Evaluation masks do not match the requested number of query points."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, suffix=".npz", delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            np.savez_compressed(
+                temporary_file,
+                point_count=np.int64(point_count),
+                predictions=np.packbits(predictions),
+                targets=np.packbits(targets),
+            )
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _cached_case_sums(
+    path: Path,
+    case: EvaluationCase,
+    point_count: int,
+    infer: Callable[
+        [TargetVolume], tuple[np.ndarray, np.ndarray]
+    ],
+) -> dict[str, float]:
+    masks = _load_cached_masks(path, point_count)
+    if masks is None:
+        target_volume = _load_target_volume(case)
+        masks = infer(target_volume)
+        _save_cached_masks(path, point_count, *masks)
+
+    sums: dict[str, float] = {
+        "target": 0.0,
+        "hard_prediction": 0.0,
+        "hard_intersection": 0.0,
+    }
+    _dice_sums(sums, *masks)
+    return sums
+
+
+def _embedding_cache_path(
+    loaded: LoadedModel,
+    args: argparse.Namespace,
+    trajectory_dates: list[str],
+    device: torch.device,
+) -> Path:
+    cache_key = json.dumps(
+        {
+            "version": CACHE_VERSION,
+            "run_id": loaded.run_id,
+            "model": loaded.family,
+            "epochs": args.embedding_epochs,
+            "combination_epochs": args.embedding_combination_epochs,
+            "learning_rate": args.embedding_lr,
+            "batch_size": args.embedding_batch_size,
+            "samples_per_epoch": args.embedding_samples_per_epoch,
+            "seed": args.embedding_seed,
+            "trajectory": EMBEDDING_TRAJECTORY,
+            "trajectory_dates": trajectory_dates,
+            "device": str(device),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+    run_dir = VALIDATION_CACHE_DIR / _cache_run_component(loaded.run_id)
+    return run_dir / f"embedding-{digest}.npy"
+
+
+def _load_or_fit_embedding(
+    path: Path,
+    device: torch.device,
+    fit: Callable[[], torch.Tensor],
+) -> torch.Tensor:
+    if path.is_file():
+        embedding = np.load(path, allow_pickle=False)
+        if embedding.ndim != 1 or not np.isfinite(embedding).all():
+            raise ValueError(f"Cached embedding at {path} is invalid.")
+        return torch.from_numpy(embedding).to(device)
+
+    fitted_embedding = fit()
+    embedding_array = (
+        fitted_embedding.detach().to(device="cpu", dtype=torch.float32).numpy()
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, suffix=".npy", delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            np.save(temporary_file, embedding_array, allow_pickle=False)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    return fitted_embedding
+
+
+def _embedding_fingerprint(embedding: torch.Tensor) -> str:
+    embedding_array = (
+        embedding.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+    )
+    return hashlib.sha256(embedding_array.tobytes()).hexdigest()
+
+
 def _summary_metrics(rows: list[dict[str, Any]], model_name: str) -> dict[str, float]:
     metrics = {}
     for split in ("interpolation", "extrapolation", "trajectory"):
@@ -461,28 +677,41 @@ def _summary_metrics(rows: list[dict[str, Any]], model_name: str) -> dict[str, f
     return metrics
 
 
-def _average_metric(rows: list[dict[str, Any]], metric: str) -> float:
-    if rows[0]["split"] != "extrapolation":
-        return float(np.mean([row[metric] for row in rows]))
-
-    values_by_lesion: dict[str, list[float]] = {}
-    weights_by_lesion: dict[str, float] = {}
+def _extrapolation_weights(rows: list[dict[str, Any]]) -> dict[str, float]:
+    timepoints_by_lesion: dict[str, int] = {}
     for row in rows:
         lesion_id = row["lesion_id"]
-        values_by_lesion.setdefault(lesion_id, []).append(row[metric])
         timepoint_count = row["extrapolation_timepoints"]
         if timepoint_count is None or timepoint_count < 1:
             raise ValueError(
                 f"Invalid extrapolation timepoint count for lesion {lesion_id}."
             )
-        weights_by_lesion[lesion_id] = float(timepoint_count)
-    max_timepoints = max(weights_by_lesion.values())
-    lesion_weights = [
-        weight / max_timepoints for weight in weights_by_lesion.values()
-    ]
+        previous_count = timepoints_by_lesion.setdefault(
+            lesion_id, int(timepoint_count)
+        )
+        if previous_count != timepoint_count:
+            raise ValueError(
+                f"Inconsistent extrapolation timepoint count for lesion {lesion_id}."
+            )
+    max_timepoints = max(timepoints_by_lesion.values())
+    return {
+        lesion_id: timepoint_count / max_timepoints
+        for lesion_id, timepoint_count in timepoints_by_lesion.items()
+    }
+
+
+def _average_metric(rows: list[dict[str, Any]], metric: str) -> float:
+    if rows[0]["split"] != "extrapolation":
+        return float(np.mean([row[metric] for row in rows]))
+
+    values_by_lesion: dict[str, list[float]] = {}
+    for row in rows:
+        values_by_lesion.setdefault(row["lesion_id"], []).append(row[metric])
+    weights = _extrapolation_weights(rows)
     lesion_averages = [
         float(np.mean(values)) for values in values_by_lesion.values()
     ]
+    lesion_weights = [weights[lesion_id] for lesion_id in values_by_lesion]
     return float(np.average(lesion_averages, weights=lesion_weights))
 
 
@@ -506,13 +735,10 @@ def _infer_continuous_model(
     chunk_size: int,
     device: torch.device,
     embedding_override: torch.Tensor | None = None,
-) -> dict[str, float]:
+) -> tuple[np.ndarray, np.ndarray]:
     count = resolution**3
-    sums = {
-        "target": 0.0,
-        "hard_prediction": 0.0,
-        "hard_intersection": 0.0,
-    }
+    predictions = np.empty(count, dtype=bool)
+    target_mask = np.empty(count, dtype=bool)
     patient_tensor = torch.tensor([patient_idx], dtype=torch.long, device=device)
 
     hook = (
@@ -528,17 +754,18 @@ def _infer_continuous_model(
                 "chunks",
             ):
                 end = min(start + chunk_size, count)
-                coords, targets = _coordinates_and_labels(
+                coords, chunk_targets = _coordinates_and_labels(
                     target_volume, start, end, resolution
                 )
                 coords_tensor = torch.from_numpy(coords).unsqueeze(0).to(device)
                 logits = loaded.model(coords_tensor, patient_tensor).reshape(-1)
                 probabilities = torch.sigmoid(logits).cpu().numpy()
-                _dice_sums(sums, probabilities, targets)
+                predictions[start:end] = probabilities >= 0.5
+                target_mask[start:end] = chunk_targets
     finally:
         if hook is not None:
             hook.remove()
-    return sums
+    return predictions, target_mask
 
 
 def _infer_dilation_baseline(
@@ -547,15 +774,16 @@ def _infer_dilation_baseline(
     growth_rate: float,
     resolution: int,
     chunk_size: int,
-) -> dict[str, float]:
+) -> tuple[np.ndarray, np.ndarray]:
     trajectory = case.trajectory
     dates = list(
         trajectory.allowed_dates
         if hasattr(trajectory, "allowed_dates")
         else trajectory.dates
     )
+    history_dates = case.history_dates or tuple(str(date) for date in dates)
     (base_labels, base_time), affine = trajectory.load_labels_for_inr(
-        selected_date=str(dates[0]),
+        selected_date=str(history_dates[-1]),
         absolute_day_number=True,
         affine=True,
     )
@@ -571,16 +799,12 @@ def _infer_dilation_baseline(
     volume_center_voxel = (np.asarray(base_mask.shape, dtype=np.float64) - 1) / 2
     volume_center_phys = affine[:3, :3] @ volume_center_voxel + affine[:3, 3]
     inverse_affine = np.linalg.inv(affine)
-    positive_probability = 1.0 / (1.0 + np.exp(-15.0))
-    negative_probability = 1.0 / (1.0 + np.exp(15.0))
-    sums = {
-        "target": 0.0,
-        "hard_prediction": 0.0,
-        "hard_intersection": 0.0,
-    }
+    count = resolution**3
+    predictions = np.empty(count, dtype=bool)
+    targets_array = np.empty(count, dtype=bool)
 
-    for start in range(0, resolution**3, chunk_size):
-        end = min(start + chunk_size, resolution**3)
+    for start in range(0, count, chunk_size):
+        end = min(start + chunk_size, count)
         coords, targets = _coordinates_and_labels(
             target_volume, start, end, resolution
         )
@@ -598,12 +822,10 @@ def _infer_dilation_baseline(
         sampled_mask = predicted_mask[
             pixel_coords[:, 0], pixel_coords[:, 1], pixel_coords[:, 2]
         ]
-        probabilities = np.where(
-            sampled_mask, positive_probability, negative_probability
-        )
-        _dice_sums(sums, probabilities, targets)
+        predictions[start:end] = sampled_mask
+        targets_array[start:end] = targets
 
-    return sums
+    return predictions, targets_array
 
 
 def _lstm_dataset(
@@ -744,7 +966,7 @@ def _infer_lstm(
     chunk_size: int,
     device: torch.device,
     embedding_override: torch.Tensor | None = None,
-) -> dict[str, float]:
+) -> tuple[np.ndarray, np.ndarray]:
     if not case.history_dates:
         raise ValueError(
             f"No observed history for {case.lesion_id} at {case.target_date}."
@@ -788,12 +1010,9 @@ def _infer_lstm(
 
     extent = float(resampled["extent"])
     center = np.asarray(resampled["center"], dtype=np.float64)
-    sums = {
-        "target": 0.0,
-        "hard_prediction": 0.0,
-        "hard_intersection": 0.0,
-    }
     count = resolution**3
+    predictions = np.empty(count, dtype=bool)
+    targets_array = np.empty(count, dtype=bool)
     for start in _print_progress(
         range(0, count, chunk_size),
         f"LSTM {case.target_date} grid",
@@ -830,8 +1049,72 @@ def _infer_lstm(
             ).reshape(-1)
             probabilities = sampled_probabilities.cpu().numpy()
         probabilities[~in_bounds] = 0.0
-        _dice_sums(sums, probabilities, targets)
-    return sums
+        predictions[start:end] = probabilities >= 0.5
+        targets_array[start:end] = targets
+    return predictions, targets_array
+
+
+def _infer_point_lstm(
+    loaded: LoadedModel,
+    case: EvaluationCase,
+    target_volume: TargetVolume,
+    patient_idx: int,
+    scan_cache: ScanCache,
+    resolution: int,
+    chunk_size: int,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    model = loaded.model
+    history_dates = [
+        date for date in case.history_dates if date != case.target_date
+    ][-model.max_history_len:]
+    if not history_dates:
+        raise ValueError(
+            f"No observed history before {case.target_date} for {case.lesion_id}."
+        )
+
+    dataset_params = _literal_param(loaded.params, "dataset_params", {})
+    ring_mm = (
+        float(dataset_params.get("ring_mm", 3.0))
+        if isinstance(dataset_params, dict)
+        else 3.0
+    )
+    entries = [scan_cache.get(case.trajectory, date) for date in history_dates]
+    rng = np.random.default_rng(
+        zlib.crc32(f"{case.lesion_id}|{case.target_date}".encode())
+    )
+    history = batch_to_device(
+        collate_history([history_arrays(entries, model.history_points, rng, ring_mm)]),
+        device,
+    )
+    patient_tensor = torch.tensor([patient_idx], dtype=torch.long, device=device)
+    target_time = torch.tensor(
+        [target_volume.time_point], dtype=torch.float32, device=device
+    )
+
+    count = resolution**3
+    predictions = np.empty(count, dtype=bool)
+    targets_array = np.empty(count, dtype=bool)
+    with torch.inference_mode():
+        z = model.latent(model.encode_history(history), target_time, patient_tensor)
+        for start in _print_progress(
+            range(0, count, chunk_size),
+            f"plstm {target_volume.time_point:g}d grid",
+            "chunks",
+        ):
+            end = min(start + chunk_size, count)
+            coords, targets = _coordinates_and_labels(
+                target_volume, start, end, resolution
+            )
+            sdf = None
+            if model.use_sdf_prior:
+                sdf = torch.from_numpy(entries[-1].sdf_at_model(coords[:, :3]))
+                sdf = sdf.view(1, -1, 1).to(device)
+            coords_tensor = torch.from_numpy(coords).unsqueeze(0).to(device)
+            logits = model.decode(coords_tensor, z, sdf).reshape(-1)
+            predictions[start:end] = torch.sigmoid(logits).cpu().numpy() >= 0.5
+            targets_array[start:end] = targets
+    return predictions, targets_array
 
 
 def _embedding_module(model: torch.nn.Module) -> torch.nn.Embedding:
@@ -1189,7 +1472,7 @@ def _parse_args() -> argparse.Namespace:
     if not any(getattr(args, f"{family}_run_id") for family in MODEL_CLASSES):
         parser.error(
             "Provide at least one of --inr-run-id, --node-run-id, "
-            "or --lstm-run-id."
+            "--lstm-run-id, or --plstm-run-id."
         )
     if args.resolution < 2:
         parser.error("--resolution must be at least 2.")
@@ -1280,6 +1563,11 @@ def main() -> None:
     trajectory_indices = {
         lesion_id: index for index, lesion_id in enumerate(trajectories)
     }
+    point_lstm_caches = {
+        loaded.run_id: ScanCache(sdf_clip_mm=loaded.model.sdf_clip_mm)
+        for loaded in models
+        if loaded.family == "plstm"
+    }
 
     rows = []
     embedding_families = {
@@ -1355,6 +1643,7 @@ def main() -> None:
         "inr_run_id": args.inr_run_id or "",
         "node_run_id": args.node_run_id or "",
         "lstm_run_id": args.lstm_run_id or "",
+        "plstm_run_id": args.plstm_run_id or "",
     }
     if embedding_dilation_growth_rate is not None:
         validation_params[
@@ -1425,15 +1714,37 @@ def main() -> None:
                 ),
             }
         )
+
+    def cached_result(
+        model_name: str,
+        run_id: str,
+        case: EvaluationCase,
+        infer: Callable[[TargetVolume], tuple[np.ndarray, np.ndarray]],
+        growth_rate: float | None = None,
+        inference_key: str | None = None,
+    ) -> dict[str, float]:
+        cache_path = _prediction_cache_path(
+            run_id,
+            model_name,
+            case,
+            args.resolution,
+            args.chunk_size,
+            device,
+            growth_rate=growth_rate,
+            inference_key=inference_key,
+        )
+        return _cached_case_sums(
+            cache_path, case, args.resolution**3, infer
+        )
+
     for loaded in models:
         for case in _print_progress(
             cases,
             f"Evaluating {loaded.family} ({loaded.run_id[:8]})",
             "targets",
         ):
-            target_volume = _load_target_volume(case)
             if loaded.family == "lstm":
-                sums = _infer_lstm(
+                infer = lambda target_volume: _infer_lstm(
                     loaded,
                     case,
                     target_volume,
@@ -1443,16 +1754,37 @@ def main() -> None:
                     args.chunk_size,
                     device,
                 )
-            else:
-                sums = _infer_continuous_model(
-                    loaded,
-                    target_volume,
+            elif loaded.family == "plstm":
+                patient_idx = (
                     int(patient_to_idx[case.trajectory.patient_id]) * 100
-                    + int(case.trajectory.label_id),
+                    + int(case.trajectory.label_id)
+                )
+                infer = lambda target_volume: _infer_point_lstm(
+                    loaded,
+                    case,
+                    target_volume,
+                    patient_idx,
+                    point_lstm_caches[loaded.run_id],
                     args.resolution,
                     args.chunk_size,
                     device,
                 )
+            else:
+                patient_idx = (
+                    int(patient_to_idx[case.trajectory.patient_id]) * 100
+                    + int(case.trajectory.label_id)
+                )
+                infer = lambda target_volume: _infer_continuous_model(
+                    loaded,
+                    target_volume,
+                    patient_idx,
+                    args.resolution,
+                    args.chunk_size,
+                    device,
+                )
+            sums = cached_result(
+                loaded.family, loaded.run_id, case, infer
+            )
 
             record_result(loaded.family, loaded.run_id, case, sums)
 
@@ -1507,12 +1839,6 @@ def main() -> None:
 
         if embedding_trajectory is None or embedding_model_idx is None:
             raise RuntimeError("Embedding trajectory setup was not completed.")
-        print(
-            f"Fitting frozen-network embedding for {loaded.family} on "
-            f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]} using "
-            f"{len(embedding_trajectory_dates)} timepoint(s) and "
-            f"{args.embedding_samples_per_epoch} sampled example(s) per epoch."
-        )
         embedding_case = EvaluationCase(
             f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]}",
             embedding_trajectory,
@@ -1521,19 +1847,38 @@ def main() -> None:
             None,
             tuple(embedding_trajectory_dates),
         )
-        _seed_embedding_fit(args.embedding_seed)
-        fitted_embedding = _fit_embedding(
-            loaded,
-            embedding_case,
-            0,
-            embedding_lstm_datasets.get(loaded.run_id),
-            args.embedding_epochs,
-            args.embedding_combination_epochs,
-            args.embedding_lr,
-            args.embedding_batch_size,
-            args.embedding_samples_per_epoch,
-            device,
+        embedding_path = _embedding_cache_path(
+            loaded, args, embedding_trajectory_dates, device
         )
+        if embedding_path.is_file():
+            print(f"Loading cached {loaded.family} embedding from {embedding_path}.")
+        else:
+            print(
+                f"Fitting frozen-network embedding for {loaded.family} on "
+                f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]} using "
+                f"{len(embedding_trajectory_dates)} timepoint(s) and "
+                f"{args.embedding_samples_per_epoch} sampled example(s) per epoch."
+            )
+
+        def fit_embedding() -> torch.Tensor:
+            _seed_embedding_fit(args.embedding_seed)
+            return _fit_embedding(
+                loaded,
+                embedding_case,
+                0,
+                embedding_lstm_datasets.get(loaded.run_id),
+                args.embedding_epochs,
+                args.embedding_combination_epochs,
+                args.embedding_lr,
+                args.embedding_batch_size,
+                args.embedding_samples_per_epoch,
+                device,
+            )
+
+        fitted_embedding = _load_or_fit_embedding(
+            embedding_path, device, fit_embedding
+        )
+        fitted_embedding_key = _embedding_fingerprint(fitted_embedding)
         if args.plot_contact_sheets:
             output_path = args.output.with_name(
                 f"{args.output.stem}_contact_sheets"
@@ -1574,9 +1919,8 @@ def main() -> None:
                 tuple(embedding_trajectory_dates[:date_index])
                 or (date,),
             )
-            target_volume = _load_target_volume(trajectory_case)
             if loaded.family == "lstm":
-                adapted_sums = _infer_lstm(
+                infer = lambda target_volume: _infer_lstm(
                     loaded,
                     trajectory_case,
                     target_volume,
@@ -1588,7 +1932,7 @@ def main() -> None:
                     embedding_override=fitted_embedding,
                 )
             else:
-                adapted_sums = _infer_continuous_model(
+                infer = lambda target_volume: _infer_continuous_model(
                     loaded,
                     target_volume,
                     embedding_model_idx,
@@ -1597,6 +1941,13 @@ def main() -> None:
                     device,
                     embedding_override=fitted_embedding,
                 )
+            adapted_sums = cached_result(
+                f"{loaded.family}_embedding",
+                loaded.run_id,
+                trajectory_case,
+                infer,
+                inference_key=fitted_embedding_key,
+            )
             record_result(
                 f"{loaded.family}_embedding",
                 loaded.run_id,
@@ -1612,18 +1963,23 @@ def main() -> None:
         for case in _print_progress(
             cases, f"Evaluating {model_name}", "targets"
         ):
-            target_volume = _load_target_volume(case)
             growth_rate = (
                 global_growth_rate
                 if model_name == "dilation_global"
                 else lesion_growth_rates[case.lesion_id]
             )
-            sums = _infer_dilation_baseline(
+            sums = cached_result(
+                model_name,
+                "computed",
                 case,
-                target_volume,
-                growth_rate,
-                args.resolution,
-                args.chunk_size,
+                lambda target_volume: _infer_dilation_baseline(
+                    case,
+                    target_volume,
+                    growth_rate,
+                    args.resolution,
+                    args.chunk_size,
+                ),
+                growth_rate=growth_rate,
             )
             record_result(
                 model_name,
@@ -1661,13 +2017,18 @@ def main() -> None:
                     None,
                     tuple(embedding_trajectory_dates[:date_index]) or (date,),
                 )
-                target_volume = _load_target_volume(embedding_case)
-                sums = _infer_dilation_baseline(
+                sums = cached_result(
+                    embedding_model_name,
+                    "computed",
                     embedding_case,
-                    target_volume,
-                    embedding_growth_rate,
-                    args.resolution,
-                    args.chunk_size,
+                    lambda target_volume: _infer_dilation_baseline(
+                        embedding_case,
+                        target_volume,
+                        embedding_growth_rate,
+                        args.resolution,
+                        args.chunk_size,
+                    ),
+                    growth_rate=embedding_growth_rate,
                 )
                 record_result(
                     embedding_model_name,
@@ -1715,6 +2076,15 @@ def main() -> None:
             ]
             if split_rows:
                 prefix = f"{model_name}_{split}"
+                if split == "extrapolation":
+                    weights = _extrapolation_weights(split_rows)
+                    print(
+                        f"{model_name} extrapolation weights: "
+                        + ", ".join(
+                            f"{lesion_id}={weight:.4g}"
+                            for lesion_id, weight in sorted(weights.items())
+                        )
+                    )
                 dice_score = float(
                     _average_metric(split_rows, "dice_score")
                 )

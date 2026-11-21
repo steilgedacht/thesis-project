@@ -40,7 +40,8 @@ class DenseLesionDataset(LesionDataset):
             extrapolation_dates = validation["extrapolation_dates"]
             dates = [date for date in dates if date not in extrapolation_dates]
             interpolation_index = int(validation["interpolation"])
-            dates.pop(interpolation_index)
+            if interpolation_index >= 0:  # -1 = no interpolation scan
+                dates.pop(interpolation_index)
         return dates
 
     def _load_scan(self, trj, date):

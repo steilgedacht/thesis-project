@@ -27,11 +27,9 @@ class Config:
     from utils.dataloader_patient import (
         PatientValidationExtrapolationDataset,
         PatientValidationInterpolationDataset,
-        PatientPlottingDataset,
     )
     validation_extrapolation_dataset_class = PatientValidationExtrapolationDataset
     validation_interpolation_dataset_class = PatientValidationInterpolationDataset
-    plotting_dataset_class = PatientPlottingDataset
     validation_crop_margin_mm = 10.0
 
     # Repeat positive voxels to keep training samples balanced with negatives.

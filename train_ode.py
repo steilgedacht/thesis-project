@@ -14,6 +14,8 @@ import requests
 import json
 import os
 import socket
+import tempfile
+from mlflow.artifacts import get_artifact_repository
 
 hostname = socket.gethostname()
 print(f"Hostname: {hostname}")
@@ -118,6 +120,8 @@ def validate_polation(data_loader, text, plot, global_step, criterion):
     if text == "Valid Extrapolation" and plot:
         plot_extrapolation_time(loss_T_pairs, global_step)
 
+    return loss / len(data_loader)
+
 
 def train_inr(
         model, 
@@ -141,6 +145,8 @@ def train_inr(
 
     model.to(config.device)
     losses = []
+    best_val_loss = float("inf")
+    best_model_logged = False
     
     global_step = epoch = grads = 0
 
@@ -213,8 +219,26 @@ def train_inr(
 
         if epoch % config.validation_interval == 0:
             with torch.no_grad():
-                validate_polation(valid_extrapolation_loader, "Valid Extrapolation", epoch % config.plot_validation_interval == 0, global_step, criterion)
+                val_loss = validate_polation(valid_extrapolation_loader, "Valid Extrapolation", epoch % config.plot_validation_interval == 0, global_step, criterion)
                 validate_polation(valid_interpolation_loader, "Valid Interpolation", epoch % config.plot_validation_interval == 0 , global_step, criterion)
+            if val_loss < best_val_loss:
+                active_run = mlflow.active_run()
+                if active_run is None:
+                    raise RuntimeError("Cannot log the best model without an active MLflow run.")
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    model_path = Path(temp_dir) / "best_model"
+                    mlflow.pytorch.save_model(
+                        model,
+                        str(model_path),
+                        serialization_format="pickle",
+                    )
+                    if best_model_logged:
+                        get_artifact_repository(active_run.info.artifact_uri).delete_artifacts("best_model")
+                    mlflow.log_artifacts(str(model_path), artifact_path="best_model")
+
+                best_val_loss = val_loss
+                best_model_logged = True
         if epoch % config.plot_validation_interval == 0:
             with torch.no_grad():
                 for trj in plotting_LesionDataset:

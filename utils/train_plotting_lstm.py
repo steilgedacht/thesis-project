@@ -873,20 +873,35 @@ def plot_contanct_sheet(model, epoch, trj, config, final_side_length=False,
     label_shape = np.array(full_matrix_labels[0][0].shape)
     geometry = _compute_reference_geometry(label_shape, affine)
 
-    # Build time-series data (try INR-style assembler, fallback to LSTM)
-    patient_idx_tensor = torch.tensor(trj.embedding_id).unsqueeze(0).to(config.device)
-    try:
-        data = _assemble_time_series(model, patient_idx_tensor, config, full_matrix_labels, label_shape, affine, geometry, side_length)
-    except Exception:
-        # Fallback to LSTM assembler. Use the LSTM-specific assembler
-        # `_assemble_time_series_lstm` and pass the trajectory object plus
-        # a CanonicalGridGeometry built from trajectory attributes.
+    # Build time-series data with the model's native input representation.
+    if _is_lstm_model(model):
         canonical_geom = CanonicalGridGeometry(
             center=getattr(trj, 'canonical_center', None),
             extent_mm=getattr(trj, 'canonical_extent_mm', None),
             grid_size=getattr(config, 'lstm_grid_size', None),
         )
-        data = _assemble_time_series_lstm(model, trj, config, full_matrix_labels, label_shape, affine, geometry, canonical_geom)
+        data = _assemble_time_series_lstm(
+            model,
+            trj,
+            config,
+            full_matrix_labels,
+            label_shape,
+            affine,
+            geometry,
+            canonical_geom,
+        )
+    else:
+        patient_idx_tensor = torch.tensor(trj.embedding_id).unsqueeze(0).to(config.device)
+        data = _assemble_time_series_inr(
+            model,
+            patient_idx_tensor,
+            config,
+            full_matrix_labels,
+            label_shape,
+            affine,
+            geometry,
+            side_length,
+        )
 
     n_frames = len(data.heatmaps)
     if n_frames == 0:

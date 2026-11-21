@@ -40,7 +40,7 @@ INSTANCE_STARTED=1
 
 singularity exec --nv instance://"$INSTANCE_NAME" \
     bash -c 'cd "$WORKDIR" && TMPDIR="$TMP_DIR" python3.11 validation_arena.py \
-        --node-run-id f82c0dc523134b0699c17c7b16e7a3d7 \
+        --node-run-id 37378c54c4f64b92bed35b9f522325bb \
         --lstm-run-id 8d67b8dd7050458fa6ea391e46296639 \
         --inr-run-id 556437cb22ec45b09a60a74befe7cffa \
         --output "$TMP_DIR/validation_arena_results.csv" \
