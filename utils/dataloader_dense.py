@@ -1,7 +1,46 @@
+import multiprocessing as mp
+from dataclasses import dataclass
+
 import numpy as np
 from scipy.ndimage import binary_dilation
+from tqdm import tqdm
 
 from .dataloader import LesionDataset
+
+
+@dataclass
+class _LesionCrop:
+    """All training scans of one lesion, cropped to the union of their masks.
+
+    Every positive voxel of every training scan lies inside the crop, so any
+    voxel outside it is background for every scan. The margin is large enough
+    for the border band (binary dilation), so cropping changes no label and no
+    sampling probability; it only avoids full-volume work per item.
+    """
+    shape: tuple                 # full volume shape
+    affine: np.ndarray
+    origin: np.ndarray           # [3] voxel index of the crop corner
+    masks: dict                  # date -> bool crop
+    counts: np.ndarray           # number of training scans positive per crop voxel
+    times: dict                  # date -> time point
+
+
+def _crop_lookup(crop, origin, voxels):
+    """Values of ``crop`` at full-volume ``voxels``; False/0 outside the crop."""
+    local = voxels - origin
+    inside = np.all((local >= 0) & (local < np.asarray(crop.shape)), axis=1)
+    values = np.zeros(len(voxels), dtype=crop.dtype)
+    idx = local[inside]
+    values[inside] = crop[idx[:, 0], idx[:, 1], idx[:, 2]]
+    return values
+
+
+_PRELOAD_DATASET = None
+
+
+def _preload_worker(job):
+    key, trj, dates = job
+    return key, _PRELOAD_DATASET._build_crop(trj, dates)
 
 
 class DenseLesionDataset(LesionDataset):
@@ -10,6 +49,12 @@ class DenseLesionDataset(LesionDataset):
     Each item holds out one training scan from the core/union calculation,
     supervises its real mask at its actual time, and adds intermediate-time
     samples constrained by the other scans' intersection and union.
+
+    Every lesion is loaded once (``preload``, in parallel, before the
+    DataLoader forks) and kept as a small crop around the union of its
+    training masks. Background samples far from the lesion are drawn by
+    uniform rejection sampling over the full volume, which gives the same
+    distribution as sampling from the list of all background voxels.
     """
 
     def __init__(
@@ -19,6 +64,7 @@ class DenseLesionDataset(LesionDataset):
         dialation_iterations=5,
         background_samples=3000,
         oversample_positive_samples=True,
+        preload_processes=8,
     ):
         if background_samples < 3:
             raise ValueError("background_samples must be at least 3")
@@ -30,7 +76,9 @@ class DenseLesionDataset(LesionDataset):
             background_samples=background_samples,
             oversample_positive_samples=oversample_positive_samples,
         )
-        self._positive_count_cache = {}
+        self._crops = {}
+        if preload_processes:
+            self.preload(processes=preload_processes)
 
     def _training_dates(self, trj):
         dates = list(trj.allowed_dates if hasattr(trj, "allowed_dates") else trj.dates)
@@ -52,47 +100,94 @@ class DenseLesionDataset(LesionDataset):
         )
         return np.asarray(labels, dtype=np.uint8), float(time_point), affine
 
-    def _get_positive_counts(self, cache_key, trj, dates, target_date):
-        cached = self._positive_count_cache.get(cache_key)
-        if cached is not None:
-            target_labels, target_time, affine = self._load_scan(trj, target_date)
-            counts, cached_affine, times = cached
-            if target_labels.shape != counts.shape:
+    # ------------------------------------------------------------------
+    # Per-lesion crop
+    # ------------------------------------------------------------------
+    def _build_crop(self, trj, dates):
+        scans = {}
+        affine = shape = None
+        for date in dates:
+            labels, time_point, scan_affine = self._load_scan(trj, date)
+            if shape is None:
+                shape, affine = labels.shape, scan_affine
+            elif labels.shape != shape:
                 raise ValueError(
                     f"Label shape changed for lesion {trj.patient_id}_{trj.label_id}"
                 )
-            return target_labels, times[target_date], cached_affine
+            elif not np.allclose(scan_affine, affine):
+                raise ValueError(
+                    f"Affine changed for lesion {trj.patient_id}_{trj.label_id}"
+                )
+            scans[date] = (labels > 0, time_point)
 
-        first_labels, first_time, affine = self._load_scan(trj, dates[0])
+        union = np.zeros(shape, dtype=bool)
+        for mask, _ in scans.values():
+            union |= mask
+        positive = np.argwhere(union)
+        if len(positive):
+            # The border band reaches dialation_iterations voxels from a lesion.
+            margin = int(self.dialation_iterations) + 1
+            lo = np.maximum(positive.min(axis=0) - margin, 0)
+            hi = np.minimum(positive.max(axis=0) + margin + 1, np.asarray(shape))
+        else:
+            lo = np.zeros(3, dtype=np.int64)
+            hi = np.ones(3, dtype=np.int64)
+        crop = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+
+        masks = {date: mask[crop].copy() for date, (mask, _) in scans.items()}
         count_dtype = np.uint16 if len(dates) <= np.iinfo(np.uint16).max else np.uint32
-        counts = np.zeros(first_labels.shape, dtype=count_dtype)
-        times = {}
-        target_labels = None
+        counts = np.zeros(masks[dates[0]].shape, dtype=count_dtype)
+        for mask in masks.values():
+            counts += mask
+        return _LesionCrop(
+            shape=tuple(int(s) for s in shape),
+            affine=np.asarray(affine, dtype=np.float64),
+            origin=lo.astype(np.int64),
+            masks=masks,
+            counts=counts,
+            times={date: time_point for date, (_, time_point) in scans.items()},
+        )
 
-        for date in dates:
-            if date == dates[0]:
-                labels, time_point = first_labels, first_time
+    @staticmethod
+    def _crop_key(trj, dates):
+        return (trj.patient_id, trj.label_id, tuple(dates))
+
+    def _crop(self, trj, dates):
+        key = self._crop_key(trj, dates)
+        crop = self._crops.get(key)
+        if crop is None:
+            crop = self._build_crop(trj, dates)
+            self._crops[key] = crop
+        return crop
+
+    def preload(self, processes=8):
+        """Build every lesion's crop in parallel (before the DataLoader forks)."""
+        global _PRELOAD_DATASET
+        jobs = {}
+        for trj in self.trajectories:
+            dates = self._training_dates(trj)
+            key = self._crop_key(trj, dates)
+            if len(dates) >= 2 and key not in self._crops:
+                jobs[key] = (key, trj, dates)
+        if not jobs:
+            return
+        _PRELOAD_DATASET = self
+        try:
+            if processes > 1:
+                with mp.get_context("fork").Pool(processes) as pool:
+                    results = pool.imap_unordered(_preload_worker, jobs.values(), chunksize=2)
+                    for key, crop in tqdm(results, total=len(jobs), desc="Preloading lesions"):
+                        self._crops[key] = crop
             else:
-                labels, time_point, scan_affine = self._load_scan(trj, date)
-                if labels.shape != counts.shape:
-                    raise ValueError(
-                        f"Label shape changed for lesion {trj.patient_id}_{trj.label_id}"
-                    )
-                if not np.allclose(scan_affine, affine):
-                    raise ValueError(
-                        f"Affine changed for lesion {trj.patient_id}_{trj.label_id}"
-                    )
+                for job in tqdm(jobs.values(), desc="Preloading lesions"):
+                    key, crop = _preload_worker(job)
+                    self._crops[key] = crop
+        finally:
+            _PRELOAD_DATASET = None
 
-            np.add(counts, labels, out=counts, casting="unsafe")
-            times[date] = time_point
-            if date == target_date:
-                target_labels = labels
-
-        self._positive_count_cache[cache_key] = (counts, affine, times)
-        if target_labels is None:
-            raise ValueError(f"Target date {target_date} is not in the training dates")
-        return target_labels, times[target_date], affine
-
+    # ------------------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------------------
     @staticmethod
     def _sample_voxels(voxels, count, replace=True):
         if count == 0:
@@ -102,14 +197,33 @@ class DenseLesionDataset(LesionDataset):
         indices = np.random.choice(len(voxels), size=count, replace=replace or count > len(voxels))
         return voxels[indices]
 
-    def _sample_observed(self, labels, sample_count):
-        positive_voxels = np.argwhere(labels > 0)
-        negative_voxels = np.argwhere(labels <= 0)
+    @staticmethod
+    def _sample_outside(shape, crop_mask, origin, count):
+        """``count`` voxels uniformly from the full volume where ``crop_mask`` is False.
+
+        Equivalent to drawing with replacement from ``np.argwhere(~mask)``, but
+        without listing the millions of background voxels.
+        """
+        if count == 0:
+            return np.empty((0, 3), dtype=np.int64)
+        shape = np.asarray(shape, dtype=np.int64)
+        accepted, total = [], 0
+        while total < count:
+            draw = max(2 * (count - total), 64)
+            candidates = np.random.randint(0, shape, size=(draw, 3))
+            keep = candidates[~_crop_lookup(crop_mask, origin, candidates)]
+            accepted.append(keep)
+            total += len(keep)
+        return np.concatenate(accepted)[:count]
+
+    def _sample_observed(self, crop, target_mask, sample_count):
+        positive_voxels = np.argwhere(target_mask) + crop.origin
+        negative_total = int(np.prod(crop.shape)) - len(positive_voxels)
         target_positive_count = sample_count // 2
 
         if len(positive_voxels) == 0:
             positive_count = 0
-        elif len(negative_voxels) == 0:
+        elif negative_total == 0:
             positive_count = sample_count
         elif self.oversample_positive_samples:
             positive_count = target_positive_count
@@ -123,18 +237,18 @@ class DenseLesionDataset(LesionDataset):
             replace=self.oversample_positive_samples,
         )
 
-        border = binary_dilation(labels, iterations=self.dialation_iterations) & (labels <= 0)
-        border_voxels = np.argwhere(border)
+        # The crop margin covers the full dilation, so this equals the
+        # full-volume border band.
+        border = binary_dilation(target_mask, iterations=self.dialation_iterations) & ~target_mask
+        border_voxels = np.argwhere(border) + crop.origin
         border_count = min(negative_count // 5, len(border_voxels))
         border_samples = self._sample_voxels(
             border_voxels, border_count, replace=False
         )
 
         remaining_negative_count = negative_count - border_count
-        negative_samples = self._sample_voxels(
-            negative_voxels,
-            remaining_negative_count,
-            replace=True,
+        negative_samples = self._sample_outside(
+            crop.shape, target_mask, crop.origin, remaining_negative_count
         )
         samples = np.concatenate(
             [positive_samples, border_samples, negative_samples], axis=0
@@ -146,16 +260,16 @@ class DenseLesionDataset(LesionDataset):
             ]
         )
 
-    def _sample_intermediate(self, core, outside_union, sample_count):
-        core_voxels = np.argwhere(core)
-        outside_voxels = np.argwhere(outside_union)
-        if len(core_voxels) == 0 and len(outside_voxels) == 0:
+    def _sample_intermediate(self, crop, core, union, sample_count):
+        core_voxels = np.argwhere(core) + crop.origin
+        outside_count = int(np.prod(crop.shape)) - int(union.sum())
+        if len(core_voxels) == 0 and outside_count == 0:
             raise ValueError(
                 "No persistent lesion or outside-union voxels available for "
                 "intermediate-time supervision"
             )
 
-        if len(core_voxels) and len(outside_voxels):
+        if len(core_voxels) and outside_count:
             positive_count = sample_count // 2
         elif len(core_voxels):
             positive_count = sample_count
@@ -164,7 +278,7 @@ class DenseLesionDataset(LesionDataset):
 
         negative_count = sample_count - positive_count
         positive_samples = self._sample_voxels(core_voxels, positive_count)
-        negative_samples = self._sample_voxels(outside_voxels, negative_count)
+        negative_samples = self._sample_outside(crop.shape, union, crop.origin, negative_count)
         voxels = np.concatenate([positive_samples, negative_samples], axis=0)
         labels = np.concatenate(
             [
@@ -194,15 +308,13 @@ class DenseLesionDataset(LesionDataset):
                 f"lesion {trj.patient_id}_{trj.label_id}"
             )
 
-        cache_key = (trj.patient_id, trj.label_id, tuple(dates))
+        crop = self._crop(trj, dates)
         target_date = str(np.random.choice(dates))
-        target_labels, target_time, affine = self._get_positive_counts(
-            cache_key, trj, dates, target_date
-        )
-        positive_counts, _, times = self._positive_count_cache[cache_key]
+        target_mask = crop.masks[target_date]
+        target_time = crop.times[target_date]
 
         remaining_scan_count = len(dates) - 1
-        remaining_positive_counts = positive_counts - target_labels
+        remaining_positive_counts = crop.counts - target_mask
         core = remaining_positive_counts == remaining_scan_count
         union = remaining_positive_counts > 0
 
@@ -210,14 +322,14 @@ class DenseLesionDataset(LesionDataset):
         observed_count = self.max_samples - intermediate_count
 
         observed_voxels, observed_labels = self._sample_observed(
-            target_labels, observed_count
+            crop, target_mask, observed_count
         )
         intermediate_voxels, intermediate_labels = self._sample_intermediate(
-            core, ~union, intermediate_count
+            crop, core, union, intermediate_count
         )
 
-        min_time = min(times[date] for date in dates)
-        max_time = max(times[date] for date in dates)
+        min_time = min(crop.times[date] for date in dates)
+        max_time = max(crop.times[date] for date in dates)
         intermediate_times = np.random.uniform(
             min_time, max_time, size=intermediate_count
         ).astype(np.float32)
@@ -226,14 +338,14 @@ class DenseLesionDataset(LesionDataset):
             [
                 self._voxel_coords(
                     observed_voxels,
-                    affine,
-                    target_labels.shape,
+                    crop.affine,
+                    crop.shape,
                     np.full(observed_count, target_time, dtype=np.float32),
                 ),
                 self._voxel_coords(
                     intermediate_voxels,
-                    affine,
-                    target_labels.shape,
+                    crop.affine,
+                    crop.shape,
                     intermediate_times,
                 ),
             ],

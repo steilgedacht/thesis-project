@@ -49,6 +49,9 @@ ODE than the original per-point interpretation.
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+from .region_prior import RegionPrior, apply_region_prior
 
 
 class FourierFeatures(nn.Module):
@@ -172,12 +175,26 @@ class SpatialDecoder(nn.Module):
         nn.init.constant_(self.net[-1].bias, -0.5)
 
     def forward(self, xyz_encoded, z_t):
-        hidden = torch.cat([xyz_encoded, z_t], dim=-1)
+        # z_t is usually one latent per sample expanded over the N points
+        # (stride 0). Then the latent part of the first layer and all FiLM
+        # terms are computed once per sample and broadcast, which is the same
+        # result without materialising [B, N, latent] / [B, N, 2*hidden]
+        # tensors per layer (the main memory cost for large N).
+        shared = z_t.dim() == 3 and z_t.shape[1] > 1 and z_t.stride(1) == 0
+        z_film = z_t[:, :1] if shared else z_t
+        first = self.net[0]
+        if shared:
+            spatial_dim = xyz_encoded.shape[-1]
+            hidden = F.linear(xyz_encoded, first.weight[:, :spatial_dim]) + F.linear(
+                z_film, first.weight[:, spatial_dim:], first.bias
+            )
+        else:
+            hidden = first(torch.cat([xyz_encoded, z_t], dim=-1))
         film_index = 0
-        for layer in self.net:
+        for layer in list(self.net)[1:]:
             hidden = layer(hidden)
             if isinstance(layer, nn.ReLU) and film_index < len(self.film):
-                scale, shift = self.film[film_index](z_t).chunk(2, dim=-1)
+                scale, shift = self.film[film_index](z_film).chunk(2, dim=-1)
                 hidden = hidden * (1.0 + scale) + shift
                 film_index += 1
         return hidden
@@ -211,8 +228,16 @@ class NeuralODE_INR(nn.Module):
         spatial_hidden_dim=256,
         spatial_layers=4,
         num_fourier_frequencies=6,
+        use_region_prior=False,
+        region_margin_mm=10.0,
+        region_strength_per_mm=1.0,
     ):
         super().__init__()
+        # Optional far-field prior, boxes are filled by utils.region_prior.attach_region_boxes
+        self.region_prior = (
+            RegionPrior(num_patients, region_margin_mm, region_strength_per_mm)
+            if use_region_prior else None
+        )
 
         self.patient_embedding = nn.Embedding(num_patients, patient_embed_dim)
         self.max_t = max_t
@@ -260,4 +285,4 @@ class NeuralODE_INR(nn.Module):
 
         xyz_encoded = self.spatial_encoding(xyz)               # [B, N, spatial_in_dim]
         logits = self.decoder(xyz_encoded, z_t_expanded)        # [B, N, 1]
-        return logits
+        return apply_region_prior(self, logits, xyz, patient_idx)

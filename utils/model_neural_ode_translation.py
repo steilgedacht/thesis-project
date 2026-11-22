@@ -8,6 +8,8 @@ translation in the same normalized xyz units used by the input coordinates.
 import torch
 import torch.nn as nn
 
+from .region_prior import RegionPrior, apply_region_prior
+
 from .model_neural_ode import (
     FixedStepODESolver,
     FourierFeatures,
@@ -39,8 +41,18 @@ class NeuralODETranslationINR(nn.Module):
         spatial_hidden_dim=256,
         spatial_layers=4,
         num_fourier_frequencies=6,
+        translation_ode_hidden_dim=64,
+        translation_ode_layers=2,
+        use_region_prior=False,
+        region_margin_mm=10.0,
+        region_strength_per_mm=1.0,
     ):
         super().__init__()
+        # Optional far-field prior, boxes are filled by utils.region_prior.attach_region_boxes
+        self.region_prior = (
+            RegionPrior(num_patients, region_margin_mm, region_strength_per_mm)
+            if use_region_prior else None
+        )
 
         self.patient_embedding = nn.Embedding(num_patients, patient_embed_dim)
         self.max_t = max_t
@@ -68,8 +80,8 @@ class NeuralODETranslationINR(nn.Module):
             LatentODEFunc(
                 latent_dim=3,
                 cond_dim=patient_embed_dim,
-                hidden_dim=ode_hidden_dim,
-                n_layers=ode_layers,
+                hidden_dim=translation_ode_hidden_dim,
+                n_layers=translation_ode_layers,
             ),
             n_steps=ode_steps,
             method=ode_method,
@@ -109,4 +121,5 @@ class NeuralODETranslationINR(nn.Module):
         relative_xyz = xyz - translation.unsqueeze(1)
         xyz_encoded = self.spatial_encoding(relative_xyz)
         shape_state = shape_state.unsqueeze(1).expand(-1, xyz.shape[1], -1)
-        return self.decoder(xyz_encoded, shape_state)
+        logits = self.decoder(xyz_encoded, shape_state)
+        return apply_region_prior(self, logits, xyz, patient_idx)

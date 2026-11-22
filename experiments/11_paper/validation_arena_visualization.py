@@ -32,6 +32,28 @@ METRIC_NAMES = sorted(
 )
 EVAL_NAMES = ["embedding_trajectory", "interpolation", "extrapolation"]
 
+# Display names, in plot order: models first, then baselines.
+METHOD_LABELS = {
+    "inr": "INR",
+    "node": "Neural ODE",
+    "lstm": "LSTM (grid)",
+    "plstm": "Point-LSTM",
+    "last_scan": "Baseline: copy last scan",
+    "dilation_global": "Baseline: dilation (global rate)",
+    "dilation_lesion_specific": "Baseline: dilation (lesion rate)",
+}
+MODEL_FAMILIES = ["inr", "node", "lstm", "plstm"]
+REFERENCE_METHOD = "last_scan"
+
+
+def method_label(method: str) -> str:
+    return METHOD_LABELS.get(method, method)
+
+
+def method_order(methods) -> list:
+    known = [m for m in METHOD_LABELS if m in set(methods)]
+    return known + sorted(set(methods) - set(known))
+
 st.set_page_config(page_title="MLflow metrics", layout="wide")
 st.title("MLflow metrics explorer")
 
@@ -75,6 +97,7 @@ def load_runs_by_id(uri: str, run_ids: tuple) -> pd.DataFrame:
         row = {"run_id": run.info.run_id,
                "tags.mlflow.runName": run.data.tags.get("mlflow.runName")}
         row.update({f"metrics.{k}": v for k, v in run.data.metrics.items()})
+        row.update({f"params.{k}": v for k, v in run.data.params.items()})
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -184,28 +207,56 @@ if df.empty:
 # ---------------------------------------------------------------- sidebar: filters
 with st.sidebar:
     st.header("Filters")
+    all_methods = method_order(df["method"].unique())
     sel_methods = st.multiselect(
-        "Methods", sorted(df["method"].unique()), default=sorted(df["method"].unique())
+        "Methods", all_methods, default=all_methods, format_func=method_label
     )
     sel_evals = st.multiselect(
         "Evaluations", sorted(df["eval"].unique()), default=sorted(df["eval"].unique())
     )
     use_log = st.checkbox("Log y-axis", value=False)
 
+df_all = df.copy()  # unfiltered, so the copy-last-scan reference survives the method filter
 df = df[df["method"].isin(sel_methods) & df["eval"].isin(sel_evals)]
 if df.empty:
     st.info("Nothing selected.")
     st.stop()
 
 multi = df["run"].nunique() > 1
-EVAL_ORDER = {"eval": ["interpolation", "extrapolation", "embedding_trajectory"]}
+df["method_label"] = df["method"].map(method_label)
+EVAL_ORDER = {
+    "eval": ["interpolation", "extrapolation", "embedding_trajectory"],
+    "method_label": [method_label(m) for m in method_order(df["method"].unique())],
+}
+
+# ---------------------------------------------------------------- models in the run(s)
+st.header("Evaluated models")
+model_rows = []
+for _, r in runs_raw.iterrows():
+    run_name = r.get("tags.mlflow.runName") or r["run_id"][:8]
+    for family in MODEL_FAMILIES:
+        training_run = r.get(f"params.{family}_run_id")
+        if isinstance(training_run, str) and training_run:
+            model_rows.append(
+                {"validation run": f"{run_name} ({r['run_id'][:6]})",
+                 "model": method_label(family),
+                 "training run ID": training_run}
+            )
+if model_rows:
+    st.dataframe(pd.DataFrame(model_rows), width="stretch", hide_index=True)
+st.caption(
+    "embedding_trajectory: INR / Neural ODE / LSTM fit a new embedding on YG_WCONBI42RLEZ_1 "
+    "(frozen network) and are scored on every scan. The Point-LSTM needs no fitting: each "
+    "scan is predicted from the scans before it, so its first scan is skipped. Baselines "
+    "copy (or dilate) the previous scan."
+)
 
 
 def bar(metric: str, title: str, height: int = 380, y_max=None):
     d = df[df["metric"] == metric]
     fig = px.bar(
         d,
-        x="method",
+        x="method_label",
         y="value",
         color="eval",
         barmode="group",
@@ -218,7 +269,7 @@ def bar(metric: str, title: str, height: int = 380, y_max=None):
     )
     if y_max is not None and not use_log:
         fig.update_yaxes(range=[0, y_max * 1.1])
-    fig.update_layout(legend_title_text="")
+    fig.update_layout(legend_title_text="", xaxis_title="")
     return fig
 
 
@@ -226,6 +277,41 @@ def bar(metric: str, title: str, height: int = 380, y_max=None):
 st.header("Dice")
 st.caption("Hard Dice at threshold 0.5; higher is better")
 st.plotly_chart(bar("dice_score", "Dice score"), width="stretch")
+
+# ---------------------------------------------------------------- Dice vs. copy-last-scan
+reference = df_all[(df_all["metric"] == "dice_score") & (df_all["method"] == REFERENCE_METHOD)]
+if not reference.empty:
+    st.header("Dice gain over copying the last scan")
+    st.caption(
+        "Model Dice minus the Dice of the copy-last-scan baseline on the same targets. "
+        "Above 0 means the model predicts the change, not just the last observation."
+    )
+    dice = df[(df["metric"] == "dice_score") & (df["method"] != REFERENCE_METHOD)]
+    gain = dice.merge(
+        reference[["run", "eval", "value"]].rename(columns={"value": "reference"}),
+        on=["run", "eval"],
+    )
+    gain["value"] = gain["value"] - gain["reference"]
+    fig = px.bar(
+        gain,
+        x="method_label",
+        y="value",
+        color="eval",
+        barmode="group",
+        text_auto="+.3f",
+        facet_row="run" if multi else None,
+        category_orders=EVAL_ORDER,
+        title="Δ Dice vs. copy last scan",
+        height=380 * (gain["run"].nunique() if multi else 1),
+    )
+    fig.add_hline(y=0, line_color="gray")
+    fig.update_layout(legend_title_text="", xaxis_title="")
+    st.plotly_chart(fig, width="stretch")
+else:
+    st.info(
+        "This validation run has no copy-last-scan baseline yet "
+        "(rerun validation_arena.py to get the 'Dice gain' chart)."
+    )
 
 # ---------------------------------------------------------------- Volume
 st.header("Wrongly predicted volume (cm³)")
@@ -247,6 +333,6 @@ st.plotly_chart(
 
 # ---------------------------------------------------------------- Table
 st.header("All values")
-wide = df.pivot_table(index=["method", "eval", "run"], columns="metric", values="value")
+wide = df.pivot_table(index=["method_label", "eval", "run"], columns="metric", values="value")
 st.dataframe(wide, width="stretch")
 st.download_button("Download CSV", wide.to_csv().encode(), "metrics.csv", "text/csv")

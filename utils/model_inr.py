@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+from .region_prior import RegionPrior, apply_region_prior
+
 
 class TimeEncoder(nn.Module):
     def __init__(self, 
@@ -71,11 +73,19 @@ class LesionINR(nn.Module):
                  omega_0=30.0, 
                  n_layers=8,
                  time_freqs=6,
-                 max_t=3650.0
+                 max_t=3650.0,
+                 use_region_prior=False,
+                 region_margin_mm=10.0,
+                 region_strength_per_mm=1.0,
 
             ):
         super().__init__()
         num_patients = len(trajectories) * 100 # otherwise we get a lot of collisions in the embedding space for different lesions of the same patient
+        # Optional far-field prior, boxes are filled by utils.region_prior.attach_region_boxes
+        self.region_prior = (
+            RegionPrior(num_patients, region_margin_mm, region_strength_per_mm)
+            if use_region_prior else None
+        )
         self.latent_vectors = nn.Embedding(num_patients, latent_dim)
         
         self.time_freqs = time_freqs
@@ -130,4 +140,4 @@ class LesionINR(nn.Module):
         for layer in self.layers:
             x_out = layer(x_out, z)
 
-        return self.final_layer(x_out)
+        return apply_region_prior(self, self.final_layer(x_out), spatial_coords, patient_idx)

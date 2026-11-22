@@ -7,6 +7,7 @@ import mlflow
 import mlflow.pytorch
 from tqdm import tqdm
 from utils.mri_dataloader import MRI_Dataloader
+from utils.region_prior import attach_region_boxes
 from utils.dataloader import Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset, Plotting_LesionDataset
 from utils.train_plotting import *
 from utils.grid_validation import evaluator_from_config, grid_validation_metrics, lesion_validation_cases
@@ -420,6 +421,10 @@ if __name__ == "__main__":
             trajectories=trajectories, 
             **model_params
         )
+        # Fills the per-lesion boxes if the model was built with use_region_prior=True
+        region_prior_lesions = attach_region_boxes(
+            model, mri_dataloader.cache_lesion_trajectories, train_dataset.get_embedding_id
+        )
         # if config.load_model:
         #     if config.load_model_path.startswith("runs"):
         #         model = mlflow.pytorch.load_model(config.load_model_path)
@@ -430,6 +435,7 @@ if __name__ == "__main__":
         mlflow.log_params({
             "dataset_size": len(train_dataset),
             "loss_function": type(config.loss_fn).__name__,
+            "region_prior_lesions": region_prior_lesions,
             **{key: getattr(config, key) for key in dir(config) if not key.startswith("_")}
         })
         mlflow.log_artifact(args.config)

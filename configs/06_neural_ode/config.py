@@ -2,9 +2,12 @@ import torch
 
 class Config:
     """ Tracking parameters """
-    # mlflow_tracking_uri = "http://127.0.0.1:5124"
-    mlflow_tracking_uri = f"http://{open('/home/optima/bbergmann/mlflow_host.txt').read().strip()}:5124"
-    print(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
+    try:
+        mlflow_tracking_uri = f"http://{open('/home/optima/bbergmann/mlflow_host.txt').read().strip()}:5124"
+        print(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
+    except FileNotFoundError:
+        mlflow_tracking_uri = "http://127.0.0.1:5124"
+        print(f"Using default MLflow tracking URI: {mlflow_tracking_uri}")
     mlflow_experiment_name = "Lesion_ODE_Training"
     mlflow_run_name = "ODE higher lr, lower epoch" 
 

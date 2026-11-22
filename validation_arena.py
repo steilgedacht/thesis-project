@@ -15,8 +15,11 @@ same locations. Results are written per held-out scan to CSV.
 
 Unless --skip-embedding-test is set, INR, Neural ODE, and LSTM models also fit
 one embedding on YG_WCONBI42RLEZ lesion 1 and report fitted-embedding Dice for
-every timepoint. Global-rate and lesion-specific-rate dilation baselines are
-computed only from non-validation scans and also evaluated on the embedding
+every timepoint. The Point-LSTM needs no fitting: it predicts every scan of that
+lesion from the scans before it (the first scan has no history and is skipped).
+Baselines: "last_scan" copies the last observed mask, and the global-rate and
+lesion-specific-rate dilation baselines dilate it; rates are computed only from
+non-validation scans. All baselines are also evaluated on the embedding
 trajectory.
 
 Use --plot-contact-sheets to save contact sheets for up to five validation
@@ -65,6 +68,7 @@ from utils.dataloader_point_lstm import (
 )
 from utils.mri_dataloader import MRI_Dataloader
 from utils.paths import DatasetPaths
+from utils.region_prior import all_dates_box
 
 
 MODEL_CLASSES = {
@@ -76,8 +80,9 @@ MODEL_CLASSES = {
     "lstm": (LesionLSTM, LesionLatentLSTM),
     "plstm": (PointLSTM,),
 }
-EMBEDDING_SUPPORTED_FAMILIES = {"inr", "node", "lstm"}
-DILATION_BASELINE_NAMES = ("dilation_global", "dilation_lesion_specific")
+EMBEDDING_SUPPORTED_FAMILIES = {"inr", "node", "lstm", "plstm"}
+# "last_scan" = dilation with rate 0, i.e. the last observed mask unchanged.
+BASELINE_NAMES = ("last_scan", "dilation_global", "dilation_lesion_specific")
 EMBEDDING_TRAJECTORY = ("YG_WCONBI42RLEZ", 1)
 VALIDATION_CACHE_DIR = (
     Path(__file__).resolve().parent / "cache" / "validation_arena"
@@ -383,6 +388,16 @@ def _training_dates_for_rate(
             "excluding validation timepoints."
         )
     return training_dates
+
+
+def _baseline_growth_rate(
+    model_name: str, global_rate: float, lesion_rate: float
+) -> float:
+    if model_name == "last_scan":
+        return 0.0
+    if model_name == "dilation_global":
+        return global_rate
+    return lesion_rate
 
 
 def _seed_embedding_fit(seed: int) -> None:
@@ -1054,6 +1069,66 @@ def _infer_lstm(
     return predictions, targets_array
 
 
+def _point_lstm_ring_mm(loaded: LoadedModel) -> float:
+    dataset_params = _literal_param(loaded.params, "dataset_params", {})
+    if isinstance(dataset_params, dict):
+        return float(dataset_params.get("ring_mm", 3.0))
+    return 3.0
+
+
+def _point_lstm_latent(
+    loaded: LoadedModel,
+    lesion_id: str,
+    trajectory: Any,
+    history_dates: tuple[str, ...],
+    target_date: str,
+    target_time: float,
+    patient_idx: int,
+    scan_cache: ScanCache,
+    device: torch.device,
+    embedding_override: torch.Tensor | None = None,
+):
+    """Encode the observed history and return (z, history ScanEntries)."""
+    model = loaded.model
+    history_dates = [date for date in history_dates if date != target_date][
+        -model.max_history_len:
+    ]
+    if not history_dates:
+        raise ValueError(f"No observed history before {target_date} for {lesion_id}.")
+    entries = [scan_cache.get(trajectory, date) for date in history_dates]
+    rng = np.random.default_rng(zlib.crc32(f"{lesion_id}|{target_date}".encode()))
+    history = batch_to_device(
+        collate_history(
+            [history_arrays(entries, model.history_points, rng, _point_lstm_ring_mm(loaded))]
+        ),
+        device,
+    )
+    patient_tensor = torch.tensor([patient_idx], dtype=torch.long, device=device)
+    time_tensor = torch.tensor([target_time], dtype=torch.float32, device=device)
+    hook = (
+        _embedding_override(model, embedding_override)
+        if embedding_override is not None
+        else None
+    )
+    try:
+        with torch.inference_mode():
+            z = model.latent(model.encode_history(history), time_tensor, patient_tensor)
+    finally:
+        if hook is not None:
+            hook.remove()
+    return z, entries
+
+
+def _point_lstm_zero_embedding(
+    loaded: LoadedModel, device: torch.device
+) -> torch.Tensor | None:
+    """Zero lesion embedding = how the Point-LSTM treats an unseen lesion."""
+    model = loaded.model
+    if not getattr(model, "use_lesion_embedding", False):
+        return None
+    return torch.zeros(model.lesion_embedding.embedding_dim, device=device)
+
+
 def _infer_point_lstm(
     loaded: LoadedModel,
     case: EvaluationCase,
@@ -1063,40 +1138,26 @@ def _infer_point_lstm(
     resolution: int,
     chunk_size: int,
     device: torch.device,
+    embedding_override: torch.Tensor | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     model = loaded.model
-    history_dates = [
-        date for date in case.history_dates if date != case.target_date
-    ][-model.max_history_len:]
-    if not history_dates:
-        raise ValueError(
-            f"No observed history before {case.target_date} for {case.lesion_id}."
-        )
-
-    dataset_params = _literal_param(loaded.params, "dataset_params", {})
-    ring_mm = (
-        float(dataset_params.get("ring_mm", 3.0))
-        if isinstance(dataset_params, dict)
-        else 3.0
-    )
-    entries = [scan_cache.get(case.trajectory, date) for date in history_dates]
-    rng = np.random.default_rng(
-        zlib.crc32(f"{case.lesion_id}|{case.target_date}".encode())
-    )
-    history = batch_to_device(
-        collate_history([history_arrays(entries, model.history_points, rng, ring_mm)]),
+    z, entries = _point_lstm_latent(
+        loaded,
+        case.lesion_id,
+        case.trajectory,
+        case.history_dates,
+        case.target_date,
+        target_volume.time_point,
+        patient_idx,
+        scan_cache,
         device,
-    )
-    patient_tensor = torch.tensor([patient_idx], dtype=torch.long, device=device)
-    target_time = torch.tensor(
-        [target_volume.time_point], dtype=torch.float32, device=device
+        embedding_override,
     )
 
     count = resolution**3
     predictions = np.empty(count, dtype=bool)
     targets_array = np.empty(count, dtype=bool)
     with torch.inference_mode():
-        z = model.latent(model.encode_history(history), target_time, patient_tensor)
         for start in _print_progress(
             range(0, count, chunk_size),
             f"plstm {target_volume.time_point:g}d grid",
@@ -1117,8 +1178,94 @@ def _infer_point_lstm(
     return predictions, targets_array
 
 
+def _plot_point_lstm_contact_sheet(
+    loaded: LoadedModel,
+    lesion_id: str,
+    trajectory: Any,
+    rows: list[tuple[tuple[str, ...], str]],
+    patient_idx: int,
+    scan_cache: ScanCache,
+    output_path: Path,
+    device: torch.device,
+    embedding_override: torch.Tensor | None = None,
+) -> None:
+    """One row per (history, target): last observed | prediction | target, axial slice."""
+    from matplotlib import pyplot as plt
+
+    model = loaded.model
+    if not rows:
+        return
+    figure, axes = plt.subplots(
+        len(rows), 3, figsize=(9, 3 * len(rows)), squeeze=False
+    )
+    try:
+        for row, (history_dates, target_date) in enumerate(rows):
+            target = scan_cache.get(trajectory, target_date)
+            z, entries = _point_lstm_latent(
+                loaded,
+                lesion_id,
+                trajectory,
+                history_dates,
+                target_date,
+                target.time,
+                patient_idx,
+                scan_cache,
+                device,
+                embedding_override,
+            )
+            last = entries[-1]
+            reference = target if len(target.positive_voxels) else last
+            boxes = [entry.crop_box for entry in (target, last) if entry.sdf_q is not None]
+            if boxes:
+                low = np.min([box[0] for box in boxes], axis=0)
+                high = np.max([box[1] for box in boxes], axis=0)
+            else:
+                low, high = np.zeros(3, dtype=np.int64), np.asarray(target.shape)
+            z_slice = (
+                int(np.median(reference.positive_voxels[:, 2]))
+                if len(reference.positive_voxels)
+                else int((low[2] + high[2]) // 2)
+            )
+            grid_i, grid_j = np.meshgrid(
+                np.arange(low[0], high[0]), np.arange(low[1], high[1]), indexing="ij"
+            )
+            voxels = np.stack(
+                [grid_i.ravel(), grid_j.ravel(), np.full(grid_i.size, z_slice)], axis=1
+            )
+            xyz = target.voxels_to_model(voxels)
+            coords = np.concatenate(
+                [xyz, np.full((len(xyz), 1), target.time, np.float32)], axis=1
+            )
+            sdf = None
+            if model.use_sdf_prior:
+                sdf = torch.from_numpy(last.sdf_at_model(xyz)).view(1, -1, 1).to(device)
+            with torch.inference_mode():
+                logits = model.decode(
+                    torch.from_numpy(coords).unsqueeze(0).to(device), z, sdf
+                )
+            probability = torch.sigmoid(logits).reshape(grid_i.shape).cpu().numpy()
+            target_slice = target.label_at_voxels(voxels).reshape(grid_i.shape)
+            last_date = [d for d in history_dates if d != target_date][-1]
+            panels = [
+                (last.label_at_voxels(voxels).reshape(grid_i.shape), f"last observed ({last_date})"),
+                (probability, f"prediction (+{target.time - last.time:.0f} d)"),
+                (target_slice, f"target ({target_date})"),
+            ]
+            for column, (image, title) in enumerate(panels):
+                axis = axes[row, column]
+                axis.imshow(image.T, cmap="magma", vmin=0, vmax=1, origin="lower")
+                axis.contour(target_slice.T, levels=[0.5], colors="cyan", linewidths=0.7)
+                axis.set_title(f"{lesion_id}\n{title}" if column == 0 else title, fontsize=8)
+                axis.axis("off")
+        figure.tight_layout()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output_path, dpi=110)
+    finally:
+        plt.close(figure)
+
+
 def _embedding_module(model: torch.nn.Module) -> torch.nn.Embedding:
-    for name in ("patient_embedding", "latent_vectors", "patient_emb"):
+    for name in ("patient_embedding", "latent_vectors", "patient_emb", "lesion_embedding"):
         module = getattr(model, name, None)
         if isinstance(module, torch.nn.Embedding):
             return module
@@ -1207,6 +1354,7 @@ def _fit_embedding(
     batch_size: int,
     samples_per_epoch: int,
     device: torch.device,
+    continuous_patient_idx: int = 0,
 ) -> torch.Tensor:
     if epochs < 1:
         raise ValueError("--embedding-epochs must be positive.")
@@ -1304,8 +1452,13 @@ def _fit_embedding(
                         batch = shuffled[start : start + batch_size]
                         coords = torch.stack([item[0] for item in batch]).to(device)
                         labels = torch.stack([item[1] for item in batch]).to(device)
-                        patient_idx = torch.zeros(
-                            len(batch), dtype=torch.long, device=device
+                        # The hook replaces the embedding; the index only
+                        # selects the region-prior box (if the model has one).
+                        patient_idx = torch.full(
+                            (len(batch),),
+                            continuous_patient_idx,
+                            dtype=torch.long,
+                            device=device,
                         )
                         optimizer.zero_grad()
                         predictions = model(coords, patient_idx)
@@ -1545,7 +1698,7 @@ def main() -> None:
     )
 
     print(
-        f"Evaluating {len(models)} model(s) and 2 dilation baselines, "
+        f"Evaluating {len(models)} model(s) and {len(BASELINE_NAMES)} baselines, "
         f"{len(trajectories)} shared lesion(s), "
         f"{len(cases)} target(s), {args.resolution}^3 = "
         f"{args.resolution**3:,} query points per target on {device}."
@@ -1654,7 +1807,7 @@ def main() -> None:
             not args.skip_embedding_test
             and loaded.family in EMBEDDING_SUPPORTED_FAMILIES
         )
-    for baseline_name in DILATION_BASELINE_NAMES:
+    for baseline_name in BASELINE_NAMES:
         validation_params[f"{baseline_name}_embedding_test_enabled"] = str(
             not args.skip_embedding_test and embedding_trajectory is not None
         )
@@ -1812,6 +1965,22 @@ def main() -> None:
                         output_path,
                         device,
                     )
+                elif loaded.family == "plstm":
+                    _plot_point_lstm_contact_sheet(
+                        loaded,
+                        case.lesion_id,
+                        case.trajectory,
+                        [
+                            (lesion_case.history_dates, lesion_case.target_date)
+                            for lesion_case in cases
+                            if lesion_case.lesion_id == case.lesion_id
+                        ],
+                        int(patient_to_idx[case.trajectory.patient_id]) * 100
+                        + int(case.trajectory.label_id),
+                        point_lstm_caches[loaded.run_id],
+                        output_path,
+                        device,
+                    )
                 else:
                     embedding_id = (
                         int(patient_to_idx[case.trajectory.patient_id]) * 100
@@ -1847,6 +2016,78 @@ def main() -> None:
             None,
             tuple(embedding_trajectory_dates),
         )
+
+        if loaded.family == "plstm":
+            # Nothing to fit: the Point-LSTM conditions on the lesion's own
+            # observed scans. Every scan is predicted from the scans before it.
+            zero_embedding = _point_lstm_zero_embedding(loaded, device)
+            plstm_rows = [
+                (tuple(embedding_trajectory_dates[:date_index]), date)
+                for date_index, date in enumerate(embedding_trajectory_dates)
+                if date_index > 0
+            ]
+            for history_dates, date in _print_progress(
+                plstm_rows, "Evaluating plstm trajectory forecast", "timepoints"
+            ):
+                trajectory_case = EvaluationCase(
+                    embedding_case.lesion_id,
+                    embedding_trajectory,
+                    "trajectory",
+                    date,
+                    None,
+                    history_dates,
+                )
+                infer = lambda target_volume: _infer_point_lstm(
+                    loaded,
+                    trajectory_case,
+                    target_volume,
+                    embedding_model_idx,
+                    point_lstm_caches[loaded.run_id],
+                    args.resolution,
+                    args.chunk_size,
+                    device,
+                    embedding_override=zero_embedding,
+                )
+                sums = cached_result(
+                    "plstm_embedding",
+                    loaded.run_id,
+                    trajectory_case,
+                    infer,
+                    inference_key=(
+                        "observed-history-zero-embedding"
+                        if zero_embedding is not None
+                        else "observed-history"
+                    ),
+                )
+                record_result("plstm_embedding", loaded.run_id, trajectory_case, sums)
+            if args.plot_contact_sheets:
+                _plot_point_lstm_contact_sheet(
+                    loaded,
+                    embedding_case.lesion_id,
+                    embedding_trajectory,
+                    plstm_rows,
+                    embedding_model_idx,
+                    point_lstm_caches[loaded.run_id],
+                    args.output.with_name(f"{args.output.stem}_contact_sheets")
+                    / f"plstm_embedding_{embedding_case.lesion_id}.png",
+                    device,
+                    embedding_override=zero_embedding,
+                )
+            embedding_metrics = _summary_metrics(rows, "plstm_embedding")
+            if embedding_metrics:
+                mlflow.log_metrics(embedding_metrics)
+            continue
+
+        # Region prior (INR/NODE): the embedding is fitted on every scan of the
+        # lesion, so its box covers every scan too. Restored afterwards.
+        region_prior = getattr(loaded.model, "region_prior", None)
+        saved_region_box = None
+        if region_prior is not None:
+            saved_region_box = region_prior.get_box(embedding_model_idx)
+            embedding_box = all_dates_box(embedding_trajectory)
+            if embedding_box is not None:
+                region_prior.set_box(embedding_model_idx, embedding_box)
+
         embedding_path = _embedding_cache_path(
             loaded, args, embedding_trajectory_dates, device
         )
@@ -1873,6 +2114,7 @@ def main() -> None:
                 args.embedding_batch_size,
                 args.embedding_samples_per_epoch,
                 device,
+                continuous_patient_idx=embedding_model_idx,
             )
 
         fitted_embedding = _load_or_fit_embedding(
@@ -1958,15 +2200,15 @@ def main() -> None:
         embedding_metrics = _summary_metrics(rows, f"{loaded.family}_embedding")
         if embedding_metrics:
             mlflow.log_metrics(embedding_metrics)
+        if region_prior is not None:
+            region_prior.set_box(embedding_model_idx, saved_region_box)
 
-    for model_name in DILATION_BASELINE_NAMES:
+    for model_name in BASELINE_NAMES:
         for case in _print_progress(
             cases, f"Evaluating {model_name}", "targets"
         ):
-            growth_rate = (
-                global_growth_rate
-                if model_name == "dilation_global"
-                else lesion_growth_rates[case.lesion_id]
+            growth_rate = _baseline_growth_rate(
+                model_name, global_growth_rate, lesion_growth_rates[case.lesion_id]
             )
             sums = cached_result(
                 model_name,
@@ -1996,10 +2238,8 @@ def main() -> None:
             and embedding_trajectory is not None
             and embedding_dilation_growth_rate is not None
         ):
-            embedding_growth_rate = (
-                global_growth_rate
-                if model_name == "dilation_global"
-                else embedding_dilation_growth_rate
+            embedding_growth_rate = _baseline_growth_rate(
+                model_name, global_growth_rate, embedding_dilation_growth_rate
             )
             embedding_model_name = f"{model_name}_embedding"
             for date_index, date in enumerate(
@@ -2057,10 +2297,10 @@ def main() -> None:
         ):
             model_names.append(f"{loaded.family}_embedding")
         model_names_to_summarize.extend(model_names)
-    model_names_to_summarize.extend(DILATION_BASELINE_NAMES)
+    model_names_to_summarize.extend(BASELINE_NAMES)
     if not args.skip_embedding_test and embedding_trajectory is not None:
         model_names_to_summarize.extend(
-            f"{name}_embedding" for name in DILATION_BASELINE_NAMES
+            f"{name}_embedding" for name in BASELINE_NAMES
         )
     for model_name in model_names_to_summarize:
         splits = (
