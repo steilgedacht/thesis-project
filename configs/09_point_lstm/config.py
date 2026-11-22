@@ -40,7 +40,7 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 100
+    epochs = 150
     lr = 4e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.01
@@ -84,3 +84,16 @@ class Config:
     validation_interval = 5
     plot_validation_interval = 25
     n_monitoring_samples_to_visualize = 5
+
+    # Time-evolution GIF (utils/train_plotting_point_lstm.py), as for INR / ODE
+    time_evolution_steps = 100        # frames
+    time_evolution_side_length = 50   # heatmap pixels per axis during training
+    full_size_side_length = 500       # heatmap pixels per axis for the final GIF
+
+    # Validation on a uniform grid over [-1, 1]^3 like validation_arena.py
+    # (coarse-to-fine, see utils/grid_validation.py); "sampled" = legacy.
+    validation_mode = "grid"
+    validation_grid_coarse_resolution = 15    # sectors per axis
+    validation_grid_fine_resolution = 150     # points per axis (multiple of coarse)
+    validation_grid_neighbor_sectors = 1      # dilation of the refined sector set
+    validation_grid_chunk_size = 262144       # points per forward pass

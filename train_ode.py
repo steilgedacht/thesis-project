@@ -9,6 +9,7 @@ from tqdm import tqdm
 from utils.mri_dataloader import MRI_Dataloader
 from utils.dataloader import Validation_Extrapolation_LesionDataset, Validation_Interpolation_LesionDataset, Plotting_LesionDataset
 from utils.train_plotting import *
+from utils.grid_validation import evaluator_from_config, grid_validation_metrics, lesion_validation_cases
 import argparse
 import requests
 import json
@@ -79,7 +80,54 @@ def plot_extrapolation_time(loss_T_pairs, global_step):
     mlflow.log_artifact(output_path)
     plt.close()
 
+_GRID_EVALUATOR = None
+
+
+def _grid_evaluator():
+    """One evaluator per run so the fine ground-truth grids are cached across epochs."""
+    global _GRID_EVALUATOR
+    if _GRID_EVALUATOR is None:
+        _GRID_EVALUATOR = evaluator_from_config(config)
+    return _GRID_EVALUATOR
+
+
+def validate_polation_grid(data_loader, text, plot, global_step, criterion):
+    """Coarse-to-fine uniform-grid Dice, matching validation_arena.py (see utils/grid_validation.py)."""
+    del criterion
+    evaluator = _grid_evaluator()
+    lesion_ids, results, loss_T_pairs = [], [], []
+    for trj, date, embedding_id, T in tqdm(
+        lesion_validation_cases(data_loader.dataset), desc=text, total=len(data_loader.dataset)
+    ):
+        result = evaluator.evaluate(model, trj, date, embedding_id)
+        lesion_ids.append(f"{trj.patient_id}_{trj.label_id}")
+        results.append(result)
+        loss_T_pairs.append((1.0 - result.dice_score, torch.tensor(T)))
+
+    metrics, mean_dice = grid_validation_metrics(
+        text.lower().replace(" ", "_"), lesion_ids, results, evaluator,
+        extrapolation=(text == "Valid Extrapolation"),
+    )
+    mlflow.log_metrics(metrics, step=global_step)
+
+    if text == "Valid Extrapolation" and plot:
+        plot_extrapolation_time(loss_T_pairs, global_step)
+
+    return 1.0 - mean_dice
+
+
 def validate_polation(data_loader, text, plot, global_step, criterion):
+    """Dispatch on config.validation_mode: "grid" (default) or "sampled" (legacy)."""
+    mode = getattr(config, "validation_mode", "grid")
+    if mode == "grid":
+        return validate_polation_grid(data_loader, text, plot, global_step, criterion)
+    if mode == "sampled":
+        return validate_polation_sampled(data_loader, text, plot, global_step, criterion)
+    raise ValueError(f"Unknown validation_mode: {mode!r} (expected 'grid' or 'sampled').")
+
+
+def validate_polation_sampled(data_loader, text, plot, global_step, criterion):
+    """Legacy: Dice on the importance-sampled points of the dataset (biased towards the lesion)."""
     loss = 0.0
     volume_error_cm3 = []
 

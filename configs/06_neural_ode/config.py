@@ -10,7 +10,7 @@ class Config:
 
 
     """ Dataloading parameters """
-    batchsize = 64
+    batchsize = 16
     num_workers = 7
     prefetch_factor = 2
     pin_memory = True
@@ -35,7 +35,7 @@ class Config:
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     epochs = 100
-    background_samples = 3000
+    background_samples = 10000
     lr = 4e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.0001
@@ -54,9 +54,9 @@ class Config:
     
     # Instantiate loss with dynamic weighting
     loss_fn = Loss_BCE_Dice_TV(
-        lambda_space=3e-5, 
+        lambda_space=0.0, 
         lambda_time=0.001,
-        use_dynamic_pos_weight=use_dynamic_pos_weight,
+        use_dynamic_pos_weight=False,
     )
 
 
@@ -77,14 +77,14 @@ class Config:
     # )
 
     model_params = dict(
-        patient_embed_dim=256,
-        latent_dim=256,
-        ode_hidden_dim=256,
+        patient_embed_dim=512,
+        latent_dim=512,
+        ode_hidden_dim=512,
         ode_layers=3,
         ode_steps=8,
         ode_method="rk4",
         max_t=3650.0,
-        spatial_hidden_dim=256,
+        spatial_hidden_dim=512,
         spatial_layers=8,
         num_fourier_frequencies=8,
         # new: add as separate args in NeuralODETranslationINR
@@ -102,6 +102,16 @@ class Config:
     n_monitoring_samples_to_visualize = 5
     validation_interval = 5
     plot_validation_interval = 25
+
+    # Validation on a uniform grid over [-1, 1]^3 like validation_arena.py.
+    # "grid": coarse pass (one query per sector) -> refine sectors that are
+    # predicted positive, contain the lesion, or neighbour those, at fine res.
+    # "sampled": legacy Dice on the importance-sampled dataset points.
+    validation_mode = "grid"
+    validation_grid_coarse_resolution = 15    # sectors per axis
+    validation_grid_fine_resolution = 150     # points per axis (multiple of coarse)
+    validation_grid_neighbor_sectors = 1      # dilation of the refined sector set
+    validation_grid_chunk_size = 262144       # points per forward pass
     print_loss_interval = 10
     
     time_evolution_steps = 100

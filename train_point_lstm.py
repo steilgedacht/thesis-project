@@ -10,6 +10,7 @@ import json
 import os
 import random
 import socket
+import zlib
 from pathlib import Path
 
 import matplotlib
@@ -35,7 +36,10 @@ from utils.dataloader_point_lstm import (
     lesion_key,
     point_lstm_collate,
 )
+from utils.grid_validation import evaluator_from_config, grid_validation_metrics
 from utils.mri_dataloader import MRI_Dataloader
+from utils.paths import DatasetPaths
+from utils.train_plotting_point_lstm import plot_point_lstm_time_evolution
 
 print(f"Hostname: {socket.gethostname()}")
 
@@ -106,6 +110,73 @@ def validate(model, loader, name, criterion, config, global_step):
     return days_and_dice
 
 
+_GRID_EVALUATOR = None
+
+
+@torch.no_grad()
+def validate_grid(model, loader, name, config, global_step):
+    """Coarse-to-fine uniform-grid Dice, matching validation_arena.py (see utils/grid_validation.py).
+
+    History and latent are computed once per case exactly like the arena's
+    _infer_point_lstm; only the decoder is queried on the grid points.
+    """
+    global _GRID_EVALUATOR
+    if _GRID_EVALUATOR is None:  # one per run: fine ground truth is cached across epochs
+        _GRID_EVALUATOR = evaluator_from_config(config)
+    evaluator = _GRID_EVALUATOR
+    dataset = loader.dataset
+    model.eval()
+
+    lesion_ids, results, days_and_dice = [], [], []
+    for trj, target_date, days in tqdm(dataset.cases, desc=name):
+        history_dates = evaluation_history(
+            trj, target_date, dataset.validation_samples, model.max_history_len
+        )
+        entries = [dataset.cache.get(trj, d) for d in history_dates]
+        rng = np.random.default_rng(
+            dataset.seed + zlib.crc32(f"{lesion_key(trj)}|{target_date}".encode())
+        )
+        history = batch_to_device(
+            collate_history([history_arrays(entries, model.history_points, rng, dataset.ring_mm)]),
+            config.device,
+        )
+        patient_idx = torch.as_tensor([int(dataset.get_embedding_id(trj))], device=config.device)
+        target_time = torch.tensor(
+            [evaluator.target_time(trj, target_date)], dtype=torch.float32, device=config.device
+        )
+        z = model.latent(model.encode_history(history), target_time, patient_idx)
+
+        def query(xyz, time_point, z=z, last=entries[-1]):
+            sdf = None
+            if model.use_sdf_prior:
+                sdf = torch.from_numpy(last.sdf_at_model(xyz)).view(1, -1, 1).to(config.device)
+            return model.decode(evaluator.coords_tensor(xyz, time_point), z, sdf)
+
+        result = evaluator.evaluate_query(query, trj, target_date)
+        lesion_ids.append(lesion_key(trj))
+        results.append(result)
+        if days >= 0:
+            days_and_dice.append((float(days), result.dice_score))
+
+    metrics, _ = grid_validation_metrics(
+        name.lower().replace(" ", "_"), lesion_ids, results, evaluator,
+        extrapolation=(dataset.split == "extrapolation"),
+    )
+    mlflow.log_metrics(metrics, step=global_step)
+    model.train()
+    return days_and_dice
+
+
+def run_validation(model, loader, name, criterion, config, global_step):
+    """Dispatch on config.validation_mode: "grid" (default) or "sampled" (legacy)."""
+    mode = getattr(config, "validation_mode", "grid")
+    if mode == "grid":
+        return validate_grid(model, loader, name, config, global_step)
+    if mode == "sampled":
+        return validate(model, loader, name, criterion, config, global_step)
+    raise ValueError(f"Unknown validation_mode: {mode!r} (expected 'grid' or 'sampled').")
+
+
 # ---------------------------------------------------------------------------
 # Qualitative plot: axial slice through the target lesion
 # ---------------------------------------------------------------------------
@@ -159,14 +230,14 @@ def plot_slices(model, dataset, config, epoch, n_cases):
     model.train()
 
 
-def plot_extrapolation_by_horizon(days_and_dice, global_step):
+def plot_extrapolation_by_horizon(days_and_dice, global_step, ylabel="hard Dice (sampled points)"):
     if len(days_and_dice) < 2:
         return
     days, dice = np.asarray(days_and_dice).T
     fig, ax = plt.subplots(figsize=(5, 4))
     ax.scatter(days, dice, s=12)
     ax.set_xlabel("days before trajectory end (T minus)")
-    ax.set_ylabel("hard Dice (sampled points)")
+    ax.set_ylabel(ylabel)
     ax.set_ylim(0, 1)
     fig.tight_layout()
     output_path = f"/tmp/point_lstm_extrapolation_horizon_step{global_step}.png"
@@ -178,7 +249,18 @@ def plot_extrapolation_by_horizon(days_and_dice, global_step):
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-def train(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, config):
+def plot_time_evolutions(model, trajectories, dataset, config, epoch, final_side_length=False):
+    """Time-evolution GIFs (as in utils/train_plotting.py) for the plotting lesions."""
+    for trj in trajectories:
+        plot_point_lstm_time_evolution(
+            model, epoch, trj, dataset.cache, dataset.validation_samples,
+            dataset.get_embedding_id(trj), config,
+            final_side_length=final_side_length, ring_mm=dataset.ring_mm,
+        )
+
+
+def train(model, train_loader, valid_interpolation_loader, valid_extrapolation_loader, config,
+          plotting_trajectories=()):
     optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.epochs, eta_min=config.scheduler_eta_min
@@ -222,16 +304,25 @@ def train(model, train_loader, valid_interpolation_loader, valid_extrapolation_l
         if config.only_train:
             continue
         if epoch % config.validation_interval == 0 or epoch == config.epochs:
-            days_and_dice = validate(model, valid_extrapolation_loader, "Valid Extrapolation",
-                                     criterion, config, global_step)
-            validate(model, valid_interpolation_loader, "Valid Interpolation",
-                     criterion, config, global_step)
+            days_and_dice = run_validation(model, valid_extrapolation_loader, "Valid Extrapolation",
+                                           criterion, config, global_step)
+            run_validation(model, valid_interpolation_loader, "Valid Interpolation",
+                           criterion, config, global_step)
             if epoch % config.plot_validation_interval == 0 or epoch == config.epochs:
-                plot_extrapolation_by_horizon(days_and_dice, global_step)
+                plot_extrapolation_by_horizon(
+                    days_and_dice, global_step,
+                    "hard Dice (uniform grid)" if getattr(config, "validation_mode", "grid") == "grid"
+                    else "hard Dice (sampled points)",
+                )
                 for loader in (valid_extrapolation_loader, valid_interpolation_loader):
                     plot_slices(model, loader.dataset, config, epoch, config.n_monitoring_samples_to_visualize)
+                if epoch != config.epochs:  # the final epoch is plotted at full size below
+                    plot_time_evolutions(model, plotting_trajectories,
+                                         valid_extrapolation_loader.dataset, config, epoch)
 
     mlflow.pytorch.log_model(model, name=config.model_save_name, serialization_format="pickle")
+    plot_time_evolutions(model, plotting_trajectories, valid_extrapolation_loader.dataset,
+                         config, config.epochs, final_side_length=True)
     return losses
 
 
@@ -306,8 +397,15 @@ def main():
         for source in ("train_point_lstm.py", "utils/model_point_lstm.py", "utils/dataloader_point_lstm.py"):
             mlflow.log_artifact(source)
 
+        with open(DatasetPaths().plotting_samples(), encoding="utf-8") as file:
+            plotting_keys = {f"{s['Patient']}_{s['Lesion']}" for s in json.load(file)}
+        plotting_trajectories = list(
+            {lesion_key(t): t for t in base_trajectories if lesion_key(t) in plotting_keys}.values()
+        )
+
         losses = train(model, train_loader, validation_loaders["interpolation"],
-                       validation_loaders["extrapolation"], config)
+                       validation_loaders["extrapolation"], config,
+                       plotting_trajectories=plotting_trajectories)
         if losses:
             mlflow.log_metric("final_train_loss", losses[-1])
 

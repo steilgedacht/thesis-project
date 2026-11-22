@@ -385,12 +385,13 @@ def collate_history(histories):
 
 
 def build_item(cache, trj, history_dates, target_date, history_points, query_points,
-               rng, ring_mm, embedding_id):
+               rng, ring_mm, embedding_id, query_fractions=None):
     if str(target_date) in {str(d) for d in history_dates}:
         raise ValueError(f"Target {target_date} must not be part of the history")
     entries = [cache.get(trj, d) for d in history_dates]
     target = cache.get(trj, target_date)
-    xyz, labels, sdf = sample_query_points(target, entries[-1], query_points, rng, ring_mm)
+    fractions = {} if query_fractions is None else {"fractions": tuple(query_fractions)}
+    xyz, labels, sdf = sample_query_points(target, entries[-1], query_points, rng, ring_mm, **fractions)
     coords = np.concatenate([xyz, np.full((len(xyz), 1), target.time, np.float32)], axis=1)
     return {
         "history": history_arrays(entries, history_points, rng, ring_mm),
@@ -430,11 +431,17 @@ def batch_to_device(batch, device):
 class _PointLSTMBase(Dataset):
     def __init__(self, trajectories, history_points=1024, query_points=3000,
                  max_history_len=5, sdf_clip_mm=20.0, ring_mm=3.0,
-                 cache=None, **_unused):
+                 query_fractions=None, cache=None, **_unused):
         self.history_points = history_points
         self.query_points = query_points
         self.max_history_len = max_history_len
         self.ring_mm = ring_mm
+        # (lesion, target ring, last-history ring, box around lesions, whole volume);
+        # None keeps the defaults of sample_query_points.
+        if query_fractions is not None:
+            if len(query_fractions) != 5 or abs(sum(query_fractions) - 1.0) > 1e-6:
+                raise ValueError(f"query_fractions needs 5 entries summing to 1, got {query_fractions}")
+        self.query_fractions = query_fractions
         self.cache = cache if cache is not None else ScanCache(sdf_clip_mm)
         self.validation_samples = load_validation_samples()
         with open(DatasetPaths().patient_to_idx(), encoding="utf-8") as file:
@@ -496,6 +503,7 @@ class PointLSTMDataset(_PointLSTMBase):
         return build_item(
             self.cache, trj, history_dates, target_date, self.history_points,
             self.query_points, rng, self.ring_mm, self.get_embedding_id(trj),
+            self.query_fractions,
         )
 
 
@@ -533,6 +541,7 @@ class PointLSTMValidationDataset(_PointLSTMBase):
         item = build_item(
             self.cache, trj, history, target_date, self.history_points,
             self.query_points, rng, self.ring_mm, self.get_embedding_id(trj),
+            self.query_fractions,
         )
         item["days_from_endpoint"] = days
         return item
