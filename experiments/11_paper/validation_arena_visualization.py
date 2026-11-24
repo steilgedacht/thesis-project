@@ -151,11 +151,15 @@ with st.sidebar:
 
     st.header("Experiment & Run")
     exp_ids = list(experiments)
-    if DEFAULT_EXPERIMENT_ID in experiments:
+    # By name first: experiment ids differ between MLflow servers
+    # (server: 9, local: 11), and id 9 is another experiment locally.
+    by_name = [i for i, n in experiments.items() if n == DEFAULT_EXPERIMENT_NAME]
+    if by_name:
+        default_idx = exp_ids.index(by_name[0])
+    elif DEFAULT_EXPERIMENT_ID in experiments:
         default_idx = exp_ids.index(DEFAULT_EXPERIMENT_ID)
     else:
-        by_name = [i for i, n in experiments.items() if n == DEFAULT_EXPERIMENT_NAME]
-        default_idx = exp_ids.index(by_name[0]) if by_name else 0
+        default_idx = 0
     exp_id = st.selectbox(
         "Experiment",
         exp_ids,
@@ -245,10 +249,12 @@ for _, r in runs_raw.iterrows():
 if model_rows:
     st.dataframe(pd.DataFrame(model_rows), width="stretch", hide_index=True)
 st.caption(
-    "embedding_trajectory: INR / Neural ODE / LSTM fit a new embedding on YG_WCONBI42RLEZ_1 "
-    "(frozen network) and are scored on every scan. The Point-LSTM needs no fitting: each "
-    "scan is predicted from the scans before it, so its first scan is skipped. Baselines "
-    "copy (or dilate) the previous scan."
+    "embedding_trajectory: new-lesion test on YG_69FMUN9PHHKE_2 (never trained, same "
+    "protocol as new_patient_fit.py). INR / Neural ODE / LSTM fit only an embedding "
+    "(frozen network) on its first scans and are scored on the last 2 held-out scans. "
+    "The Point-LSTM needs no fitting: it predicts the held-out scans from the same first "
+    "scans. Baselines copy (or dilate) the last of those scans. Runs before this change "
+    "used YG_WCONBI42RLEZ_1 (a training lesion) and scored every scan."
 )
 
 

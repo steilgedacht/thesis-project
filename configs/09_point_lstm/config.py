@@ -40,7 +40,7 @@ class Config:
 
     """ Training parameters """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    epochs = 150
+    epochs = 1000
     lr = 4e-4
     weight_decay = 1e-6
     scheduler_eta_min = lr * 0.01
@@ -81,8 +81,8 @@ class Config:
 
     """ Logging parameters """
     train_log_interval = 10
-    validation_interval = 5
-    plot_validation_interval = 25
+    validation_interval = 25
+    plot_validation_interval = 250
     n_monitoring_samples_to_visualize = 5
 
     # Time-evolution GIF (utils/train_plotting_point_lstm.py), as for INR / ODE

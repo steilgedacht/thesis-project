@@ -40,6 +40,7 @@ from utils.model_neural_ode import NeuralODE_INR
 from utils.model_neural_ode_translation import NeuralODETranslationINR
 from utils.patient import Patient
 from utils.paths import DatasetPaths
+from utils.region_prior import apply_region_prior
 from utils.train_plotting import (
     _compute_lesion_z_voxel,
     _compute_reference_geometry,
@@ -48,7 +49,7 @@ from utils.train_plotting import (
 )
 
 
-RUN_ID = "50d82532807e4da3ab4eead3869afb8c"
+RUN_ID = "315faa8e61c74cceaced1bc78e9497a0"  # ODE + fixes, round 2 (best NODE)
 TRACKING_URI = "http://127.0.0.1:5124"
 MODEL_ARTIFACT = "lesion_ode_model"
 LABEL_COLOR = "#c62523"
@@ -59,9 +60,9 @@ EVALUATION_LABEL_COLOR = "#CB9412"
 TIMELINE_COLOR = PREDICTION_COLOR
 INR_COLOR = "#8e44ad"
 LSTM_COLOR = "#089284"
-DEFAULT_INR_RUN_ID = "ac4338b4ad0a4f5b8b72d48b159520ca"
+DEFAULT_INR_RUN_ID = "adea3d5301684f30aed0345694012672"  # INR + region prior, collapse fixes
 DEFAULT_LSTM_RUN_ID = "8d67b8dd7050458fa6ea391e46296639"
-PLOT_CACHE_VERSION = 3
+PLOT_CACHE_VERSION = 4  # 4: region prior in NODE plots, per-lesion extrapolation phase
 
 
 class _OrthogonalConnection:
@@ -100,6 +101,12 @@ def _arguments():
         action="store_true",
         dest="no_comparisons",
         help="Plot only the Neural ODE (NODE), skipping INR and LSTM comparisons.",
+    )
+    parser.add_argument(
+        "--y-quantity",
+        choices=("radius", "volume"),
+        default="radius",
+        help="Timeline y-axis: spherical-equivalent radius [mm] (default) or volume [cm^3].",
     )
     parser.add_argument("--time-steps", type=int, default=300,
                         help="Number of ODE evaluation times before adding label dates.")
@@ -149,10 +156,10 @@ def _plotting_dataset():
     return dataloader, plotting_dataset
 
 
-def _interpolation_date(trajectory: Lesion_Trajectory) -> str | None:
+def _validation_sample(trajectory: Lesion_Trajectory) -> dict | None:
     with open(DatasetPaths().validation_samples(), encoding="utf-8") as file:
         validation_samples = json.load(file)
-    sample = next(
+    return next(
         (
             item for item in validation_samples
             if item["Patient"] == trajectory.patient_id
@@ -160,16 +167,40 @@ def _interpolation_date(trajectory: Lesion_Trajectory) -> str | None:
         ),
         None,
     )
+
+
+def _interpolation_date(trajectory: Lesion_Trajectory) -> str | None:
+    sample = _validation_sample(trajectory)
     if sample is None:
         return None
     dates = trajectory.allowed_dates
     index = int(sample["interpolation"])
-    if not 0 <= index < len(dates):
+    if index < 0:  # -1: this lesion has no interpolation scan
+        return None
+    if index >= len(dates):
         raise ValueError(
             f"Interpolation index {index} is outside the {len(dates)} dates "
             f"for {trajectory.patient_id}, lesion {trajectory.label_id}."
         )
     return dates[index]
+
+
+def _extrapolation_start_day(trajectory, dates, label_days, interpolation_date):
+    """Day of the last training scan before the held-out extrapolation scans.
+
+    Falls back to the old "last 180 days" window for lesions without
+    validation extrapolation dates.
+    """
+    sample = _validation_sample(trajectory)
+    held_out = [str(d) for d in (sample or {}).get("extrapolation_dates", []) if str(d) in dates]
+    if not held_out:
+        return max(0.0, float(label_days[-1]) - 180.0)
+    first = min(dates.index(d) for d in held_out)
+    training_before = [i for i in range(first) if dates[i] != interpolation_date]
+    if not training_before:
+        raise ValueError(f"No training scan before the extrapolation scans of "
+                         f"{trajectory.patient_id}, lesion {trajectory.label_id}.")
+    return float(label_days[training_before[-1]])
 
 
 def _trajectory_data(trajectory: Lesion_Trajectory):
@@ -308,6 +339,17 @@ def _ode_states(model, patient_idx, time_points):
     return states
 
 
+def _with_region_prior(model, logits, model_xyz, chunk_index, batch_size, patient_idx):
+    """Region prior as in the model's forward (eval mode): absolute xyz, global id."""
+    if patient_idx is None or model_xyz is None or getattr(model, "region_prior", None) is None:
+        return logits
+    start = chunk_index * batch_size
+    xyz = torch.as_tensor(
+        model_xyz[start:start + batch_size], dtype=logits.dtype, device=logits.device
+    ).unsqueeze(0)
+    return apply_region_prior(model, logits, xyz, patient_idx)
+
+
 def _predicted_volumes_mm3(
     model,
     encoded_chunks,
@@ -315,6 +357,7 @@ def _predicted_volumes_mm3(
     sample_weight_mm3,
     model_xyz=None,
     batch_size=8192,
+    patient_idx=None,
 ):
     volumes = []
     with torch.inference_mode():
@@ -334,9 +377,12 @@ def _predicted_volumes_mm3(
                 shape_state = state
                 state_encoded_chunks = encoded_chunks
             predicted_volume = 0.0
-            for encoded in state_encoded_chunks:
+            for chunk_index, encoded in enumerate(state_encoded_chunks):
                 state_for_chunk = shape_state.unsqueeze(1).expand(-1, encoded.shape[1], -1)
                 logits = model.decoder(encoded, state_for_chunk)
+                logits = _with_region_prior(
+                    model, logits, model_xyz, chunk_index, batch_size, patient_idx
+                )
                 predicted_volume += float(torch.sigmoid(logits).sum().item())
             volumes.append(predicted_volume * sample_weight_mm3)
     return np.asarray(volumes, dtype=float)
@@ -359,14 +405,18 @@ def _voxel_model_grid(shape, affine, geometry, z_index, max_side_length=192):
     return _voxel_to_model_space(voxels, affine, geometry.volume_center_phys), grid_shape
 
 
-def _prediction_slice_masks(model, encoded_chunks, state):
+def _prediction_slice_masks(model, encoded_chunks, state, model_xyz=None,
+                            patient_idx=None, batch_size=8192):
     if isinstance(state, tuple):
         state = state[0]
     masks = []
     with torch.inference_mode():
-        for encoded in encoded_chunks:
+        for chunk_index, encoded in enumerate(encoded_chunks):
             state_for_chunk = state.unsqueeze(1).expand(-1, encoded.shape[1], -1)
             logits = model.decoder(encoded, state_for_chunk)
+            logits = _with_region_prior(
+                model, logits, model_xyz, chunk_index, batch_size, patient_idx
+            )
             masks.append((logits.squeeze(0).squeeze(-1) >= 0).cpu().numpy())
     return np.concatenate(masks).reshape(-1)
 
@@ -589,6 +639,8 @@ def _read_plot_cache(output_path, signature):
             plot_data = {key: archive[key] for key in archive.files}
         plot_data["dates"] = metadata["dates"]
         plot_data["interpolation_date"] = metadata["interpolation_date"]
+        # KeyError for caches written before this field existed -> recompute.
+        plot_data["extrapolation_start_day"] = metadata["extrapolation_start_day"]
         if len(plot_data["panel_indices"]) != min(6, len(metadata["dates"])):
             return None
         comparison_predictions = {}
@@ -633,6 +685,7 @@ def _write_plot_cache(output_path, signature, plot_data):
         "signature": signature,
         "dates": plot_data["dates"],
         "interpolation_date": plot_data["interpolation_date"],
+        "extrapolation_start_day": plot_data["extrapolation_start_day"],
         "comparisons": comparisons,
     }
 
@@ -665,6 +718,8 @@ def _render_plot_data(trajectory, plot_data, args, output_path):
         output_path,
         args.prediction_spacing_mm,
         plot_data["comparison_predictions"],
+        extrapolation_start_day=plot_data.get("extrapolation_start_day"),
+        y_quantity=getattr(args, "y_quantity", "radius"),
     )
     plt.close(figure)
     print(f"Saved plot to {output_path}")
@@ -692,9 +747,15 @@ def _aligned_mri_slices(dataloader, trajectory, affine, shape, z_index):
     return slices
 
 
+def _size_text(radius_mm, y_quantity="radius"):
+    if y_quantity == "volume":
+        return f"V={_volume_from_radius_mm(radius_mm) / 1000.0:.2f} cm³"
+    return f"r={radius_mm:.1f} mm"
+
+
 def _add_contact_panels(fig, grid, label_slices, label_days, label_radii_mm,
                         mri_slices, prediction_slices, dates, interpolation_date,
-                        columns=4):
+                        columns=4, y_quantity="radius"):
     rows = int(np.ceil(len(label_slices) / columns))
     for index, (label_slice, day, radius, mri_slice, prediction, date) in enumerate(
         zip(label_slices, label_days, label_radii_mm, mri_slices, prediction_slices, dates)
@@ -718,7 +779,7 @@ def _add_contact_panels(fig, grid, label_slices, label_days, label_radii_mm,
         ax.text(
             0.03,
             0.04,
-            f"t={day:.0f} days    r={radius:.1f} mm",
+            f"t={day:.0f} days    {_size_text(radius, y_quantity)}",
             transform=ax.transAxes,
             color="grey",
             fontsize=8,
@@ -731,7 +792,7 @@ def _add_contact_panels(fig, grid, label_slices, label_days, label_radii_mm,
 
 def _add_boundary_zoom_panels(fig, grid, label_slices, label_days,
                               label_radii_mm, mri_slices, prediction_slices,
-                              columns=4):
+                              columns=4, y_quantity="radius"):
     rows = int(np.ceil(len(label_slices) / columns))
     for index, (label_slice, day, radius, mri_slice, prediction) in enumerate(
         zip(label_slices, label_days, label_radii_mm, mri_slices, prediction_slices)
@@ -767,7 +828,7 @@ def _add_boundary_zoom_panels(fig, grid, label_slices, label_days,
         ax.text(
             0.03,
             0.04,
-            f"t={day:.0f} days    r={radius:.1f} mm",
+            f"t={day:.0f} days    {_size_text(radius, y_quantity)}",
             transform=ax.transAxes,
             color="grey",
             fontsize=8,
@@ -781,7 +842,8 @@ def _add_boundary_zoom_panels(fig, grid, label_slices, label_days,
 def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
                  prediction_days, prediction_radii_mm, mri_slices,
                  prediction_slices, dates, panel_indices, interpolation_date,
-                 output_path, prediction_spacing_mm, comparison_predictions=None):
+                 output_path, prediction_spacing_mm, comparison_predictions=None,
+                 extrapolation_start_day=None, y_quantity="radius"):
     columns = 6
     if len(label_slices) > columns:
         raise ValueError(f"Expected at most {columns} MRI overlay panels, got {len(label_slices)}.")
@@ -818,6 +880,7 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
         [dates[index] for index in panel_indices],
         interpolation_date,
         columns,
+        y_quantity,
     )
     zoom_grid = contact_rows_grid[1, 0].subgridspec(
         contact_rows,
@@ -833,13 +896,30 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
         mri_slices,
         prediction_slices,
         columns,
+        y_quantity,
     )
     ax = fig.add_subplot(outer[0, :])
 
     end_day = float(label_days[-1])
-    extrapolation_start = max(float(prediction_days[0]), end_day - 180.0)
+    # Held-out extrapolation scans of the validation set start after this day.
+    extrapolation_start = (
+        float(extrapolation_start_day)
+        if extrapolation_start_day is not None
+        else max(float(prediction_days[0]), end_day - 180.0)
+    )
     prediction_radii_mm = np.asarray(prediction_radii_mm, dtype=float)
     label_radii_mm = np.asarray(label_radii_mm, dtype=float)
+    comparison_predictions = dict(comparison_predictions or {})
+    if y_quantity == "volume":
+        # The timeline below is drawn from these arrays; in volume mode they
+        # hold V = 4/3 pi r^3 in cm^3 instead of the radius in mm.
+        to_cm3 = lambda radii: _volume_from_radius_mm(radii) / 1000.0
+        prediction_radii_mm = to_cm3(prediction_radii_mm)
+        label_radii_mm = to_cm3(label_radii_mm)
+        comparison_predictions = {
+            name: (days, to_cm3(np.asarray(radii, dtype=float)), color)
+            for name, (days, radii, color) in comparison_predictions.items()
+        }
     if end_day > extrapolation_start:
         ax.axvspan(
             extrapolation_start,
@@ -907,7 +987,8 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
         label_color = (
             EVALUATION_LABEL_COLOR
             if is_interpolation
-            else EVALUATION_LABEL_COLOR if day >= extrapolation_start else LABEL_COLOR
+            # The phase starts at the last training scan; only later scans are held out.
+            else EVALUATION_LABEL_COLOR if day > extrapolation_start else LABEL_COLOR
         )
         ax.vlines(
             day,
@@ -941,7 +1022,9 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
     ax.set_ylim(0, y_limit)
     ax.set_xlim(-10, end_day + 10)
     ax.yaxis.set_major_locator(LinearLocator(10))
-    ax.yaxis.set_major_formatter(FormatStrFormatter("%.0f"))
+    ax.yaxis.set_major_formatter(
+        FormatStrFormatter("%.1f" if y_quantity == "volume" and y_limit < 20 else "%.0f")
+    )
     ax.spines["bottom"].set_position(("data", 0))
     ax.spines["bottom"].set_bounds(-10, end_day + 10)
     ax.xaxis.set_ticks_position("bottom")
@@ -950,9 +1033,12 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
         bbox={"facecolor": "white", "alpha": 0.5, "edgecolor": "none"},
     )
     x_label.set_zorder(10)
-    ax.set_ylabel(
-        r"Spherical-equivalent lesion radius [mm]  $r = \sqrt[3]{\frac{3V}{4\pi}}$          "
-    )
+    if y_quantity == "volume":
+        ax.set_ylabel("Lesion volume [cm³]")
+    else:
+        ax.set_ylabel(
+            r"Spherical-equivalent lesion radius [mm]  $r = \sqrt[3]{\frac{3V}{4\pi}}$          "
+        )
     # ax.grid(axis="y", which="major", color="#aeb7c0", linewidth=0.7, alpha=0.55)
     # ax.grid(axis="y", which="minor", color="#d5dbe1", linewidth=0.55, alpha=0.55)
     ax.tick_params(axis="y", which="minor", length=0)
@@ -1018,7 +1104,7 @@ def _make_figure(trajectory, label_slices, label_days, label_radii_mm,
         ax.text(
             x_mid,
             brace_y + 3.1 * brace_depth,
-            "Evaluation Extrapolation phase\n(180 days before last label)",
+            "Evaluation Extrapolation phase\n(held-out scans of the last 180 days)",
             color=EVALUATION_LABEL_COLOR,
             ha="center",
             va="bottom",
@@ -1147,6 +1233,9 @@ def _render_trajectory(model, dataloader, trajectory, args, device,
         label_volumes_mm3,
         interpolation_index,
     )
+    extrapolation_start_day = _extrapolation_start_day(
+        trajectory, dates, label_days, interpolation_date
+    )
     prediction_days = np.unique(
         np.concatenate(
             [
@@ -1156,7 +1245,7 @@ def _render_trajectory(model, dataloader, trajectory, args, device,
                     args.time_steps,
                 ),
                 label_days,
-                [max(0.0, float(label_days[-1]) - 180.0)],
+                [extrapolation_start_day],
             ]
         )
     )
@@ -1178,6 +1267,7 @@ def _render_trajectory(model, dataloader, trajectory, args, device,
             sample_weight_mm3,
             model_xyz=volume_xyz,
             batch_size=args.batch_size,
+            patient_idx=patient_idx,
         )
 
         slice_xyz, slice_shape = _voxel_model_grid(shape, affine, geometry, lesion_z)
@@ -1200,6 +1290,9 @@ def _render_trajectory(model, dataloader, trajectory, args, device,
                 model,
                 slice_encoding_for_state,
                 state,
+                model_xyz=slice_xyz,
+                patient_idx=patient_idx,
+                batch_size=args.batch_size,
             ).reshape(slice_shape)
             if mask.shape != tuple(shape[:2]):
                 mask = _resize_2d(mask.astype(np.uint8), shape[:2], order=0).astype(bool)
@@ -1249,6 +1342,7 @@ def _render_trajectory(model, dataloader, trajectory, args, device,
         "dates": dates,
         "panel_indices": selected_indices,
         "interpolation_date": interpolation_date,
+        "extrapolation_start_day": extrapolation_start_day,
         "comparison_predictions": comparison_predictions,
     }
     if cache_signature is not None:
