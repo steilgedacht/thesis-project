@@ -65,6 +65,10 @@ class DenseLesionDataset(LesionDataset):
         background_samples=3000,
         oversample_positive_samples=True,
         preload_processes=8,
+        near_field_fraction=0.0,
+        near_field_margin_mm=20.0,
+        voxel_jitter=False,
+        single_time_items=False,
     ):
         if background_samples < 3:
             raise ValueError("background_samples must be at least 3")
@@ -76,6 +80,24 @@ class DenseLesionDataset(LesionDataset):
             background_samples=background_samples,
             oversample_positive_samples=oversample_positive_samples,
         )
+        if not 0.0 <= near_field_fraction <= 1.0:
+            raise ValueError("near_field_fraction must be in [0, 1]")
+        # Share of the far-background negatives that is instead drawn from the
+        # crop box grown by near_field_margin_mm (0 = previous behaviour).
+        self.near_field_fraction = float(near_field_fraction)
+        self.near_field_margin_mm = float(near_field_margin_mm)
+        # Move each sample uniformly inside its voxel (+-0.5 voxel per axis) instead
+        # of the voxel centre. With 5-6.5 mm slices the centres all lie on the
+        # slice planes and the space between slices is never supervised; the
+        # label stays the voxel's, i.e. nearest-voxel like the grid validation.
+        self.voxel_jitter = bool(voxel_jitter)
+        # The models read ONE time per item (INR: time of point 0, NODE: mean
+        # time). Mixed items (2/3 of the points at the target scan time, 1/3 at
+        # random intermediate times) therefore train with wrong times. With this
+        # flag an item is either a scan item (all points at the scan time) or,
+        # with probability 1/3, an intermediate item (all points at one random
+        # time), which keeps the same overall share of each kind of point.
+        self.single_time_items = bool(single_time_items)
         self._crops = {}
         if preload_processes:
             self.preload(processes=preload_processes)
@@ -198,23 +220,43 @@ class DenseLesionDataset(LesionDataset):
         return voxels[indices]
 
     @staticmethod
-    def _sample_outside(shape, crop_mask, origin, count):
-        """``count`` voxels uniformly from the full volume where ``crop_mask`` is False.
+    def _sample_outside(shape, crop_mask, origin, count, lo=None, hi=None):
+        """``count`` voxels uniformly from the box [lo, hi) where ``crop_mask`` is False.
 
-        Equivalent to drawing with replacement from ``np.argwhere(~mask)``, but
+        The box defaults to the full volume. Equivalent to drawing with
+        replacement from ``np.argwhere(~mask)`` restricted to the box, but
         without listing the millions of background voxels.
         """
         if count == 0:
             return np.empty((0, 3), dtype=np.int64)
-        shape = np.asarray(shape, dtype=np.int64)
+        lo = np.zeros(3, dtype=np.int64) if lo is None else np.asarray(lo, dtype=np.int64)
+        hi = np.asarray(shape, dtype=np.int64) if hi is None else np.asarray(hi, dtype=np.int64)
         accepted, total = [], 0
         while total < count:
             draw = max(2 * (count - total), 64)
-            candidates = np.random.randint(0, shape, size=(draw, 3))
+            candidates = np.random.randint(lo, hi, size=(draw, 3))
             keep = candidates[~_crop_lookup(crop_mask, origin, candidates)]
             accepted.append(keep)
             total += len(keep)
         return np.concatenate(accepted)[:count]
+
+    def _near_field_box(self, crop):
+        """Crop box (lesion union + border margin) grown by near_field_margin_mm."""
+        spacing = np.linalg.norm(crop.affine[:3, :3], axis=0)
+        grow = np.ceil(self.near_field_margin_mm / np.maximum(spacing, 1e-6)).astype(np.int64)
+        crop_shape = np.asarray(crop.counts.shape, dtype=np.int64)
+        lo = np.maximum(crop.origin - grow, 0)
+        hi = np.minimum(crop.origin + crop_shape + grow, np.asarray(crop.shape, dtype=np.int64))
+        return lo, hi
+
+    def _sample_negatives(self, crop, mask, count):
+        """Background negatives; ``near_field_fraction`` of them from the near-field box."""
+        near_count = int(round(count * self.near_field_fraction))
+        parts = [self._sample_outside(crop.shape, mask, crop.origin, count - near_count)]
+        if near_count:
+            lo, hi = self._near_field_box(crop)
+            parts.append(self._sample_outside(crop.shape, mask, crop.origin, near_count, lo, hi))
+        return np.concatenate(parts)
 
     def _sample_observed(self, crop, target_mask, sample_count):
         positive_voxels = np.argwhere(target_mask) + crop.origin
@@ -247,8 +289,8 @@ class DenseLesionDataset(LesionDataset):
         )
 
         remaining_negative_count = negative_count - border_count
-        negative_samples = self._sample_outside(
-            crop.shape, target_mask, crop.origin, remaining_negative_count
+        negative_samples = self._sample_negatives(
+            crop, target_mask, remaining_negative_count
         )
         samples = np.concatenate(
             [positive_samples, border_samples, negative_samples], axis=0
@@ -278,7 +320,7 @@ class DenseLesionDataset(LesionDataset):
 
         negative_count = sample_count - positive_count
         positive_samples = self._sample_voxels(core_voxels, positive_count)
-        negative_samples = self._sample_outside(crop.shape, union, crop.origin, negative_count)
+        negative_samples = self._sample_negatives(crop, union, negative_count)
         voxels = np.concatenate([positive_samples, negative_samples], axis=0)
         labels = np.concatenate(
             [
@@ -288,8 +330,10 @@ class DenseLesionDataset(LesionDataset):
         )
         return voxels, labels
 
-    @staticmethod
-    def _voxel_coords(voxels, affine, volume_shape, times):
+    def _voxel_coords(self, voxels, affine, volume_shape, times):
+        voxels = voxels.astype(np.float64)
+        if self.voxel_jitter:
+            voxels = voxels + np.random.uniform(-0.5, 0.5, size=voxels.shape)
         voxel_indices = np.concatenate(
             [voxels, np.ones((len(voxels), 1), dtype=voxels.dtype)], axis=1
         )
@@ -318,7 +362,11 @@ class DenseLesionDataset(LesionDataset):
         core = remaining_positive_counts == remaining_scan_count
         union = remaining_positive_counts > 0
 
-        intermediate_count = self.max_samples // 3
+        if self.single_time_items:
+            intermediate_item = np.random.rand() < 1.0 / 3.0
+            intermediate_count = self.max_samples if intermediate_item else 0
+        else:
+            intermediate_count = self.max_samples // 3
         observed_count = self.max_samples - intermediate_count
 
         observed_voxels, observed_labels = self._sample_observed(
@@ -330,9 +378,14 @@ class DenseLesionDataset(LesionDataset):
 
         min_time = min(crop.times[date] for date in dates)
         max_time = max(crop.times[date] for date in dates)
-        intermediate_times = np.random.uniform(
-            min_time, max_time, size=intermediate_count
-        ).astype(np.float32)
+        if self.single_time_items:
+            intermediate_times = np.full(
+                intermediate_count, np.random.uniform(min_time, max_time), dtype=np.float32
+            )
+        else:
+            intermediate_times = np.random.uniform(
+                min_time, max_time, size=intermediate_count
+            ).astype(np.float32)
 
         coords = np.concatenate(
             [
@@ -340,7 +393,7 @@ class DenseLesionDataset(LesionDataset):
                     observed_voxels,
                     crop.affine,
                     crop.shape,
-                    np.full(observed_count, target_time, dtype=np.float32),
+                    np.full(len(observed_voxels), target_time, dtype=np.float32),
                 ),
                 self._voxel_coords(
                     intermediate_voxels,

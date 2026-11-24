@@ -1,8 +1,21 @@
+import json
+
 import torch
 import torch.nn as nn
 import numpy as np
 
+from .paths import DatasetPaths
 from .region_prior import RegionPrior, apply_region_prior
+
+
+def lesion_embedding_ids(trajectories):
+    """Global embedding ids (patient_idx * 100 + label_id, as LesionDataset.get_embedding_id)
+    of the unique lesions in ``trajectories``, plus the size of the global id space."""
+    with open(DatasetPaths().patient_to_idx(), "r") as f:
+        patient_to_idx = json.load(f)
+    ids = sorted({int(patient_to_idx[t.patient_id]) * 100 + int(t.label_id) for t in trajectories})
+    id_space = max(max(patient_to_idx.values()) + 1, ids[-1] // 100 + 1) * 100
+    return ids, id_space
 
 
 class TimeEncoder(nn.Module):
@@ -77,16 +90,28 @@ class LesionINR(nn.Module):
                  use_region_prior=False,
                  region_margin_mm=10.0,
                  region_strength_per_mm=1.0,
+                 region_prior_in_training=True,
 
             ):
         super().__init__()
-        num_patients = len(trajectories) * 100 # otherwise we get a lot of collisions in the embedding space for different lesions of the same patient
-        # Optional far-field prior, boxes are filled by utils.region_prior.attach_region_boxes
+        # One embedding row per training lesion. Callers keep passing the global
+        # embedding id; ``embedding_rows`` maps it to the compact row.
+        lesion_ids, id_space = lesion_embedding_ids(trajectories)
+        self.num_lesions = len(lesion_ids)
+        embedding_rows = torch.zeros(id_space, dtype=torch.long)  # unknown ids -> row 0
+        embedding_rows[torch.tensor(lesion_ids)] = torch.arange(len(lesion_ids))
+        self.register_buffer("embedding_rows", embedding_rows)
+        # Optional far-field prior, indexed by the global id; boxes are filled by
+        # utils.region_prior.attach_region_boxes
         self.region_prior = (
-            RegionPrior(num_patients, region_margin_mm, region_strength_per_mm)
+            RegionPrior(id_space, region_margin_mm, region_strength_per_mm)
             if use_region_prior else None
         )
-        self.latent_vectors = nn.Embedding(num_patients, latent_dim)
+        # False: the prior is only applied in eval mode. Applied during training
+        # it lets the INR predict "lesion" everywhere near the lesion and leave
+        # the shape to the prior (see configs/02_tv_regulation/config_region_prior.py).
+        self.region_prior_in_training = bool(region_prior_in_training)
+        self.latent_vectors = nn.Embedding(self.num_lesions, latent_dim)
         
         self.time_freqs = time_freqs
         self.time_encoder = TimeEncoder(
@@ -131,7 +156,9 @@ class LesionINR(nn.Module):
         raw_time = x[:, 0:1, 3] 
         t_encoded = self.time_encoder(raw_time) 
         
-        z_patient = self.latent_vectors(patient_idx)
+        # Checkpoints from before the compact table have no ``embedding_rows``
+        rows = getattr(self, "embedding_rows", None)
+        z_patient = self.latent_vectors(patient_idx if rows is None else rows[patient_idx])
         z_combined = torch.cat([z_patient, t_encoded], dim=-1)
         
         z = self.latent_adapt(z_combined)

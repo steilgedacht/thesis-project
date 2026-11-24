@@ -355,6 +355,10 @@ if __name__ == "__main__":
             device=config.device, 
             background_samples=config.background_samples,
             oversample_positive_samples=config.oversample_positive_samples,
+            # opt-in dense sampler options (other dataset classes do not take them)
+            **{key: getattr(config, key) for key in ("near_field_fraction", "near_field_margin_mm", "voxel_jitter",
+                                    "single_time_items")
+               if hasattr(config, key)},
         )
         train_loader = DataLoader(
             train_dataset, 
@@ -425,6 +429,16 @@ if __name__ == "__main__":
         region_prior_lesions = attach_region_boxes(
             model, mri_dataloader.cache_lesion_trajectories, train_dataset.get_embedding_id
         )
+        # Warm start: copy the weights of a finished run (its MLflow model) into
+        # the freshly built model, which keeps this config's settings.
+        warm_start_run_id = getattr(config, "warm_start_run_id", None)
+        if warm_start_run_id:
+            source = mlflow.pytorch.load_model(
+                f"runs:/{warm_start_run_id}/{config.model_save_name}", map_location="cpu"
+            )
+            model.load_state_dict(source.state_dict())
+            del source
+            print(f"Warm start from run {warm_start_run_id}")
         # if config.load_model:
         #     if config.load_model_path.startswith("runs"):
         #         model = mlflow.pytorch.load_model(config.load_model_path)

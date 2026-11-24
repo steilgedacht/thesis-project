@@ -61,6 +61,10 @@ def apply_region_prior(model, logits, xyz, patient_idx):
     prior = getattr(model, "region_prior", None)
     if prior is None:
         return logits
+    # Models built with region_prior_in_training=False only get the prior in
+    # eval mode (validation, plotting, arena). Old checkpoints have no flag.
+    if model.training and not getattr(model, "region_prior_in_training", True):
+        return logits
     return logits - prior.penalty(xyz, patient_idx)
 
 

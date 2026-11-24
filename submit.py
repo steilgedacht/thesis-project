@@ -5,9 +5,13 @@ The training script is chosen from the config's folder (one folder -> one script
 see TRAIN_SCRIPTS below. The job script is rendered from slurm_jobs/template.sbatch,
 saved under slurm_jobs/submitted/, and handed to sbatch.
 
-Usage:
-    python submit.py configs/06_neural_ode/config.py
+The Singularity image is looked up in SIF_CANDIDATES (home directory first,
+then the project folder) or given with --sif.
+
+Usage (from any folder, e.g. ~ or ~/projects/thesis):
+    python projects/thesis/submit.py projects/thesis/configs/06_neural_ode/config.py
     python submit.py configs/09_point_lstm/config_sdf.py --dry-run
+    python submit.py configs/06_neural_ode/config_large.py --sif ~/thesis.sif
 """
 import argparse
 import datetime as dt
@@ -19,6 +23,8 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 TEMPLATE = PROJECT_DIR / "slurm_jobs" / "template.sbatch"
 SUBMITTED_DIR = PROJECT_DIR / "slurm_jobs" / "submitted"
+# Where thesis.sif is looked for (first match wins) unless --sif is given.
+SIF_CANDIDATES = [Path.home() / "thesis.sif", PROJECT_DIR / "thesis.sif"]
 
 # Config folder (under configs/) -> training script (in the project root).
 # Folders not listed here cannot be submitted.
@@ -35,11 +41,24 @@ TRAIN_SCRIPT_OVERRIDES = {
 }
 
 
-def build_job_script(config_rel: Path, train_script: str, job_name: str) -> str:
+def find_sif(explicit):
+    if explicit:
+        sif = Path(explicit).expanduser().resolve()
+        if not sif.is_file():
+            sys.exit(f"Singularity image not found: {sif}")
+        return sif
+    for candidate in SIF_CANDIDATES:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def build_job_script(config_rel: Path, train_script: str, job_name: str, sif: Path) -> str:
     template = TEMPLATE.read_text()
     replacements = {
         "JOB_NAME": job_name,
         "PROJECT_DIR": str(PROJECT_DIR),
+        "SIF": str(sif),
         "TRAIN_SCRIPT": train_script,
         "CONFIG": config_rel.as_posix(),
     }
@@ -55,6 +74,7 @@ def main() -> None:
     parser.add_argument("config", help="config file, e.g. configs/06_neural_ode/config.py")
     parser.add_argument("--dry-run", action="store_true",
                         help="write the job script but do not call sbatch")
+    parser.add_argument("--sif", help="Singularity image (default: ~/thesis.sif, then <project>/thesis.sif)")
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -81,8 +101,14 @@ def main() -> None:
     if not (PROJECT_DIR / train_script).is_file():
         sys.exit(f"Training script {train_script} does not exist.")
 
+    sif = find_sif(args.sif)
+    if sif is None:
+        if not args.dry_run:
+            sys.exit("thesis.sif not found in " + ", ".join(map(str, SIF_CANDIDATES)) + "; pass --sif.")
+        sif = SIF_CANDIDATES[0]  # dry run on a machine without the image
+
     job_name = f"{folder}_{config_path.stem}"
-    job_script = build_job_script(config_rel, train_script, job_name)
+    job_script = build_job_script(config_rel, train_script, job_name, sif)
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     SUBMITTED_DIR.mkdir(parents=True, exist_ok=True)
@@ -90,6 +116,8 @@ def main() -> None:
     job_file.write_text(job_script)
     print(f"Job script: {job_file}")
     print(f"Training:   {train_script} --config {config_rel.as_posix()}")
+    print(f"Image:      {sif}")
+    print(f"Code/logs:  {PROJECT_DIR}")
 
     if args.dry_run:
         print("Dry run, not submitted.")

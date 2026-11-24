@@ -231,6 +231,7 @@ class NeuralODE_INR(nn.Module):
         use_region_prior=False,
         region_margin_mm=10.0,
         region_strength_per_mm=1.0,
+        region_prior_in_training=True,
     ):
         super().__init__()
         # Optional far-field prior, boxes are filled by utils.region_prior.attach_region_boxes
@@ -238,6 +239,8 @@ class NeuralODE_INR(nn.Module):
             RegionPrior(num_patients, region_margin_mm, region_strength_per_mm)
             if use_region_prior else None
         )
+        # False: prior only in eval mode (validation, plotting, arena), see utils/region_prior.py
+        self.region_prior_in_training = bool(region_prior_in_training)
 
         self.patient_embedding = nn.Embedding(num_patients, patient_embed_dim)
         self.max_t = max_t

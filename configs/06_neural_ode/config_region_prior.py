@@ -29,10 +29,11 @@ class Config(_base.Config):
 
     """ Memory / runtime for a 6 GB GPU """
     batchsize = 8                       # config.py: 16
-    epochs = 30                         # config.py: 100 (~18k steps at batch 8)
+    epochs = 50                         # config.py: 100 (~18k steps at batch 8)
+    lr = 1e-4
     scheduler_eta_min = _base.Config.lr * 0.0001
     validation_interval = 5
-    plot_validation_interval = 10       # config.py: 25 (would only plot once in 30 epochs)
+    plot_validation_interval = 15       # config.py: 25 (would only plot once in 30 epochs)
     validation_grid_chunk_size = 65536  # config.py: 262144, smaller inference chunks
     # config.py: 10. Every step has the same 8 x 10k points, so emptying the
     # CUDA cache only forces reallocation (GPU dips to ~20%). The step counter
