@@ -321,7 +321,12 @@ if __name__ == "__main__":
             trajectories, 
             dialation_iterations=config.dialation_iterations, 
             device=config.device, 
-            background_samples=config.background_samples
+            background_samples=config.background_samples,
+            oversample_positive_samples=config.oversample_positive_samples,
+            # opt-in dense sampler options (other dataset classes do not take them)
+            **{key: getattr(config, key) for key in ("near_field_fraction", "near_field_margin_mm", "voxel_jitter",
+                                    "single_time_items")
+               if hasattr(config, key)},
         )
         train_loader = DataLoader(
             train_dataset, 
