@@ -68,7 +68,18 @@ from utils.dataloader_point_lstm import (
 )
 from utils.mri_dataloader import MRI_Dataloader
 from utils.paths import DatasetPaths
-from utils.region_prior import all_dates_box
+from utils.new_lesion_fit import (
+    HELDOUT_SCANS,
+    NEW_LESION,
+    PROTOCOL as NEW_LESION_PROTOCOL,
+    basis_rows,
+    global_lesion_id,
+    lesion_dates,
+    split_support_heldout,
+    support_box,
+    training_lesion_ids,
+    uniform_coefficients,
+)
 
 
 MODEL_CLASSES = {
@@ -83,7 +94,9 @@ MODEL_CLASSES = {
 EMBEDDING_SUPPORTED_FAMILIES = {"inr", "node", "lstm", "plstm"}
 # "last_scan" = dilation with rate 0, i.e. the last observed mask unchanged.
 BASELINE_NAMES = ("last_scan", "dilation_global", "dilation_lesion_specific")
-EMBEDDING_TRAJECTORY = ("YG_WCONBI42RLEZ", 1)
+# New-lesion embedding test, same protocol as new_patient_fit.py
+# (utils/new_lesion_fit.py): fit on the support scans, score the held-out ones.
+EMBEDDING_TRAJECTORY = NEW_LESION
 VALIDATION_CACHE_DIR = (
     Path(__file__).resolve().parent / "cache" / "validation_arena"
 )
@@ -612,6 +625,7 @@ def _embedding_cache_path(
             "seed": args.embedding_seed,
             "trajectory": EMBEDDING_TRAJECTORY,
             "trajectory_dates": trajectory_dates,
+            "protocol": NEW_LESION_PROTOCOL,
             "device": str(device),
         },
         sort_keys=True,
@@ -1355,6 +1369,7 @@ def _fit_embedding(
     samples_per_epoch: int,
     device: torch.device,
     continuous_patient_idx: int = 0,
+    basis_row_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if epochs < 1:
         raise ValueError("--embedding-epochs must be positive.")
@@ -1366,7 +1381,12 @@ def _fit_embedding(
     model = loaded.model
     embedding_layer = _embedding_module(model)
     original_training_mode = model.training
-    model.eval()
+    # Continuous models are fitted in train mode, as they were trained (e.g. no
+    # region prior if region_prior_in_training=False); same as new_patient_fit.py.
+    if loaded.family == "lstm":
+        model.eval()
+    else:
+        model.train()
     original_requires_grad = {
         parameter: parameter.requires_grad for parameter in model.parameters()
     }
@@ -1376,12 +1396,15 @@ def _fit_embedding(
     if isinstance(recurrent_module, torch.nn.RNNBase):
         recurrent_module.train()
 
-    basis_embeddings = embedding_layer.weight.detach().clone()
+    # Convex combination of TRAINED rows only (see utils/new_lesion_fit.py),
+    # starting from their mean.
+    basis_embeddings = embedding_layer.weight.detach()
+    if basis_row_indices is not None:
+        basis_embeddings = basis_embeddings[basis_row_indices.to(basis_embeddings.device)]
+    basis_embeddings = basis_embeddings.clone()
     coefficients = torch.nn.Parameter(
-        torch.zeros(basis_embeddings.shape[0], device=device)
+        uniform_coefficients(basis_embeddings.shape[0], device)
     )
-    with torch.no_grad():
-        coefficients[0] = 1.0
     direct_embedding = None
     criterion = Loss_BCE_Dice()
     phase_epochs = min(combination_epochs, epochs)
@@ -1607,6 +1630,15 @@ def _parse_args() -> argparse.Namespace:
         help="Sampled support batches per continuous-model epoch (default: 20).",
     )
     parser.add_argument(
+        "--embedding-heldout-scans",
+        type=int,
+        default=HELDOUT_SCANS,
+        help=(
+            "Last scans of the new lesion held out for scoring; the embedding is "
+            f"fitted on the earlier scans (default: {HELDOUT_SCANS})."
+        ),
+    )
+    parser.add_argument(
         "--embedding-seed",
         type=int,
         default=42,
@@ -1731,6 +1763,8 @@ def main() -> None:
     embedding_trajectory = None
     embedding_model_idx: int | None = None
     embedding_trajectory_dates: list[str] = []
+    embedding_support_dates: list[str] = []
+    embedding_heldout_dates: list[str] = []
     embedding_dilation_growth_rate: float | None = None
     embedding_lstm_datasets = {}
     if not args.skip_embedding_test and embedding_families:
@@ -1743,36 +1777,14 @@ def main() -> None:
                 "Could not load embedding trajectory "
                 f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]}."
             )
-        embedding_trajectory_dates = [
-            str(date)
-            for date in (
-                embedding_trajectory.allowed_dates
-                if hasattr(embedding_trajectory, "allowed_dates")
-                else embedding_trajectory.dates
-            )
-        ]
-        if not embedding_trajectory_dates:
-            raise ValueError(
-                "Embedding trajectory "
-                f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]} "
-                "has no timepoints."
-            )
-        embedding_patient_idx = patient_to_idx.get(
-            embedding_trajectory.patient_id
+        embedding_trajectory_dates = lesion_dates(embedding_trajectory)
+        # Fit on the support scans, score only the held-out scans.
+        embedding_support_dates, embedding_heldout_dates = split_support_heldout(
+            embedding_trajectory_dates, args.embedding_heldout_scans
         )
-        if isinstance(embedding_patient_idx, str):
-            embedding_patient_idx = int(embedding_patient_idx)
-        elif not isinstance(embedding_patient_idx, int):
-            raise ValueError(
-                "Embedding trajectory patient "
-                f"{embedding_trajectory.patient_id} is missing from patient_to_idx."
-            )
-        embedding_model_idx = embedding_patient_idx * 100 + EMBEDDING_TRAJECTORY[1]
+        embedding_model_idx = global_lesion_id(embedding_trajectory, patient_to_idx)
         embedding_dilation_growth_rate = float(
-            calculate_lesion_growth_rate(
-                embedding_trajectory,
-                _training_dates_for_rate(embedding_trajectory, validation),
-            )
+            calculate_lesion_growth_rate(embedding_trajectory, embedding_support_dates)
         )
         embedding_lstm_datasets = {
             loaded.run_id: _lstm_dataset([embedding_trajectory], loaded)
@@ -1830,6 +1842,9 @@ def main() -> None:
                 "embedding_trajectory": (
                     f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]}"
                 ),
+                "embedding_protocol": NEW_LESION_PROTOCOL,
+                "embedding_support_dates": ",".join(embedding_support_dates),
+                "embedding_heldout_dates": ",".join(embedding_heldout_dates),
             }
         )
     for loaded in models:
@@ -2012,19 +2027,19 @@ def main() -> None:
             f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]}",
             embedding_trajectory,
             "trajectory",
-            embedding_trajectory_dates[-1],
+            embedding_heldout_dates[-1],
             None,
-            tuple(embedding_trajectory_dates),
+            tuple(embedding_support_dates),
         )
 
         if loaded.family == "plstm":
             # Nothing to fit: the Point-LSTM conditions on the lesion's own
-            # observed scans. Every scan is predicted from the scans before it.
+            # observed scans. Each held-out scan is predicted from the support
+            # scans, the same information the fitted models get.
             zero_embedding = _point_lstm_zero_embedding(loaded, device)
             plstm_rows = [
-                (tuple(embedding_trajectory_dates[:date_index]), date)
-                for date_index, date in enumerate(embedding_trajectory_dates)
-                if date_index > 0
+                (tuple(embedding_support_dates), date)
+                for date in embedding_heldout_dates
             ]
             for history_dates, date in _print_progress(
                 plstm_rows, "Evaluating plstm trajectory forecast", "timepoints"
@@ -2078,18 +2093,18 @@ def main() -> None:
                 mlflow.log_metrics(embedding_metrics)
             continue
 
-        # Region prior (INR/NODE): the embedding is fitted on every scan of the
-        # lesion, so its box covers every scan too. Restored afterwards.
+        # Region prior (INR/NODE): box from the support scans only, as in
+        # new_patient_fit.py. Restored afterwards.
         region_prior = getattr(loaded.model, "region_prior", None)
         saved_region_box = None
         if region_prior is not None:
             saved_region_box = region_prior.get_box(embedding_model_idx)
-            embedding_box = all_dates_box(embedding_trajectory)
+            embedding_box = support_box(embedding_trajectory, embedding_support_dates)
             if embedding_box is not None:
                 region_prior.set_box(embedding_model_idx, embedding_box)
 
         embedding_path = _embedding_cache_path(
-            loaded, args, embedding_trajectory_dates, device
+            loaded, args, embedding_support_dates, device
         )
         if embedding_path.is_file():
             print(f"Loading cached {loaded.family} embedding from {embedding_path}.")
@@ -2097,9 +2112,26 @@ def main() -> None:
             print(
                 f"Fitting frozen-network embedding for {loaded.family} on "
                 f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]} using "
-                f"{len(embedding_trajectory_dates)} timepoint(s) and "
+                f"{len(embedding_support_dates)} support scan(s) and "
                 f"{args.embedding_samples_per_epoch} sampled example(s) per epoch."
             )
+
+        training_ids = training_lesion_ids(
+            int(_literal_param(loaded.params, "lesion_trajectories_with_more_than_n_scans", 6)),
+            bool(_literal_param(loaded.params, "use_only_growing_lesions", True)),
+        )
+        if embedding_model_idx in training_ids:
+            raise ValueError(
+                f"{embedding_case.lesion_id} is a training lesion of {loaded.run_id}; "
+                "the embedding test needs an unseen lesion."
+            )
+        embedding_basis_rows = basis_rows(
+            loaded.model,
+            _embedding_module(loaded.model),
+            training_ids,
+            exclude_id=embedding_model_idx,
+        )
+        print(f"{loaded.family} embedding basis: {len(embedding_basis_rows)} trained rows.")
 
         def fit_embedding() -> torch.Tensor:
             _seed_embedding_fit(args.embedding_seed)
@@ -2115,6 +2147,7 @@ def main() -> None:
                 args.embedding_samples_per_epoch,
                 device,
                 continuous_patient_idx=embedding_model_idx,
+                basis_row_indices=embedding_basis_rows,
             )
 
         fitted_embedding = _load_or_fit_embedding(
@@ -2145,12 +2178,10 @@ def main() -> None:
                     embedding_override=fitted_embedding,
                 )
 
-        for date_index, date in enumerate(
-            _print_progress(
-                embedding_trajectory_dates,
-                f"Evaluating {loaded.family} fitted trajectory",
-                "timepoints",
-            )
+        for date in _print_progress(
+            embedding_heldout_dates,
+            f"Evaluating {loaded.family} fitted embedding (held-out scans)",
+            "timepoints",
         ):
             trajectory_case = EvaluationCase(
                 embedding_case.lesion_id,
@@ -2158,8 +2189,7 @@ def main() -> None:
                 "trajectory",
                 date,
                 None,
-                tuple(embedding_trajectory_dates[:date_index])
-                or (date,),
+                tuple(embedding_support_dates),
             )
             if loaded.family == "lstm":
                 infer = lambda target_volume: _infer_lstm(
@@ -2242,12 +2272,10 @@ def main() -> None:
                 model_name, global_growth_rate, embedding_dilation_growth_rate
             )
             embedding_model_name = f"{model_name}_embedding"
-            for date_index, date in enumerate(
-                _print_progress(
-                    embedding_trajectory_dates,
-                    f"Evaluating {embedding_model_name}",
-                    "timepoints",
-                )
+            for date in _print_progress(
+                embedding_heldout_dates,
+                f"Evaluating {embedding_model_name} (held-out scans)",
+                "timepoints",
             ):
                 embedding_case = EvaluationCase(
                     f"{EMBEDDING_TRAJECTORY[0]}_{EMBEDDING_TRAJECTORY[1]}",
@@ -2255,7 +2283,7 @@ def main() -> None:
                     "trajectory",
                     date,
                     None,
-                    tuple(embedding_trajectory_dates[:date_index]) or (date,),
+                    tuple(embedding_support_dates),
                 )
                 sums = cached_result(
                     embedding_model_name,
